@@ -142,6 +142,26 @@ class Config:
         return roles[name]
 
     @classmethod
+    def role_env(cls, name: str) -> dict[str, str]:
+        """角色声明的环境变量覆盖。
+
+        用来表达"同一个 CLI、不同的后端"——例如让 ``claude`` 指向一个本地网关，
+        从而跑在别家模型上。**这比包一层 shim 脚本可靠**：shim 往往要经 cmd.exe
+        转发参数，而那一层会重新解析命令行、吃掉位置参数（实测 ccrg 就是如此）。
+        """
+        section = cls.role(name).get('env')
+        if section is None:
+            return {}
+        if not isinstance(section, dict):
+            _die(f"角色 `{name}` 的 env 必须是一个表：{CONFIG_PATH}")
+        return {str(k): str(v) for k, v in section.items()}
+
+    @classmethod
+    def role_healthcheck(cls, name: str) -> str | None:
+        value = cls.role(name).get('healthcheck_url')
+        return str(value) if value else None
+
+    @classmethod
     def spawn_setting(cls, name: str, fallback: str) -> str:
         section = cls.load().get('spawn') or {}
         value = section.get(name)
@@ -586,15 +606,29 @@ def merge_info(
     return meta
 
 
-def effective_status(meta: dict[str, Any], at: datetime | None = None) -> str:
+def effective_status(meta: dict[str, Any], at: datetime | None = None,
+                     verify_pid: bool = False) -> str:
     """**读取时**推算存活状态，而不是信任存过的 ``status``。
 
     与锁的租约同理——懒判定，不需要任何进程跑时钟。``exited`` / ``archived`` 是显式终态，
     不再按心跳推算。
+
+    :param verify_pid: 额外查一下登记的进程还在不在。默认关闭是为了让本函数保持纯粹
+        （测试与批量计算不必碰系统调用）；花名册、投递前检查、看板这些**面向决策**的
+        地方应当打开。
+
+        为什么需要它：SessionStart 钩子先注册成功、主体进程随后崩溃时，
+        心跳是新鲜的、``status`` 是 ``active``，花名册于是显示一个**根本不存在的 agent**
+        （17948ac6 实测：ccrg 拉起即崩，壳却留在了名册上）。
+        要等 5 分钟心跳超时才发现太慢，而 pid 就在手边——直接查它，一次刷新就打回原形。
     """
     stored = str(meta.get('status', STATUS_ACTIVE))
     if stored in TERMINAL_STATUSES:
         return stored
+    if verify_pid:
+        pid = meta.get('pid')
+        if isinstance(pid, int) and pid > 0 and not pid_alive(pid):
+            return STATUS_PRESUMED_DEAD
     last = meta.get('last_active')
     if not isinstance(last, datetime):
         return STATUS_PRESUMED_DEAD
@@ -847,7 +881,7 @@ def cmd_who(args: argparse.Namespace) -> None:
     rows: list[tuple[str, str, str, str, str]] = []
     at = now()
     for agent_id, meta, _ in iter_agents(target, include_archived=args.include_archived):
-        status = effective_status(meta, at)
+        status = effective_status(meta, at, verify_pid=True)
         if args.alive and status != STATUS_ACTIVE:
             continue
         topics = meta.get('topics') or []
@@ -1157,7 +1191,9 @@ def resolve_target(ws: Workspace, token: str) -> list[str]:
 def check_deliverable(ws: Workspace, agent_id: str, force: bool) -> None:
     """投递前的存活判定。死信必须**当场拒绝**，不能静默成功。"""
     meta, _ = read_info(ws.info_path_of(agent_id))
-    status = effective_status(meta)
+    # verify_pid：投递是**要有人读**才有意义的动作，宁可多一次系统调用，
+    # 也不要把信投给一个进程已经不存在、只是心跳还没过期的空壳。
+    status = effective_status(meta, verify_pid=True)
     if status == STATUS_ACTIVE or force:
         return
     stale = stale_seconds(meta)
@@ -1627,6 +1663,23 @@ def cmd_log(args: argparse.Namespace) -> None:
 
 SPAWN_MODES = ('tab', 'window', 'pane', 'named', 'background')
 
+def url_reachable(url: str, timeout: float = 3.0) -> tuple[bool, str]:
+    """后端是否可达。任何 HTTP 应答（含 4xx/5xx）都算可达——我们只关心有没有人在监听。
+
+    用于拉起前的预检：一个后端不通的实例会在第一句话就报错，与其让人对着报错猜，
+    不如在拉起前就拦住并说清是哪个地址不通。
+    """
+    import urllib.error
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=timeout):
+            return True, 'ok'
+    except urllib.error.HTTPError as exc:
+        return True, f'HTTP {exc.code}（有人在监听即可）'
+    except Exception as exc:  # noqa: BLE001 —— 连接层的失败形态很多，一律视为不可达
+        return False, f'{type(exc).__name__}: {exc}'
+
+
 def resolve_launcher(name: str) -> list[str]:
     """把命令名解析成可被 ``CreateProcess`` 直接启动的 argv 前缀。
 
@@ -1640,25 +1693,24 @@ def resolve_launcher(name: str) -> list[str]:
     return [found or name]
 
 
-BOOTSTRAP_PROMPT = (
-    '你是被 AgentNet 拉起的实例。请**按顺序**做三件事，然后照任务简报行动：\n'
-    '1. 先运行 `agentnet drain` 领取你的任务简报（前台，顺序不能颠倒——见下）\n'
-    '2. 再后台运行 `agentnet poll`（它是你此后收信的唯一途径兼心跳来源）\n'
-    '3. 运行 `agentnet charter --topics "..."` 声明你负责什么\n'
-    '\n'
-    '顺序要紧：poll 与 drain 争抢同一个收件箱，先起 poll 会让它抢先取走简报、'
-    'drain 落空（信不会丢，但会跑到后台输出里去）。\n'
-)
-"""新实例的"第一推动"。
+BOOTSTRAP_PROMPT = 'Run: agentnet drain'
+"""新实例的"第一推动"——**单行、纯 ASCII、无 shell 元字符**。
 
-作为 ``claude`` 的位置参数传入 = 首条用户消息。**必须有**：没有它，新会话只会抱着
-空提示符干等。这里只放引导、不放任务全文——任务走收件箱那条**唯一**通道，
-既不受命令行长度限制，也不会出现"两条通道各送一半"的分裂。
+作为启动命令的位置参数传入 = 首条用户消息。**必须有**：没有它，新会话只会抱着
+空提示符干等。
 
-**先 drain 后 poll 是实测教训**（selftest-3 回执）：原顺序是"先 poll 后 drain"，
-结果并行发起时 poll 抢先消费掉简报，drain 只打印出"轮询器未运行"的误导性提示，
-新实例得靠 Read 后台输出文件才找到自己的任务。move 的原子性保证了信没丢，
-但"该从哪儿拿"变得不可预期——顺序反过来就没有这个窗口。
+**为什么必须这么短**（实测教训，17948ac6 报告）：这里原本是一段多行中文引导，
+结果 ``reviewer`` 角色（``ccrg``，只有 ``.cmd`` 形态、须经 ``cmd /c`` 启动）
+**拉起即崩**，报 ``error: unknown option '->'``。根因是 cmd.exe 会**重新解析**
+整条命令行——多行参数里的换行被当成命令分隔符、非 ASCII 按 GBK 码页重编码，
+碎片再被下游的 commander.js 当成选项。
+
+修法不是去修转义，而是**让 argv 不承载内容**：详细指引走 SessionStart 钩子的
+``additionalContext``（JSON + stdin，不过 argv，中文与换行都安全），
+argv 上只留一句触发语；任务本身更是早就走收件箱那条唯一通道。
+
+**指的是 drain 而不是 poll**（selftest-3 实测）：两者争抢同一个收件箱，
+先起 poll 会抢先取走简报、让 drain 落空。poll 由上下文指引随后启动。
 """
 
 
@@ -1700,6 +1752,16 @@ def focus_own_terminal_window() -> bool:
     kernel32.SetConsoleTitleW.argtypes = (wintypes.LPCWSTR,)
     kernel32.GetConsoleTitleW.argtypes = (wintypes.LPWSTR, wintypes.DWORD)
 
+    def foreground() -> int:
+        """当前前台窗口句柄；没有前台窗口时返回 0。
+
+        ``restype = wintypes.HWND`` 是个 void 指针类型，句柄为 NULL 时 ctypes 给的是
+        ``None`` 而**不是** 0——直接 ``int()`` 会 TypeError。这条平时不触发（总有窗口
+        在前台），恰好在窗口切换的空档撞上一次就崩。
+        """
+        handle = user32.GetForegroundWindow()
+        return int(handle) if handle else 0
+
     wt_pids = {p.pid for p in _terminal_processes()}
     if not wt_pids:
         return False
@@ -1738,17 +1800,22 @@ def focus_own_terminal_window() -> bool:
             return False
         target = matches[0]
         user32.SetForegroundWindow(target)
-        if int(user32.GetForegroundWindow()) == target:
+        if foreground() == target:
             return True
-        # 前台锁：把输入队列挂到当前前台线程上再试
-        fg_thread = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
+        # 前台锁：把输入队列挂到当前前台线程上再试。
+        # 注意 SetForegroundWindow 的**返回值不可信**——裸调用会返回 True 却因前台锁无效，
+        # 这条绕法会返回 False 却真的生效。只能查实际前台。
+        current = user32.GetForegroundWindow()
+        if not current:
+            return False
+        fg_thread = user32.GetWindowThreadProcessId(current, None)
         my_thread = kernel32.GetCurrentThreadId()
         user32.AttachThreadInput(my_thread, fg_thread, True)
         try:
             user32.SetForegroundWindow(target)
         finally:
             user32.AttachThreadInput(my_thread, fg_thread, False)
-        return int(user32.GetForegroundWindow()) == target
+        return foreground() == target
     finally:
         kernel32.SetConsoleTitleW(original.value)
 
@@ -1914,17 +1981,36 @@ def cmd_spawn(args: argparse.Namespace) -> None:
     launcher_parts = shlex.split(launcher_spec)
     launcher_name = Path(launcher_parts[0]).stem.lower()
 
+    role_env = Config.role_env(role_name)
+    health = Config.role_healthcheck(role_name)
+    if health and not args.dry_run:
+        reachable, why = url_reachable(health)
+        if not reachable:
+            _die(f"角色 `{role_name}` 的后端不可达：{health}\n  {why}\n"
+                 f"  现在拉起只会得到一个第一句话就报错的实例，所以先拦下来。")
+
+    child_kind = launcher_name
     if role.get('claude_compatible') and len(launcher_parts) == 1:
         # 位置参数 = 首条用户消息，负责"第一推动"：没有它，新会话只会抱着空提示符干等。
         # 只放一句引导而不是任务全文——任务走收件箱这条**唯一**通道，不受命令行长度限制。
-        child = (resolve_launcher(launcher_parts[0])
+        inner = (resolve_launcher(launcher_parts[0])
                  + ['--session-id', new_id, '-n', name,
                     '--permission-mode', permission_mode, BOOTSTRAP_PROMPT])
-        child_kind = launcher_name
+        needs_run = bool(role_env)   # 只有要注入 env 时才多包一层
     else:
-        # 其它 harness：没有 --session-id 这类身份开关，经 run 包装器注入 AGENTNET_ID
-        child = [sys.executable, script_path(), 'run', '--id', new_id, '--'] + launcher_parts
-        child_kind = launcher_name
+        # 其它 harness：没有 --session-id 这类身份开关，只能靠环境变量注入身份
+        inner = launcher_parts
+        needs_run = True
+
+    if needs_run:
+        # 环境变量必须由**我们自己的进程**设置：wt 给新分页的是终端自己的环境块，
+        # 在 Popen 上设 env 到不了分页里的进程。run 在自己进程里设好再 exec 子命令。
+        child = [sys.executable, script_path(), 'run', '--id', new_id]
+        if role_env:
+            child += ['--role', role_name]
+        child += ['--'] + inner
+    else:
+        child = inner
 
     argv, effective_mode, target_window, notes = build_launch(
         args.mode, args.window, name, ctx.cwd, child, ctx.slug,
@@ -1981,6 +2067,12 @@ def cmd_spawn(args: argparse.Namespace) -> None:
         print(f"        若想固定开在某个窗口，把那个窗口重命名为 `{target_window}`"
               f"（命令面板 → Rename Window）。")
     print("  任务已投进它的收件箱；它启动后按引导跑 `agentnet drain` 领取。")
+    if child and Path(child[0]).name.lower() in ('cmd', 'cmd.exe'):
+        # 经 cmd.exe 转发的启动器会**重新解析**命令行，位置参数未必到得了内层进程
+        # （实测 ccrg 就会把它丢掉）。这类角色可能空跑，得让拉起方当场知道。
+        print("  [!] 该角色经 cmd.exe 启动，位置参数提示词可能到不了内层进程。")
+        print("      若它迟迟不 drain（收件箱有信但 read/ 为空），去它的窗口里手敲一句"
+              " `agentnet drain` 推动它。")
     print(f"  控制：agentnet kill {new_id[:8]} / agentnet reset {new_id[:8]}")
 
 
@@ -2092,6 +2184,7 @@ def cmd_reset(args: argparse.Namespace) -> None:
 def _args_run(p: argparse.ArgumentParser) -> None:
     p.add_argument('--id', help='为子进程钉死的 agent id（spawn 用；省略则自动生成）')
     p.add_argument('--topics', help='子进程的负责主题')
+    p.add_argument('--role', help='套用该角色在策略配置里声明的 env（值不经命令行，不会出现在进程列表里）')
     p.add_argument('rest', nargs=argparse.REMAINDER, help='`--` 之后是要运行的命令')
 
 
@@ -2115,9 +2208,15 @@ def cmd_run(args: argparse.Namespace) -> None:
     env['AGENTNET_ID'] = agent_id
     if args.topics:
         env['AGENTNET_TOPICS'] = args.topics
+    role_env = Config.role_env(args.role) if args.role else {}
+    env.update(role_env)
     # flush：否则本行会因缓冲排在子进程输出之后，读起来像是子进程先跑完才注入的身份
-    print(f"[agentnet] AGENTNET_ID={agent_id}  →  {' '.join(rest)}", flush=True)
-    completed = subprocess.run(rest, env=env, check=False)
+    banner = f"[agentnet] AGENTNET_ID={agent_id}"
+    if role_env:
+        banner += f"  role={args.role}  env={'/'.join(sorted(role_env))}"
+    print(f"{banner}  →  {' '.join(rest)}", flush=True)
+    # Windows 上 .cmd/.bat 不是可执行映像，CreateProcess 起不了；交给 cmd.exe 解释
+    completed = subprocess.run(resolve_launcher(rest[0]) + rest[1:], env=env, check=False)
     raise SystemExit(completed.returncode)
 
 
@@ -2213,6 +2312,17 @@ def cmd_hook(args: argparse.Namespace) -> None:
     }
     if meta.get('display_name'):
         hook_output['sessionTitle'] = str(meta['display_name'])
+    if pending:
+        # 收件箱里有信 ⇒ 给一条首条用户消息把它推动起来。
+        # **不消费收件箱**（早先在这里消费过，结果信被移走却没送达，任务静默蒸发）。
+        #
+        # 这条路径不经 argv，所以对那些会吞掉位置参数的启动器（如经 cmd /c 的 ccrg）
+        # 是唯一可靠的"第一推动"。argv 上的 BOOTSTRAP_PROMPT 是给能收到它的启动器用的，
+        # 两者同时到达也无害：都只是让 agent 去 drain 一次。
+        hook_output['initialUserMessage'] = (
+            f'你的 AgentNet 收件箱里有 {pending} 封未读信（其中可能包含你的任务简报）。'
+            f'先运行 `agentnet drain` 领取，再后台运行 `agentnet poll`，然后照信里的内容行动。'
+        )
     print(json.dumps({'hookSpecificOutput': hook_output}, ensure_ascii=False))
 
 
@@ -3659,7 +3769,8 @@ def collect_dashboard_data() -> dict[str, Any]:
                     'short': agent_id[:8],
                     'name': meta.get('display_name') or '',
                     'kind': meta.get('kind') or '',
-                    'status': STATUS_ARCHIVED if archived else effective_status(meta, at),
+                    'status': (STATUS_ARCHIVED if archived
+                               else effective_status(meta, at, verify_pid=True)),
                     'stale_min': (None if stale_seconds(meta, at) == float('inf')
                                   else int(stale_seconds(meta, at) // 60)),
                     'topics': meta.get('topics') or [],

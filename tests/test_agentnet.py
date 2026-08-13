@@ -215,6 +215,22 @@ class TestStatus(Base):
             meta = {'status': terminal, 'last_active': an.now()}
             self.assertEqual(an.effective_status(meta), terminal)
 
+    def test_dead_pid_detected_before_heartbeat_expires(self) -> None:
+        """假活：钩子先注册成功、主体进程随后崩溃 —— 心跳还新鲜，但那个 agent 不存在了。
+
+        实测来源：ccrg 角色拉起即崩，SessionStart 已写好注册，花名册于是显示 active
+        （17948ac6 报告）。等 5 分钟心跳超时太慢，pid 就在手边，直接查。
+        """
+        meta = {'status': an.STATUS_ACTIVE, 'last_active': an.now(), 'pid': 999999999}
+        self.assertEqual(an.effective_status(meta), an.STATUS_ACTIVE,
+                         '默认不查 pid，保持函数纯粹')
+        self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_PRESUMED_DEAD,
+                         'pid 已不存在却仍判为存活')
+
+    def test_live_pid_stays_active(self) -> None:
+        meta = {'status': an.STATUS_ACTIVE, 'last_active': an.now(), 'pid': os.getpid()}
+        self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_ACTIVE)
+
     def test_missing_heartbeat_is_dead(self) -> None:
         self.assertEqual(an.effective_status({'status': an.STATUS_ACTIVE}),
                          an.STATUS_PRESUMED_DEAD)
