@@ -312,11 +312,21 @@ def now() -> datetime:
 
 
 def _atomic_write(path: Path, content: str) -> None:
-    """tmpfile + os.replace 原子替换——读者只会看到旧全文或新全文，绝无半截。"""
+    """tmpfile + os.replace 原子替换——读者只会看到旧全文或新全文，绝无半截。
+
+    失败路径要清理临时文件：写完到 replace 之间若出错，``.tmp.<pid>`` 会留在原地。
+    这类残留看着像正常产物，实测被 ``git add -A`` 顺手带进过版本库
+    （里面是完整的网络快照，含路径与信件预览）。进程被 SIGKILL 时仍会留残留——
+    那种情况兜不住，靠 ``.gitignore`` 挡住同名模式作为第二道防线。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
-    tmp.write_text(content, encoding='utf-8', newline='\n')
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(content, encoding='utf-8', newline='\n')
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def pid_alive(pid: int) -> bool:

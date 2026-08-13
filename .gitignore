@@ -15,6 +15,11 @@ dashboard.html
 dashboard-data.json
 .browser-profile/
 
+# 原子写的临时文件。进程被杀在 write 与 replace 之间就会留下它们，
+# 名字看着像正常产物、内容却是完整的网络快照（含绝对路径与信件预览）——
+# 实测被 `git add -A` 顺手带进过版本库。这是第二道防线，第一道在 _atomic_write 的 finally。
+*.tmp.*
+
 # 控制台指令队列与执行记录（运行时）
 console-queue.json
 console-log.json
