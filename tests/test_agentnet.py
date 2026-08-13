@@ -23,7 +23,11 @@ _ROOT = Path(tempfile.mkdtemp(prefix='agentnet-test-'))
 # 否则测试会污染真实的 ~/.agentnet
 os.environ['AGENTNET_ROOT'] = str(_ROOT)
 
-_spec = importlib.util.spec_from_file_location('agentnet', _REPO / 'scripts' / 'agentnet.py')
+# 默认测仓库里那份；`AGENTNET_MODULE` 可指向**候选**文件，让改动在替换掉正在被
+# 全网轮询器使用的那份之前先跑一遍测试——脚本一改，所有 poll 都会 RELOAD 重挂，
+# 所以"边改边试"的代价是整网抖动，必须先验证后替换。
+_MODULE = Path(os.environ.get('AGENTNET_MODULE') or _REPO / 'scripts' / 'agentnet.py')
+_spec = importlib.util.spec_from_file_location('agentnet', _MODULE)
 assert _spec and _spec.loader
 an = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(an)
@@ -436,6 +440,182 @@ class TestReadme(Base):
     def test_readme_warns_against_wildcard_permission(self) -> None:
         """这条警告是踩过坑换来的，不能在改版中丢掉。"""
         self.assertIn('Bash(agentnet:*)', an.render_readme())
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 拉起命令行的装配
+# ══════════════════════════════════════════════════════════════════════════
+
+class TestSpawnArgv(Base):
+    """位置参数是新实例的"第一推动"——丢了它，spawn 表面成功、实例空转。
+
+    这类失败极难查（进程活着、注册也在、就是不动），所以用例盯得比别处紧。
+    """
+
+    def build(self, blocked: list[str]) -> list[str]:
+        return an.build_claude_argv(
+            ['C:/x/claude.exe'], an.BOOTSTRAP_PROMPT, 'sid', 'nm', 'auto', blocked)
+
+    def test_prompt_immediately_follows_executable(self) -> None:
+        for blocked in ([], ['Edit', 'Write']):
+            with self.subTest(blocked=blocked):
+                self.assertEqual(self.build(blocked)[1], an.BOOTSTRAP_PROMPT)
+
+    def test_variadic_flag_is_last(self) -> None:
+        """``--disallowed-tools <tools...>`` 吞掉其后一切，所以它必须垫底。"""
+        argv = self.build(['Edit', 'Write', 'NotebookEdit'])
+        self.assertEqual(argv[-2], '--disallowed-tools')
+        self.assertEqual(argv[-1], 'Edit,Write,NotebookEdit')
+
+    def test_no_flag_omitted_when_nothing_blocked(self) -> None:
+        """不禁用工具就别下这个选项——空值会被 commander 当成缺参数。"""
+        self.assertNotIn('--disallowed-tools', self.build([]))
+
+    def test_bootstrap_prompt_is_single_line_ascii(self) -> None:
+        """多行 / 非 ASCII 会被 cmd.exe 与 commander 一路拆碎（实测崩在 `->`）。"""
+        self.assertNotIn('\n', an.BOOTSTRAP_PROMPT)
+        an.BOOTSTRAP_PROMPT.encode('ascii')   # 非 ASCII 会当场 UnicodeEncodeError
+
+    def test_guard_fires_on_swallowed_positional(self) -> None:
+        """守卫本身必须在该响的时候真的响——只测好输入测不出这个。"""
+        bad = ['claude.exe', '--disallowed-tools', 'Edit', 'Run: agentnet drain']
+        with self.assertRaises(RuntimeError) as caught:
+            an.reject_swallowed_positional(bad, 3)
+        self.assertIn('--disallowed-tools', str(caught.exception))
+
+    def test_guard_accepts_correct_layout(self) -> None:
+        argv = self.build(['Edit'])
+        an.reject_swallowed_positional(argv, 1)   # 不应抛
+
+
+class TestSpawnEnv(Base):
+
+    def test_child_session_marker_not_inherited(self) -> None:
+        """继承它会让被拉起的实例关掉 transcript 保存，既不可 resume 也难追溯。
+
+        被拉起的是独立会话，不是调用方的子会话。
+        """
+        base = {'CLAUDE_CODE_CHILD_SESSION': '1', 'PATH': '/usr/bin'}
+        env = an.build_child_env(base, 'aid', None, {})
+        self.assertNotIn('CLAUDE_CODE_CHILD_SESSION', env)
+        self.assertEqual(env['PATH'], '/usr/bin', '不该顺手丢掉无关变量')
+
+    def test_identity_is_injected(self) -> None:
+        env = an.build_child_env({}, 'aid-7', 'a,b', {})
+        self.assertEqual(env['AGENTNET_ID'], 'aid-7')
+        self.assertEqual(env['AGENTNET_TOPICS'], 'a,b')
+
+    def test_absent_topics_leaves_no_empty_var(self) -> None:
+        """空字符串是合法值，不是"未提供"——别用它表达缺失。"""
+        self.assertNotIn('AGENTNET_TOPICS', an.build_child_env({}, 'aid', None, {}))
+
+    def test_role_env_overrides_inherited(self) -> None:
+        """角色 env 表达"同一个 CLI、不同后端"，必须盖住继承来的同名变量。
+
+        盖不住的话，调用方的后端配置会漏进子实例——reviewer 就不再是换模型的
+        独立评审，而是作者自己的模型换了个名字。
+        """
+        base = {'ANTHROPIC_BASE_URL': 'https://api.anthropic.com'}
+        env = an.build_child_env(base, 'aid', None,
+                                 {'ANTHROPIC_BASE_URL': 'http://127.0.0.1:3456'})
+        self.assertEqual(env['ANTHROPIC_BASE_URL'], 'http://127.0.0.1:3456')
+
+    def test_base_mapping_not_mutated(self) -> None:
+        """传进来的常常就是 os.environ，改了它会污染当前进程。"""
+        base = {'PATH': '/usr/bin'}
+        an.build_child_env(base, 'aid', 'x', {'FOO': '1'})
+        self.assertEqual(base, {'PATH': '/usr/bin'})
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 归档后的空壳复活
+# ══════════════════════════════════════════════════════════════════════════
+
+class TestHollowShell(Base):
+    """归档一个**仍在运行**的 agent 时，它那个还没退位的轮询器不得把目录写回来。
+
+    实测事故（04b27904）：看板归档后，旧轮询器的心跳在 `agents/<id>/` 重建出一个
+    只有 `last_active` 的目录。真历史连同未读信搁死在 archive/，花名册上却站着
+    一个没有身份字段的幽灵，此后投给它的信也落进幽灵里。
+    """
+
+    def test_heartbeat_does_not_resurrect_archived_agent(self) -> None:
+        path = self.tmp / 'gone' / 'info.md'
+        self.assertIsNone(an.merge_info(path, {'last_active': an.now()}, create=False))
+        self.assertFalse(path.exists(), '登记已归档，心跳不得凭空建出空壳')
+
+    def test_create_true_still_creates(self) -> None:
+        """默认行为不变——register 这类首次写入仍要能建文件。"""
+        path = self.tmp / 'fresh' / 'info.md'
+        path.parent.mkdir(parents=True)
+        self.assertIsNotNone(an.merge_info(path, {'id': 'x'}))
+        self.assertTrue(path.exists())
+
+    def test_hollow_shell_is_displaced(self) -> None:
+        shell_dir = self.tmp / 'agents' / 'aid'
+        (shell_dir / 'inbox').mkdir(parents=True)
+        an.merge_info(shell_dir / 'info.md', {'last_active': an.now()})   # 空壳：无 id
+        (shell_dir / 'inbox' / 'stray.md').write_text('落进幽灵的信', encoding='utf-8')
+
+        moved = an.displace_hollow_shell(shell_dir, 'aid')
+        self.assertIsNotNone(moved)
+        self.assertFalse(shell_dir.exists(), '空壳应被挪开，给恢复让路')
+
+    def test_real_registration_is_never_displaced(self) -> None:
+        """有 id = 真登记，绝不能被当成空壳挪走。"""
+        real = self.tmp / 'agents' / 'aid2'
+        real.mkdir(parents=True)
+        an.merge_info(real / 'info.md', {'id': 'aid2', 'last_active': an.now()})
+        with self.assertRaises(RuntimeError):
+            an.displace_hollow_shell(real, 'aid2')
+        self.assertTrue((real / 'info.md').exists())
+
+    def test_displace_raises_ordinary_exception(self) -> None:
+        """必须是 Exception 而非 SystemExit——看板动作在 except Exception 里逐条跑，
+        SystemExit 会穿过它把整个轮询器带走。"""
+        real = self.tmp / 'agents' / 'aid3'
+        real.mkdir(parents=True)
+        an.merge_info(real / 'info.md', {'id': 'aid3'})
+        with self.assertRaises(Exception) as caught:
+            an.displace_hollow_shell(real, 'aid3')
+        self.assertNotIsInstance(caught.exception, SystemExit)
+
+    def test_absorb_shell_rescues_letters(self) -> None:
+        """空壳没有身份，却可能已经收到信——直接删就是丢信。"""
+        shell = self.tmp / 'shell'
+        (shell / 'inbox').mkdir(parents=True)
+        (shell / 'inbox' / 'a.md').write_text('信 A', encoding='utf-8')
+        (shell / 'inbox' / 'b.md').write_text('信 B', encoding='utf-8')
+        destination = self.tmp / 'restored'
+        (destination / 'inbox').mkdir(parents=True)
+
+        self.assertEqual(an.absorb_shell(shell, destination), (2, None))
+        self.assertEqual(
+            sorted(p.name for p in (destination / 'inbox').glob('*.md')), ['a.md', 'b.md'])
+        self.assertFalse(shell.exists(), '搬空后空壳应被删除')
+
+    def test_absorb_shell_ignores_own_stub_info(self) -> None:
+        """空壳自己那份残缺 info.md 不算"内容"——它正是空壳的定义。
+
+        把它算进遗留物会让告警**永远**触发（实测：第一次真实恢复就误报了）。
+        """
+        shell = self.tmp / 'shell-stub'
+        (shell / 'inbox').mkdir(parents=True)
+        an.merge_info(shell / 'info.md', {'last_active': an.now()})
+
+        self.assertEqual(an.absorb_shell(shell, self.tmp / 'dst'), (0, None))
+        self.assertFalse(shell.exists(), '只剩残缺 info.md 时应当清干净')
+
+    def test_absorb_shell_keeps_shell_when_data_remains(self) -> None:
+        """搬不干净就留着并如实返回，不静默删除任何数据。"""
+        shell = self.tmp / 'shell2'
+        (shell / 'nested').mkdir(parents=True)
+        (shell / 'nested' / 'weird.md').write_text('不在 inbox 里的东西', encoding='utf-8')
+        destination = self.tmp / 'restored2'
+        destination.mkdir()
+
+        self.assertEqual(an.absorb_shell(shell, destination), (0, shell))
+        self.assertTrue(shell.exists(), '还有数据没搬走时不得删除空壳')
 
 
 if __name__ == '__main__':

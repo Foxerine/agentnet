@@ -28,7 +28,7 @@ import sys
 import time
 import tomllib
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn
@@ -608,6 +608,7 @@ def merge_info(
         updates: dict[str, Any],
         body: str | None = None,
         expect: dict[str, Any] | None = None,
+        create: bool = True,
 ) -> dict[str, Any] | None:
     """**字段级合并**写回 ``info.md``。
 
@@ -620,11 +621,17 @@ def merge_info(
     :param expect: 可选的前置条件（compare-and-set）。给出时，只有现有值与它**全部相等**
         才写入；否则原样返回 ``None`` 不落盘。用于"只有我还是持有者时才有资格改这个字段"——
         没有它，一个已被接替的写者会把接替者的登记覆盖掉（见 ``cmd_poll`` 的退位逻辑）。
+    :param create: 文件不存在时是否新建。**心跳类写入必须传 False**——登记文件不在了
+        意味着该 agent 已被归档，此时新建等于凭空复活一个只有 ``last_active`` 的空壳目录，
+        而真正的历史（连同未读信）还搁在 ``archive/`` 里。实测踩过：从看板归档一个**仍在
+        运行**的 agent，它那个没退位的轮询器把目录写了回来。
     """
     if path.exists():
         meta, existing_body = read_info(path)
-    else:
+    elif create:
         meta, existing_body = {}, DEFAULT_BODY
+    else:
+        return None
     if expect is not None and any(meta.get(key) != value for key, value in expect.items()):
         return None
     for key, value in updates.items():
@@ -1452,20 +1459,36 @@ def cmd_poll(args: argparse.Namespace) -> None:
     # 认领所有权：这一次是**无条件**写——新来的就是新主人。
     # 此后本进程对 poller_pid 的每一次写都要门在"我还是主人"上，见 `mine` 与 `retire`。
     me = os.getpid()
-    merge_info(ctx.info_path, {'poller_pid': me, 'last_active': now(),
-                               'status': STATUS_ACTIVE})
+    if merge_info(ctx.info_path, {'poller_pid': me, 'last_active': now(),
+                                  'status': STATUS_ACTIVE}, create=False) is None:
+        _die("你的登记在启动轮询器的瞬间消失了（被归档？）。先跑 `agentnet register`。")
     mine = {'poller_pid': me}
 
-    def superseded() -> bool:
-        """我是否已被新的轮询器接替。
+    def retirement_reason() -> str | None:
+        """本轮询器是否该退位；返回退位说明，``None`` 表示继续。
 
-        没有这个判断时，一个还在 ``sleep`` 里的旧轮询器醒来后会用**自己的旧 pid**
-        覆盖掉新主人的登记，或把它清成 None——于是 ``info.md`` 指向一个不存在的进程，
-        任何"读 poller_pid 再查存活"的外部检测（Stop 钩子就是这么做的）都会误判成死亡。
-        密集更新脚本时连续 RELOAD 会把这个窗口放大到必现。
+        两种退位，都是"我守护的那份所有权已经不属于我了"：
+
+        **① 登记文件不在了** —— 该 agent 已被归档（``exit`` / ``sweep`` / 看板动作）。
+        必须退出而**不是**把它写回来：整个目录已经原子移进 ``archive/``，此刻再写
+        ``agents/<id>/info.md`` 会凭空造出一个只有 ``last_active`` 的空壳目录，
+        而真正的历史连同未读信还搁在归档里——花名册上于是站着一个没有身份字段的幽灵，
+        后续投给它的信也落进这个幽灵。实测踩过（``04b27904``，从看板归档一个仍在运行的
+        agent，它那个没退位的轮询器把目录写了回来）。
+
+        **② 已被新的轮询器接替** —— 一个还在 ``sleep`` 里的旧轮询器醒来后会用**自己的
+        旧 pid** 覆盖掉新主人的登记，或把它清成 None，于是 ``info.md`` 指向一个不存在的
+        进程，任何"读 poller_pid 再查存活"的外部检测（Stop 钩子就是这么做的）都会误判成
+        死亡。密集更新脚本时连续 RELOAD 会把这个窗口放大到必现。
         """
+        if not ctx.info_path.exists():
+            return ('[退位] 本 agent 已被归档（登记文件已不在），轮询器随之退出。\n'
+                    '        若这是误操作，跑 `agentnet restore <id>` 取回归档目录'
+                    '（含未读信），再重新 `agentnet poll`。')
         meta, _ = read_info(ctx.info_path)
-        return meta.get('poller_pid') != me
+        if meta.get('poller_pid') != me:
+            return '[退位] 已有新的轮询器接管本 agent，本进程退出（未改动任何登记）。'
+        return None
 
     deadline = None if args.max_wait <= 0 else time.monotonic() + args.max_wait
     last_beat = time.monotonic()
@@ -1476,9 +1499,10 @@ def cmd_poll(args: argparse.Namespace) -> None:
     script_stamp = Path(__file__).stat().st_mtime
     try:
         while True:
-            # 被接替就**立刻退位，且什么都不写** —— 让位比抢着做完手上的事重要。
-            if superseded():
-                print('[退位] 已有新的轮询器接管本 agent，本进程退出（未改动任何登记）。')
+            # 该退位就**立刻退位，且什么都不写** —— 让位比抢着做完手上的事重要。
+            retiring = retirement_reason()
+            if retiring is not None:
+                print(retiring)
                 return
 
             # 看板没有服务端，运行中的轮询器就是它的执行器：每轮顺带取走排队的管理动作。
@@ -1492,13 +1516,14 @@ def cmd_poll(args: argparse.Namespace) -> None:
                 if items:
                     # 刷新心跳后再退出：给 agent 留出处理时间，别让它在处理途中被判死
                     merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': None},
-                               expect=mine)
+                               expect=mine, create=False)
                     print(render_letters(items))
                     print(REARM_NOTICE)
                     return
             moment = time.monotonic()
             if moment - last_beat >= heartbeat_interval_s():
-                merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': me}, expect=mine)
+                merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': me},
+                           expect=mine, create=False)
                 last_beat = moment
                 # 没有守护进程，所以 sweep 搭轮询器的车跑——它本就是常驻的周期性载体。
                 # 用锁互斥 + 跟着心跳限频，避免 N 个 agent 同时扫。
@@ -1512,17 +1537,17 @@ def cmd_poll(args: argparse.Namespace) -> None:
                 refresh_dashboard_data()  # 长驻进程内部改了状态，也要让看板跟上
             if Path(__file__).stat().st_mtime != script_stamp:
                 merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': None},
-                           expect=mine)
+                           expect=mine, create=False)
                 print('[RELOAD] agentnet 脚本已更新，本轮询器跑的是旧代码，现在退出。\n'
                       '         **立刻重新后台运行 `agentnet poll`** 以载入新版本。')
                 return
             if deadline is not None and moment >= deadline:
-                merge_info(ctx.info_path, {'poller_pid': None}, expect=mine)
+                merge_info(ctx.info_path, {'poller_pid': None}, expect=mine, create=False)
                 print(f"[TIMEOUT] 等待 {args.max_wait}s 无信件。**须重新运行 `agentnet poll`**。")
                 return
             time.sleep(interval)
     except KeyboardInterrupt:
-        merge_info(ctx.info_path, {'poller_pid': None}, expect=mine)
+        merge_info(ctx.info_path, {'poller_pid': None}, expect=mine, create=False)
         raise
 
 
@@ -1760,6 +1785,95 @@ argv 上只留一句触发语；任务本身更是早就走收件箱那条唯一
 **指的是 drain 而不是 poll**（selftest-3 实测）：两者争抢同一个收件箱，
 先起 poll 会抢先取走简报、让 drain 落空。poll 由上下文指引随后启动。
 """
+
+VARIADIC_FLAGS = frozenset({
+    '--disallowed-tools', '--disallowedTools',
+    '--allowed-tools', '--allowedTools',
+    '--tools', '--add-dir',
+})
+"""claude CLI 里**吞掉其后全部参数**的选项（``--help`` 记为 ``<tools...>``）。
+
+commander.js 的 variadic 选项没有终止符：``--disallowed-tools A,B "提示词"``
+会被解析成 tools = ``['A,B', '提示词']``，**位置参数就此消失**。
+
+实测代价：加上 ``--disallowed-tools`` 那一版拉起的 reviewer 抱着空提示符干等，
+表面看像"spawn 成功了但它不动"——最难查的那类失败。
+"""
+
+
+INHERITED_MARKERS_TO_DROP = ('CLAUDE_CODE_CHILD_SESSION',)
+"""必须从子进程环境里摘掉的**继承标记**。
+
+被拉起的实例是一个独立会话，不是调用方的子会话。继承这个标记会让它关掉
+transcript 保存（启动横幅："Transcript saving is off — inherited
+CLAUDE_CODE_CHILD_SESSION marker"），于是它既不可 resume、事后也难追溯——
+而"事后能追溯一个 agent 到底做了什么"正是这套网络存在的理由之一。
+"""
+
+
+def build_child_env(
+        base: Mapping[str, str],
+        agent_id: str,
+        topics: str | None,
+        role_env: Mapping[str, str],
+) -> dict[str, str]:
+    """装配被拉起实例的环境变量。
+
+    :param base: 继承来源，通常是 ``os.environ``
+    :param role_env: 角色声明的覆盖项，**最后生效**——它表达"同一个 CLI、不同后端"，
+        必须能盖住继承来的同名变量，否则调用方的后端配置会漏进子实例
+    """
+    env = {key: value for key, value in base.items()
+           if key not in INHERITED_MARKERS_TO_DROP}
+    env['AGENTNET_ID'] = agent_id
+    if topics:
+        env['AGENTNET_TOPICS'] = topics
+    env.update(role_env)
+    return env
+
+
+def reject_swallowed_positional(argv: list[str], positional_index: int) -> None:
+    """确认位置参数不会被 variadic 选项吞掉，否则当场 raise。
+
+    :param positional_index: 位置参数在 ``argv`` 中的下标
+
+    单独成函数是为了**能被直接喂坏输入测试**——只测 :func:`build_claude_argv`
+    的产物永远是对的，测不到守卫本身在该响的时候响不响。
+    """
+    for index, token in enumerate(argv):
+        if index < positional_index and token in VARIADIC_FLAGS:
+            raise RuntimeError(
+                f"argv 排布错误：位置参数 `{argv[positional_index]}` 落在 variadic "
+                f"选项 `{token}` 之后，会被它吞掉，新实例将收不到任何提示词。argv={argv}")
+
+
+def build_claude_argv(
+        executable: list[str],
+        prompt: str,
+        session_id: str,
+        name: str,
+        permission_mode: str,
+        blocked_tools: list[str],
+) -> list[str]:
+    """装配 claude 兼容启动器的 argv。
+
+    :param executable: 已解析的可执行文件（``resolve_launcher`` 的产物）
+    :param prompt: 位置参数，即首条用户消息
+    :param blocked_tools: 工具级禁用清单，空则不下这个选项
+
+    **不变式：位置参数紧跟可执行文件，variadic 选项一律在末尾。** 这是唯一
+    可靠的排布——commander 的 variadic 没有终止符，位置参数只要落在它后面
+    就会被吞掉（见 :data:`VARIADIC_FLAGS`）。装配完即自校验，排错当场 raise，
+    而不是拉起一个静默空转的实例。
+    """
+    argv = [*executable, prompt,
+            '--session-id', session_id, '-n', name,
+            '--permission-mode', permission_mode]
+    if blocked_tools:
+        # 工具名是纯 ASCII，走 argv 安全；这是角色边界里**真拦得住**的那一半
+        argv += ['--disallowed-tools', ','.join(blocked_tools)]
+    reject_swallowed_positional(argv, len(executable))
+    return argv
 
 
 def in_windows_terminal() -> bool:
@@ -2041,13 +2155,9 @@ def cmd_spawn(args: argparse.Namespace) -> None:
     if role.get('claude_compatible') and len(launcher_parts) == 1:
         # 位置参数 = 首条用户消息，负责"第一推动"：没有它，新会话只会抱着空提示符干等。
         # 只放一句引导而不是任务全文——任务走收件箱这条**唯一**通道，不受命令行长度限制。
-        inner = resolve_launcher(launcher_parts[0]) + [
-            '--session-id', new_id, '-n', name, '--permission-mode', permission_mode]
-        blocked = Config.role_disallowed_tools(role_name)
-        if blocked:
-            # 工具名是纯 ASCII，走 argv 安全；这是角色边界里**真拦得住**的那一半
-            inner += ['--disallowed-tools', ','.join(blocked)]
-        inner.append(BOOTSTRAP_PROMPT)
+        inner = build_claude_argv(
+            resolve_launcher(launcher_parts[0]), BOOTSTRAP_PROMPT,
+            new_id, name, permission_mode, Config.role_disallowed_tools(role_name))
         needs_run = bool(role_env)   # 只有要注入 env 时才多包一层
     else:
         # 其它 harness：没有 --session-id 这类身份开关，只能靠环境变量注入身份
@@ -2256,12 +2366,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     if not rest:
         _die('`--` 之后需要给出要运行的命令，例如：agentnet run -- codex "..."')
     agent_id = args.id or str(uuid.uuid4())
-    env = dict(os.environ)
-    env['AGENTNET_ID'] = agent_id
-    if args.topics:
-        env['AGENTNET_TOPICS'] = args.topics
     role_env = Config.role_env(args.role) if args.role else {}
-    env.update(role_env)
+    env = build_child_env(os.environ, agent_id, args.topics, role_env)
     # flush：否则本行会因缓冲排在子进程输出之后，读起来像是子进程先跑完才注入的身份
     banner = f"[agentnet] AGENTNET_ID={agent_id}"
     if role_env:
@@ -2607,6 +2713,58 @@ def cmd_lock(args: argparse.Namespace) -> None:
 # 归档、恢复与 sweep
 # ══════════════════════════════════════════════════════════════════════════
 
+def displace_hollow_shell(destination: Path, agent_id: str) -> Path | None:
+    """挡在恢复路径上的目录若是**空壳**，挪到一边并返回它；是真登记则当场报错。
+
+    空壳的来历：一个 agent 被归档（整目录移进 ``archive/``）时，它的轮询器可能还在跑；
+    旧版本的心跳会把 ``agents/<id>/info.md`` 重新写出来，于是留下一个**只有 last_active
+    的目录**——没有 ``id``、没有 ``cwd``、没有 ``status``。轮询器现已会在登记消失时退位
+    （见 ``cmd_poll`` 的 ``retirement_reason``），但存量空壳仍需清理。
+
+    判据是 ``id`` 字段：正常登记一定有它（``register`` 首次写死），空壳一定没有。
+
+    :raises RuntimeError: 挡路的是**真登记**。刻意用普通异常而非 ``_die``——看板动作
+        在 ``except Exception`` 里逐条执行，``SystemExit`` 会穿过它把整个轮询器带走，
+        于是"一次恢复点错了"升级成"这个 agent 从此收不到信"。
+    """
+    if not destination.exists():
+        return None
+    info = destination / 'info.md'
+    meta, _ = read_info(info) if info.exists() else ({}, '')
+    if meta.get('id'):
+        raise RuntimeError(f"{agent_id[:8]} 已经在花名册里了，无需恢复")
+    shell = destination.with_name(f"{agent_id}.shell-{now().strftime('%Y%m%dT%H%M%S')}")
+    os.replace(destination, shell)
+    return shell
+
+
+def absorb_shell(shell: Path, destination: Path) -> tuple[int, Path | None]:
+    """把空壳里攒下的信件并回恢复出来的目录，再删掉空壳。
+
+    空壳虽然没有身份，却可能已经收到过信——投递只看目录在不在。直接删掉就是丢信，
+    所以先搬再删；有搬不走的内容就**留着壳**，让人来看，不静默删除任何数据。
+
+    :return: ``(救回的信件数, 未能删除的空壳)``。第二项为 None 表示已清干净。
+        返回它而不是自己打印结论，是为了让调用方**如实**描述发生了什么——
+        否则会出现"顺带清掉了空壳"与紧随其后的"未删除"自相矛盾（实测出现过）。
+    """
+    rescued = 0
+    inbox = shell / 'inbox'
+    if inbox.is_dir():
+        (destination / 'inbox').mkdir(parents=True, exist_ok=True)
+        for letter in sorted(inbox.glob('*.md')):
+            os.replace(letter, destination / 'inbox' / letter.name)
+            rescued += 1
+    # 空壳自己那份残缺 info.md 不算"内容"——它正是空壳的定义（只有 last_active、
+    # 没有 id），留着毫无价值。把它算进去会让告警**永远**触发。
+    leftovers = [p for p in shell.rglob('*') if p.is_file() and p != shell / 'info.md']
+    if leftovers:
+        print(f"[WARN] 空壳 `{shell.name}` 里还有 {len(leftovers)} 个文件，未删除，请人工确认。")
+        return rescued, shell
+    shutil.rmtree(shell, ignore_errors=True)
+    return rescued, None
+
+
 def archive_agent(ws: Workspace, agent_id: str, by: str, reason: str) -> list[str]:
     """把一个 agent 整目录移入 archive/，并释放它持有的锁。返回释放掉的锁名。
 
@@ -2789,12 +2947,19 @@ def run_console_action(ws: Workspace, action: dict[str, Any]) -> str:
             released = archive_agent(ws, agent_id, 'console', 'archived from dashboard')
             return f"已归档 {agent_id[:8]}" + (f"，释放锁 {', '.join(released)}" if released else '')
         if verb == 'restore':
-            os.replace(ws.archive_dir / agent_id, ws.agents_dir / agent_id)
+            destination = ws.agents_dir / agent_id
+            shell = displace_hollow_shell(destination, agent_id)
+            os.replace(ws.archive_dir / agent_id, destination)
+            rescued, stuck = absorb_shell(shell, destination) if shell else (0, None)
             merge_info(ws.info_path_of(agent_id), {
                 'status': STATUS_ACTIVE, 'last_active': now(), 'poller_pid': None,
                 'archived_at': None, 'archived_by': None, 'archive_reason': None,
             })
-            return f"已恢复 {agent_id[:8]}（它须重新启动轮询器才能收信）"
+            note = ''
+            if shell:
+                note = (f"，空壳{'留待人工确认' if stuck else '已清掉'}"
+                        f"、救回 {rescued} 封信")
+            return f"已恢复 {agent_id[:8]}{note}（它须重新启动轮询器才能收信）"
     except Exception as exc:  # noqa: BLE001 —— 单个动作失败不该让整队停摆
         return f"`{verb} {target}` 失败：{type(exc).__name__}: {exc}"
     return f"拒绝：未处理的动作 `{verb}`"
@@ -2868,13 +3033,16 @@ def cmd_restore(args: argparse.Namespace) -> None:
     source = candidates[0]
     agent_id = source.name.split('-20')[0] if source.name.count('-') > 4 else source.name
     destination = ctx.agents_dir / agent_id
-    if destination.exists():
-        _die(f"{agent_id[:8]} 已经在花名册里了，无需恢复")
+    try:
+        shell = displace_hollow_shell(destination, agent_id)
+    except RuntimeError as exc:
+        _die(str(exc))
 
     ctx.agents_dir.mkdir(parents=True, exist_ok=True)
     os.replace(source, destination)
     for sub in ('inbox', 'read', 'sent'):
         (destination / sub).mkdir(parents=True, exist_ok=True)
+    rescued, stuck = absorb_shell(shell, destination) if shell else (0, None)
     merge_info(destination / 'info.md', {
         'status': STATUS_ACTIVE,
         'last_active': now(),
@@ -2885,6 +3053,10 @@ def cmd_restore(args: argparse.Namespace) -> None:
     })
     unread = len(inbox_letters(ctx, agent_id))
     print(f"[OK] 已恢复 {agent_id[:8]} → agents/")
+    if shell:
+        fate = f"已留在 `{stuck.name}` 待人工确认" if stuck else '已删除'
+        print(f"  路上挡着一个空壳目录（归档后仍在跑的轮询器写回来的）：{fate}"
+              f"，救回其中 {rescued} 封信")
     print(f"  未读信件 {unread} 封（归档期间投递会被拒绝，所以这些是归档前留下的）")
     print(f"  **它必须重新后台运行 `agentnet poll`** 才算真正回到可收信状态。")
 
