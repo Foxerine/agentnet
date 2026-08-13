@@ -17,6 +17,9 @@ agentnet who                                         # 看看还有谁在
 
 然后**告诉用户一句**：可以 `agentnet dashboard --open` 打开管理后台看全网现状。
 
+要拉起别的 agent（比如找个 reviewer）时，先 `agentnet roles` 看可选角色——
+别去读 config.toml，那是人类维护的策略，你只需从菜单里报一个名字。
+
 轮询器**必须**挂上：它既是你收信的唯一途径（空闲时），也是你的心跳来源。
 停了轮询器 = 5 分钟后被判定死亡 = 别人投信给你会被当场拒绝。
 
@@ -105,6 +108,16 @@ agentnet who [--topic x] [--alive] [--workspace <slug>] [--include-archived]
 ```
 
 status 是**读取时**按心跳推算的，不信任存过的值——与锁的租约懒过期同理。
+
+### `roles`
+
+列出可用的 spawn 角色（人类维护的菜单）
+
+```
+agentnet roles
+```
+
+拉起子实例前用它看菜单。角色、启动命令、权限模式都由**人类**在策略配置里定，agent 只能从中报一个名字——所以你需要一个看菜单的入口，而不是自己去读配置文件（那等于绕过抽象）。
 
 ### `workspaces`
 
@@ -197,6 +210,7 @@ agentnet log "在做什么" [--plan <计划文件路径>] [--pivot]
 agentnet spawn (--task-file t.md | --task "...") [--role <角色名>] [--mode tab|window|pane|named|background] [--window <id|名字>] [--topics a,b] [--name x] [--dry-run]
 ```
 
+**先跑 `agentnet roles` 看菜单。**
 **角色、启动命令、权限模式都来自人类维护的策略配置**，agent 只能报一个角色名——它无法自由组合"用什么命令拉起 + 给多大权限"，因此不存在权限棘轮（受限 agent 拉起更自由的子 agent、逐级放大）。新增角色是人的动作。
 评审角色**建议配成与作者不同的模型**：对抗性评审的价值来自独立性，同一个模型的盲区是共享的。
 默认 `tab` 投向**约定窗口** `agentnet-<workspace>`——同 workspace 的 agent 全聚在一处。

@@ -864,6 +864,29 @@ def cmd_who(args: argparse.Namespace) -> None:
 
 
 @command(
+    'roles',
+    '列出可用的 spawn 角色（人类维护的菜单）',
+    'agentnet roles',
+    detail=('拉起子实例前用它看菜单。角色、启动命令、权限模式都由**人类**在策略配置里定，'
+            'agent 只能从中报一个名字——所以你需要一个看菜单的入口，'
+            '而不是自己去读配置文件（那等于绕过抽象）。'),
+)
+def cmd_roles(args: argparse.Namespace) -> None:
+    roles = Config.roles()
+    default = Config.spawn_setting('default_role', 'peer')
+    permission = Config.spawn_setting('permission_mode', 'auto')
+    print(f"可用角色（默认 `{default}`，被拉起实例的权限模式 `{permission}`）：\n")
+    width = max(len(name) for name in roles)
+    for name in sorted(roles):
+        role = roles[name]
+        mark = ' *' if name == default else '  '
+        compat = 'claude 同款参数' if role.get('claude_compatible') else '经 run 包装器注入身份'
+        print(f"{mark}{name.ljust(width)}   {str(role.get('command', '?')):<12} {compat}")
+    print(f"\n用法：agentnet spawn --role <名字> --task-file <简报>")
+    print(f"新增角色是**人类**的动作——编辑 {CONFIG_PATH}")
+
+
+@command(
     'workspaces',
     '列出全部 workspace 及成员数',
     'agentnet workspaces',
@@ -944,6 +967,9 @@ def render_readme() -> str:
         '```',
         '',
         '然后**告诉用户一句**：可以 `agentnet dashboard --open` 打开管理后台看全网现状。',
+        '',
+        '要拉起别的 agent（比如找个 reviewer）时，先 `agentnet roles` 看可选角色——',
+        '别去读 config.toml，那是人类维护的策略，你只需从菜单里报一个名字。',
         '',
         '轮询器**必须**挂上：它既是你收信的唯一途径（空闲时），也是你的心跳来源。',
         f'停了轮询器 = {dead_after_s() // 60} 分钟后被判定死亡 = 别人投信给你会被当场拒绝。',
@@ -1805,7 +1831,8 @@ def _args_spawn(p: argparse.ArgumentParser) -> None:
     'agentnet spawn (--task-file t.md | --task "...") [--role <角色名>] '
     '[--mode tab|window|pane|named|background] [--window <id|名字>] '
     '[--topics a,b] [--name x] [--dry-run]',
-    detail=('**角色、启动命令、权限模式都来自人类维护的策略配置**，agent 只能报一个角色名——'
+    detail=('**先跑 `agentnet roles` 看菜单。**\n'
+            '**角色、启动命令、权限模式都来自人类维护的策略配置**，agent 只能报一个角色名——'
             '它无法自由组合"用什么命令拉起 + 给多大权限"，因此不存在权限棘轮'
             '（受限 agent 拉起更自由的子 agent、逐级放大）。新增角色是人的动作。\n'
             '评审角色**建议配成与作者不同的模型**：对抗性评审的价值来自独立性，'
