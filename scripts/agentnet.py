@@ -264,6 +264,18 @@ DEFAULT_BODY = f"""{SECTION_SCOPE}
 # 基础工具
 # ══════════════════════════════════════════════════════════════════════════
 
+EXIT_LOCK_HELD = 3
+"""``lock acquire`` 因**被他人持有**而失败的专用退出码。
+
+与通用错误码（1）分开，是为了让脚本调用方能区分两件性质完全不同的事：
+**"锁被占了，等一会儿再来"**（正常的竞争结果，应当重试）与 **"agentnet 用不了"**
+（未注册 / 参数错 / 环境不对，重试一万次也没用，应当降级或报错）。
+
+只靠退出码 1 的话，调用方只能去匹配错误文案里的中文子串——那种判据在改一句提示
+文案时就会静默失效。SCPM 迁移正是第一个需要区分它们的调用方。
+"""
+
+
 def _die(msg: str, code: int = 1) -> NoReturn:
     print(f"[ERR] {msg}", file=sys.stderr)
     raise SystemExit(code)
@@ -2738,7 +2750,8 @@ def cmd_lock(args: argparse.Namespace) -> None:
         return
     holder = str((held or {}).get('holder', '?'))[:8]
     _die(f"`{args.name}` 正被 {holder} 持有，到期 {(held or {}).get('expires_at')}。\n"
-         f"  等它释放，或到期后自动可抢占。当前用途：{(held or {}).get('purpose') or '（未注明）'}")
+         f"  等它释放，或到期后自动可抢占。当前用途：{(held or {}).get('purpose') or '（未注明）'}",
+         code=EXIT_LOCK_HELD)
 
 
 # ══════════════════════════════════════════════════════════════════════════

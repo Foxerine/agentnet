@@ -267,6 +267,28 @@ class TestWorkspaceIsolation(Base):
 # 锁：互斥 / 租约懒过期 / 释放后不留僵尸目录
 # ══════════════════════════════════════════════════════════════════════════
 
+class TestLockExitCodes(Base):
+    """竞争失败必须与"agentnet 用不了"用不同的退出码区分开。
+
+    脚本调用方（SCPM 迁移是第一个）据此决定该重试还是该降级。只靠"非零"会把环境
+    问题当成竞争，白白轮询到超时却看不到真正的原因。
+    """
+
+    def test_contention_has_its_own_exit_code(self) -> None:
+        self.assertNotEqual(an.EXIT_LOCK_HELD, 1, '必须与通用错误码区分')
+        self.assertNotEqual(an.EXIT_LOCK_HELD, 0)
+
+    def test_held_lock_exits_with_that_code(self) -> None:
+        import argparse
+        self.register()
+        ctx = self.ctx()
+        an.try_acquire_lock(ctx, 'scpm', 'someone-else', 999, 'held by other', 600)
+        with self.assertRaises(SystemExit) as caught:
+            an.cmd_lock(argparse.Namespace(
+                action='acquire', name='scpm', purpose='mine', ttl=600, all=False))
+        self.assertEqual(caught.exception.code, an.EXIT_LOCK_HELD)
+
+
 class TestLocks(Base):
 
     def test_mutual_exclusion(self) -> None:
