@@ -1008,6 +1008,34 @@ def _args_readme(p: argparse.ArgumentParser) -> None:
     group.add_argument('--check', action='store_true', help='校验磁盘版本与生成版本是否一致')
 
 
+SKILL_PATH = Path(__file__).resolve().parent.parent / 'skill' / 'SKILL.md'
+"""agent skill 文档。**手写**——它讲的是 ``--help`` 给不了的判断，故不参与生成与比对。
+
+但它引用的子命令必须真实存在，见 :func:`unknown_commands_in_skill`。
+"""
+
+_SKILL_COMMAND_MENTION = re.compile(r'`agentnet ([a-z][a-z-]*)')
+"""从 SKILL.md 里摘出被引用的子命令名。
+
+**必须以字母开头**——否则 ``agentnet --help`` 里的 ``--help`` 会被当成一个子命令名，
+守卫在自己身上误报（实测第一版就是这么错的）。
+"""
+
+
+def unknown_commands_in_skill() -> list[str]:
+    """SKILL.md 里提到、但命令表中不存在的子命令。
+
+    skill **刻意不复制命令表**——复制就是第二个真相源，必然漂移。但"不复制"挡不住
+    另一种漂移：命令改名或删除后 skill 仍在教旧用法，而 agent 正是照着 skill 行动的，
+    教错等于让它反复执行一条不存在的命令。这条只验引用存在性，成本极低。
+    """
+    if not SKILL_PATH.exists():
+        return []
+    known = {cmd.name for cmd in COMMANDS}
+    mentioned = set(_SKILL_COMMAND_MENTION.findall(SKILL_PATH.read_text(encoding='utf-8')))
+    return sorted(mentioned - known)
+
+
 @command(
     'readme',
     '生成 / 校验 ~/.agentnet/README.md',
@@ -1024,9 +1052,13 @@ def cmd_readme(args: argparse.Namespace) -> None:
         return
     if not README_PATH.exists():
         _die(f"README 不存在: {README_PATH}（跑 `agentnet readme --write`）")
+    stale = unknown_commands_in_skill()
+    if stale:
+        _die(f"skill/SKILL.md 引用了不存在的子命令：{', '.join(stale)}。"
+             "命令改名或删除后要同步改 skill——agent 是照着它行动的。")
     on_disk = README_PATH.read_text(encoding='utf-8')
     if on_disk == generated:
-        print("[OK] README 与实现一致")
+        print("[OK] README 与实现一致；SKILL.md 引用的子命令均存在")
         return
     _die("README 与实现**不一致**——命令表或常量已变。跑 `agentnet readme --write` 重新生成。")
 

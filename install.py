@@ -32,6 +32,8 @@ BIN = REPO / 'bin'
 SCRIPT = REPO / 'scripts' / 'agentnet.py'
 
 CLAUDE_SETTINGS = Path.home() / '.claude' / 'settings.json'
+SKILL_SOURCE = REPO / 'skill' / 'SKILL.md'
+SKILL_TARGET = Path.home() / '.claude' / 'skills' / 'agentnet' / 'SKILL.md'
 
 SAFE_SUBCOMMANDS = (
     'register', 'charter', 'whoami', 'who', 'workspaces', 'send', 'reply', 'poll',
@@ -139,11 +141,35 @@ def report() -> None:
         wired = [e for e in ('SessionStart', 'Stop')
                  if any('agentnet' in json.dumps(h) for h in (settings['hooks'].get(e) or []))]
         print(f"Claude 钩子   : 已配置事件 {events or '无'}；AgentNet 已接入 {wired or '无'}")
+    print(f"Agent skill   : {skill_state()}")
+
+
+def install_skill() -> None:
+    """把 SKILL.md 装进 ``~/.claude/skills/agentnet/``。
+
+    装的是**副本**而不是符号链接：Windows 上建符号链接需要开发者模式或管理员权限，
+    在一个"给别人克隆就能用"的安装器里不能假设有。副本会漂移，所以 ``--check``
+    会比对两份内容并在不一致时说出来。
+    """
+    if not SKILL_SOURCE.exists():
+        raise SystemExit(f'[ERR] 找不到 {SKILL_SOURCE}')
+    SKILL_TARGET.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(SKILL_SOURCE, SKILL_TARGET)
+    print(f"[OK] 已安装 skill → {SKILL_TARGET}")
+
+
+def skill_state() -> str:
+    if not SKILL_TARGET.exists():
+        return '未安装（`python install.py --skill`）'
+    same = SKILL_TARGET.read_bytes() == SKILL_SOURCE.read_bytes()
+    return '已安装，与仓库一致' if same else '**已安装但与仓库不一致** —— 重跑 --skill 覆盖'
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='安装 AgentNet 启动器（可选：接上 Claude Code 钩子）')
     parser.add_argument('--hooks', action='store_true', help='顺便接上 SessionStart / Stop 钩子')
+    parser.add_argument('--skill', action='store_true',
+                        help='顺便把 SKILL.md 装进 ~/.claude/skills/agentnet/')
     parser.add_argument('--check', action='store_true', help='只报告现状，不做任何改动')
     args = parser.parse_args()
 
@@ -162,6 +188,8 @@ def main() -> None:
         print(f"[OK] 已安装 {path}")
     if args.hooks:
         install_hooks()
+    if args.skill:
+        install_skill()
 
     print()
     print('接下来：')

@@ -442,6 +442,50 @@ class TestReadme(Base):
         self.assertIn('Bash(agentnet:*)', an.render_readme())
 
 
+class TestSkill(Base):
+    """SKILL.md 是 agent 照着行动的文本，引用错了就是让它执行不存在的命令。
+
+    断言的对象是**仓库里那份产物**（``_REPO/skill/SKILL.md``），而不是
+    ``an.SKILL_PATH`` —— 后者由被测模块的 ``__file__`` 推导，测候选文件时会指到别处。
+    """
+
+    SKILL = _REPO / 'skill' / 'SKILL.md'
+
+    def test_skill_file_exists(self) -> None:
+        self.assertTrue(self.SKILL.exists(), f'缺少 {self.SKILL}')
+
+    def test_skill_has_frontmatter_with_name_and_description(self) -> None:
+        """Claude Code 靠 description 决定何时加载它——缺了就永远不会被触发。"""
+        text = self.SKILL.read_text(encoding='utf-8')
+        self.assertTrue(text.startswith('---\n'), 'skill 须以 YAML frontmatter 开头')
+        head = text.split('---', 2)[1]
+        self.assertIn('name: agentnet', head)
+        self.assertRegex(head, r'description:\s*\S')
+
+    def test_skill_references_only_real_commands(self) -> None:
+        known = {cmd.name for cmd in an.COMMANDS}
+        mentioned = set(an._SKILL_COMMAND_MENTION.findall(
+            self.SKILL.read_text(encoding='utf-8')))
+        self.assertEqual(sorted(mentioned - known), [])
+
+    def test_guard_catches_a_renamed_command(self) -> None:
+        """守卫必须在该响时真的响——只测当前文件干净，测不出这一点。"""
+        known = {cmd.name for cmd in an.COMMANDS}
+        self.assertNotIn('teleport', known)
+        mentioned = set(an._SKILL_COMMAND_MENTION.findall('跑 `agentnet teleport --now`'))
+        self.assertEqual(sorted(mentioned - known), ['teleport'])
+
+    def test_guard_ignores_long_options(self) -> None:
+        """`agentnet --help` 里的 --help 不是子命令。第一版正则把它当成了子命令，
+        于是守卫在自己身上误报——误报会让人把守卫关掉，比没有守卫更糟。"""
+        self.assertEqual(an._SKILL_COMMAND_MENTION.findall('`agentnet --help`'), [])
+
+    def test_skill_path_points_beside_the_script(self) -> None:
+        """部署形态是"仓库即运行时根目录"，skill 与 scripts/ 同级。"""
+        self.assertEqual(an.SKILL_PATH.name, 'SKILL.md')
+        self.assertEqual(an.SKILL_PATH.parent.name, 'skill')
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # 拉起命令行的装配
 # ══════════════════════════════════════════════════════════════════════════
