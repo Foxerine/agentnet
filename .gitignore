@@ -1,0 +1,30 @@
+# AgentNet：仓库既是源码也是运行时根目录（`git clone <url> ~/.agentnet` 即安装）。
+# 所以这里要把**运行时状态**全部挡在版本控制之外——它们是每台机器各自的事实，
+# 不是项目的一部分。
+
+# 网络自身的状态：花名册、信件、锁、归档
+workspaces/
+
+# 本机策略配置：写着你本机的 agent CLI 名字与权限模式，不该被提交、也不该被别人的覆盖。
+# 无需提供 example —— 首次运行会从 scripts/agentnet.py 里的 DEFAULT_CONFIG 生成它，
+# 那是唯一真相源，另存一份 example 只会多一处漂移。
+config.toml
+
+# 看板的派生产物与浏览器 profile
+dashboard.html
+dashboard-data.json
+.browser-profile/
+
+# 控制台指令队列与执行记录（运行时）
+console-queue.json
+console-log.json
+
+# 注意：README.md **是**提交的。它由 `agentnet readme --write` 生成，
+# 但机器无关，且 GitHub 需要它当着陆页。防漂移靠 `agentnet readme --check`
+# （改了命令表却忘了重新生成就会失败），而不是靠不提交。
+
+# 兜底身份映射（无 session id 的 harness 用）
+**/.fallback-ids/
+
+__pycache__/
+*.pyc

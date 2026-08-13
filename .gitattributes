@@ -1,0 +1,15 @@
+# 行尾一律 LF 入库。
+#
+# 这不是洁癖：bin/agentnet 是 POSIX shell 脚本，一旦 checkout 成 CRLF，
+# bash 会把 shebang 读成 `/bin/sh\r` 而报 "bad interpreter"。
+# Windows 上开发、Linux 上运行的项目最常见的一类"在我机器上好好的"。
+* text=auto eol=lf
+
+# 明确声明：这两个必须是 LF，即便用户全局配了 core.autocrlf=true
+bin/agentnet    text eol=lf
+*.sh            text eol=lf
+*.py            text eol=lf
+
+# .cmd 是给 cmd.exe 的，CRLF 才是它的原生行尾
+bin/*.cmd       text eol=crlf
+*.bat           text eol=crlf

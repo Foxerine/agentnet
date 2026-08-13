@@ -1,0 +1,29 @@
+#!/bin/sh
+# AgentNet launcher for POSIX shells (Git Bash, WSL, Linux, macOS).
+#
+# Why this exists alongside agentnet.cmd: bash does NOT honour PATHEXT, so it only
+# ever looks for a file named exactly "agentnet". Without this sibling, every
+# `agentnet ...` from Git Bash dies with exit 127 -- which also breaks the wake
+# mechanism, since background pollers are launched through bash.
+#
+# PYTHONUTF8=1 forces Python's UTF-8 mode so stdout/stderr and file I/O are UTF-8
+# regardless of the system ANSI codepage. Without it, printing non-ASCII through a
+# Git Bash pipe raises UnicodeEncodeError on a CJK Windows install.
+#
+# It does NOT fix non-ASCII *arguments*: Git Bash builds the child command line as
+# UTF-8 bytes but Windows CreateProcess decodes it with the system ANSI codepage,
+# so the text is already mangled before Python sees it. agentnet detects that and
+# refuses rather than writing garbage to disk. Real fixes: set the system codepage
+# to UTF-8, or pass text through --*-file options instead of arguments.
+#
+# ASCII only, LF line endings: bash rejects a CRLF shebang.
+PYTHONUTF8=1
+export PYTHONUTF8
+
+: "${AGENTNET_HOME:=$HOME/.agentnet}"
+script="$AGENTNET_HOME/scripts/agentnet.py"
+if command -v cygpath >/dev/null 2>&1; then
+  # Windows python.exe cannot open a POSIX path like /c/Users/...
+  script="$(cygpath -w "$script")"
+fi
+exec python "$script" "$@"
