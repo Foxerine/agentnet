@@ -553,7 +553,12 @@ def read_info(path: Path) -> tuple[dict[str, Any], str]:
     return parse_doc(path)
 
 
-def merge_info(path: Path, updates: dict[str, Any], body: str | None = None) -> dict[str, Any]:
+def merge_info(
+        path: Path,
+        updates: dict[str, Any],
+        body: str | None = None,
+        expect: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """**字段级合并**写回 ``info.md``。
 
     这是本文件最关键的一条约束：解析现有 frontmatter → 只覆写 ``updates`` 里给出的键 →
@@ -561,11 +566,17 @@ def merge_info(path: Path, updates: dict[str, Any], body: str | None = None) -> 
 
     禁止"重新生成整个文件"——那会让每 5 分钟一次的心跳把 LLM 写的 topics 与正文一起抹掉，
     而且症状隐蔽：charter 完一切正常，五分钟后职责声明凭空消失。
+
+    :param expect: 可选的前置条件（compare-and-set）。给出时，只有现有值与它**全部相等**
+        才写入；否则原样返回 ``None`` 不落盘。用于"只有我还是持有者时才有资格改这个字段"——
+        没有它，一个已被接替的写者会把接替者的登记覆盖掉（见 ``cmd_poll`` 的退位逻辑）。
     """
     if path.exists():
         meta, existing_body = read_info(path)
     else:
         meta, existing_body = {}, DEFAULT_BODY
+    if expect is not None and any(meta.get(key) != value for key, value in expect.items()):
+        return None
     for key, value in updates.items():
         if value is None:
             meta.pop(key, None)
@@ -778,6 +789,8 @@ def cmd_charter(args: argparse.Namespace) -> None:
     updates['last_active'] = now()
 
     meta = merge_info(ctx.info_path, updates, body=body)
+    if meta is None:  # 没传 expect 就不该被拒；真发生了说明有别的地方改了契约
+        _die('info.md 写入被前置条件拒绝（不应发生）')
     print(f"[OK] charter 已更新")
     print(f"  topics : {meta.get('topics', [])}")
     if body is not None:
@@ -1352,8 +1365,24 @@ def cmd_poll(args: argparse.Namespace) -> None:
         _die("你还没注册。先跑 `agentnet register`。")
     ensure_agent_home(ctx)
 
-    merge_info(ctx.info_path, {'poller_pid': os.getpid(), 'last_active': now(),
+    # 认领所有权：这一次是**无条件**写——新来的就是新主人。
+    # 此后本进程对 poller_pid 的每一次写都要门在"我还是主人"上，见 `mine` 与 `retire`。
+    me = os.getpid()
+    merge_info(ctx.info_path, {'poller_pid': me, 'last_active': now(),
                                'status': STATUS_ACTIVE})
+    mine = {'poller_pid': me}
+
+    def superseded() -> bool:
+        """我是否已被新的轮询器接替。
+
+        没有这个判断时，一个还在 ``sleep`` 里的旧轮询器醒来后会用**自己的旧 pid**
+        覆盖掉新主人的登记，或把它清成 None——于是 ``info.md`` 指向一个不存在的进程，
+        任何"读 poller_pid 再查存活"的外部检测（Stop 钩子就是这么做的）都会误判成死亡。
+        密集更新脚本时连续 RELOAD 会把这个窗口放大到必现。
+        """
+        meta, _ = read_info(ctx.info_path)
+        return meta.get('poller_pid') != me
+
     deadline = None if args.max_wait <= 0 else time.monotonic() + args.max_wait
     last_beat = time.monotonic()
     interval = max(1, args.interval)
@@ -1363,6 +1392,11 @@ def cmd_poll(args: argparse.Namespace) -> None:
     script_stamp = Path(__file__).stat().st_mtime
     try:
         while True:
+            # 被接替就**立刻退位，且什么都不写** —— 让位比抢着做完手上的事重要。
+            if superseded():
+                print('[退位] 已有新的轮询器接管本 agent，本进程退出（未改动任何登记）。')
+                return
+
             # 看板没有服务端，运行中的轮询器就是它的执行器：每轮顺带取走排队的管理动作。
             # 只是一次 exists() 检查，代价可忽略。
             if process_console_queue(ctx, ctx.agent_id):
@@ -1373,13 +1407,14 @@ def cmd_poll(args: argparse.Namespace) -> None:
                 items = consume(ctx, pending)
                 if items:
                     # 刷新心跳后再退出：给 agent 留出处理时间，别让它在处理途中被判死
-                    merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': None})
+                    merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': None},
+                               expect=mine)
                     print(render_letters(items))
                     print(REARM_NOTICE)
                     return
             moment = time.monotonic()
             if moment - last_beat >= heartbeat_interval_s():
-                merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': os.getpid()})
+                merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': me}, expect=mine)
                 last_beat = moment
                 # 没有守护进程，所以 sweep 搭轮询器的车跑——它本就是常驻的周期性载体。
                 # 用锁互斥 + 跟着心跳限频，避免 N 个 agent 同时扫。
@@ -1392,17 +1427,18 @@ def cmd_poll(args: argparse.Namespace) -> None:
                         release_lock(ctx, SWEEP_LOCK, ctx.agent_id)
                 refresh_dashboard_data()  # 长驻进程内部改了状态，也要让看板跟上
             if Path(__file__).stat().st_mtime != script_stamp:
-                merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': None})
+                merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': None},
+                           expect=mine)
                 print('[RELOAD] agentnet 脚本已更新，本轮询器跑的是旧代码，现在退出。\n'
                       '         **立刻重新后台运行 `agentnet poll`** 以载入新版本。')
                 return
             if deadline is not None and moment >= deadline:
-                merge_info(ctx.info_path, {'poller_pid': None})
+                merge_info(ctx.info_path, {'poller_pid': None}, expect=mine)
                 print(f"[TIMEOUT] 等待 {args.max_wait}s 无信件。**须重新运行 `agentnet poll`**。")
                 return
             time.sleep(interval)
     except KeyboardInterrupt:
-        merge_info(ctx.info_path, {'poller_pid': None})
+        merge_info(ctx.info_path, {'poller_pid': None}, expect=mine)
         raise
 
 
@@ -2141,6 +2177,8 @@ def cmd_hook(args: argparse.Namespace) -> None:
             updates['topics'] = _split_topics(topics_env)
             updates['topics_updated_at'] = now()
     meta = merge_info(ctx.info_path, updates)
+    if meta is None:  # 同上：本调用没传 expect
+        _die('info.md 写入被前置条件拒绝（不应发生）')
     _ensure_workspace_doc(ctx)
 
     # **钩子绝不消费收件箱。** 曾经在这里把 errand 消费掉并试图经 initialUserMessage 注入，

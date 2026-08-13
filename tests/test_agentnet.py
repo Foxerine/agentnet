@@ -153,6 +153,39 @@ class TestInfoMerge(Base):
         for text in ('第一步', '第二步', '第三步'):
             self.assertIn(text, body)
 
+    def test_superseded_writer_cannot_clobber_owner(self) -> None:
+        """被接替的轮询器不得覆盖新主人的登记。
+
+        真实事故（0de75e6c 报告）：旧 poller 在 ``sleep`` 里睡着，醒来后用**自己的旧 pid**
+        覆盖了新 poller 的登记 ⇒ ``poller_pid`` 指向一个不存在的进程 ⇒ 任何
+        "读 poller_pid 再查存活"的外部检测都误判成死亡。密集 RELOAD 时必现。
+        """
+        self.register()
+        info = self.ctx().info_path
+
+        an.merge_info(info, {'poller_pid': 111})          # 旧 poller 认领
+        an.merge_info(info, {'poller_pid': 222})          # 新 poller 接管（无条件，新主人）
+
+        stale_write = an.merge_info(info, {'poller_pid': None}, expect={'poller_pid': 111})
+        self.assertIsNone(stale_write, '旧持有者的写没有被前置条件挡住')
+        self.assertEqual(an.read_info(info)[0]['poller_pid'], 222, '新主人的登记被覆盖了')
+
+        own_write = an.merge_info(info, {'poller_pid': None}, expect={'poller_pid': 222})
+        self.assertIsNotNone(own_write, '真正的持有者反而写不进去')
+        self.assertIsNone(an.read_info(info)[0].get('poller_pid'))
+
+    def test_expect_does_not_touch_body(self) -> None:
+        """前置条件不成立时必须**完全不落盘**，不能顺手改了正文。"""
+        self.register()
+        info = self.ctx().info_path
+        an.merge_info(info, {}, body='## 负责内容\n\n原样保留\n')
+        refused = an.merge_info(info, {'pid': 7}, body='## 负责内容\n\n不该写进去\n',
+                                expect={'poller_pid': 99999})
+        self.assertIsNone(refused)
+        _, body = an.read_info(info)
+        self.assertIn('原样保留', body)
+        self.assertNotIn('不该写进去', body)
+
     def test_split_build_body_roundtrip(self) -> None:
         body = '## 负责内容\n\n职责\n\n## 工作日志\n\n- a\n- b\n'
         scope, worklog = an.split_body(body)
