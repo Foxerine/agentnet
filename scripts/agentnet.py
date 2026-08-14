@@ -1348,9 +1348,17 @@ TRUST_NOTE_ERRAND = (
 REARM_NOTICE = (
     "\n[!] 轮询器已随本次投递退出。**处理完上面的信件后，立刻重新后台运行 `agentnet poll`**，\n"
     "    否则你在空闲时收不到任何信、并会在 5 分钟后被判定死亡。\n"
-    "    （做不到自动续命：唤醒你靠的是 harness 追踪的那个后台进程退出，\n"
-    "      本脚本自己 spawn 的后继进程 harness 看不见，它退出唤不醒你。）"
+    "    **必须用 harness 的后台机制**（Claude Code 是 Bash 工具的 run_in_background）——\n"
+    "    自己用 `&` / `nohup` / `start` 挂后台**不行**：唤醒你靠的是 harness 追踪的那个进程退出，\n"
+    "    它追踪不到你自己 fork 的进程，那个进程退出时唤不醒任何人（本脚本自己 spawn 后继进程同理）。"
 )
+"""收信后提示重挂轮询器。
+
+**"用 `&` 挂不行"这句是后加的**（``0de75e6c`` 反馈）：原文只从"本脚本自己 spawn 后继
+进程"的角度说明，读者读过了却仍用 ``agentnet poll --interval 3 &`` 踩坑——因为他没意识到
+同一条道理**也适用于他自己用 `&` 挂**。同一个机制的两种表现形态，只讲一种，读者要自己
+完成那步类比才能受益；而需要读者补一步推理的警告，等于没警告。
+"""
 
 
 def letter_filename(sender_id: str) -> str:
@@ -2144,6 +2152,32 @@ def in_windows_terminal() -> bool:
     return bool(os.environ.get('WT_SESSION'))
 
 
+WINDOW_TARGETING_LIMIT = (
+    'Windows Terminal 不提供"我这个分页属于哪个窗口"的查询手段'
+    '（`WT_WINDOWID` 至今是未实现的功能请求），只能靠"窗口标题 = 活动分页标题"反推——'
+    '所以仅当**你的分页正好是所在窗口的活动分页**时才认得出来。'
+)
+"""为什么"开在发起方当前窗口"结构性做不到。
+
+**这不是偶发失败，是平台限制**，措辞上必须分清——否则调用方会以为"下次可能成功"
+而反复尝试，还会向用户承诺做不到的事（`0de75e6c` 报告：6 次 spawn **6 次**降级）。
+
+两条退路都实测验死了：
+  ① ``WT_WINDOWID`` 未实现，拿不到窗口 id；
+  ② 想从进程树反查——实测本机**一个 WindowsTerminal.exe 进程托管 23 个窗口**，
+     PID → 窗口是 1:23，反查不出是哪一个。
+而窗口标题只反映**活动**分页，后台分页从外部根本不可见。
+
+更关键的是**前提与使用场景系统性冲突**：spawn 的典型场景恰恰是"后台 agent 在用户
+看别处时拉起实例"，"我的分页正好是活动分页"在多实例并行下是小概率事件——
+而多实例并行正是 agentnet 存在的理由。
+
+所以默认不再尝试它：一个成功率≈0 的机制，代价却是 ``AttachThreadInput`` 抢前台——
+万一成功，就是在用户看别处时把焦点夺走。要它得 ``--window current`` 显式声明，
+且做不到时**响亮失败**。
+"""
+
+
 def focus_own_terminal_window() -> bool:
     """把**调用者自己所在的终端窗口**切到前台，好让随后的 ``wt -w 0``（最近使用的窗口）落在它上面。
 
@@ -2298,6 +2332,13 @@ def build_launch(
 
     返回 (argv, 实际生效的 mode, 目标窗口, 降级说明)。降级**显式返回**而不是静默改行为。
     """
+    # `--window` 的两个**保留值**表达意图，其余按具体窗口名处理。
+    # 让调用方声明"我要哪种"，而不是由 spawn 猜——猜错时它只能静默降级，
+    # 而静默降级正是"6/6 失败却没人察觉"的成因。
+    want_current_window = (window == 'current')
+    if window in ('current', 'shared'):
+        window = ''
+
     notes: list[str] = []
     effective = mode
     if mode != 'background' and not shutil.which('wt'):
@@ -2318,21 +2359,25 @@ def build_launch(
         target = window or '-1'
     elif window:
         target = window
-    else:
-        # tab / pane 且未显式指定窗口：先尝试把**自己的窗口**切到前台，
-        # 让 `-w 0`（最近使用的窗口）解析成我这一个 —— 这才是"父子同窗"。
-        # 切不成（我的分页不是活动分页、非 Windows、找不到 WT）就回退到约定具名窗口：
-        # 那个不受焦点影响，至少保证同 workspace 的 agent 聚在一处。
-        if allow_focus and focus_own_terminal_window():
+    elif want_current_window:
+        # 调用方**显式**要了"当前窗口"。能不能做到取决于我的分页此刻是不是所在窗口的
+        # 活动分页（原因见 WINDOW_TARGETING_LIMIT）——做不到就**响亮失败**，
+        # 而不是悄悄换个窗口然后报告成功。显式要求就该得到确定的答复。
+        if not allow_focus:
+            target = '0'
+            notes.append('dry-run：真实 spawn 会尝试把你的窗口切到前台再用 `-w 0`')
+        elif focus_own_terminal_window():
             target = '0'
             notes.append('已把你的窗口切到前台，新分页开在你这个窗口里')
-        elif not allow_focus:
-            target = workspace_window_name(slug)
-            notes.append('dry-run 不抢焦点，此处显示的是回退目标；真实 spawn 会先试你自己的窗口')
         else:
-            target = workspace_window_name(slug)
-            notes.append(f'未能定位/切换到你的窗口，回退到约定窗口 `{target}`'
-                         f'（我的分页须是所在窗口的活动分页才认得出来）')
+            _die(f"--window current 无法满足：{WINDOW_TARGETING_LIMIT}\n"
+                 f"  改用 `--window shared`（约定窗口 `{workspace_window_name(slug)}`，"
+                 f"这是默认值）或 `--window <具体名字>`。")
+    else:
+        # 默认：约定具名窗口。**不再默认去试"当前窗口"**——见 WINDOW_TARGETING_LIMIT，
+        # 那件事结构性做不到（实测 6/6 全部降级），而尝试本身要抢前台，
+        # 万一成功反而是在用户看别处时把焦点夺走。
+        target = workspace_window_name(slug)
 
     verb = 'sp' if effective == 'pane' else 'nt'
     argv = ['wt', '-w', target, verb]
@@ -2347,7 +2392,9 @@ def _args_spawn(p: argparse.ArgumentParser) -> None:
     p.add_argument('--task-file', help='任务简报 .md，将作为 errand 信投进新实例的收件箱')
     p.add_argument('--task', help='任务简报（短文本）')
     p.add_argument('--mode', default='tab', choices=SPAWN_MODES, help='启动模式（默认 tab）')
-    p.add_argument('--window', help='目标窗口 id 或名字（覆盖 mode 的默认定位）')
+    p.add_argument('--window', default='shared',
+                   help='shared=本 workspace 的约定窗口（默认）| current=你此刻所在的窗口'
+                        '（多数情况做不到，会响亮失败）| <名字或 id>=指定窗口')
     p.add_argument('--role', help='角色名，须出现在策略配置的 [roles.*] 菜单里（默认取 [spawn].default_role）')
     p.add_argument('--topics', help='为新实例预设的负责主题')
     p.add_argument('--name', help='显示名 / 分页标题')
@@ -2356,9 +2403,9 @@ def _args_spawn(p: argparse.ArgumentParser) -> None:
 
 @command(
     'spawn',
-    '拉起一个新 agent（默认开在发起方所在窗口的新分页）并转交任务',
+    '拉起一个新 agent（默认开在本 workspace 的约定窗口）并转交任务',
     'agentnet spawn (--task-file t.md | --task "...") [--role <角色名>] '
-    '[--mode tab|window|pane|named|background] [--window <id|名字>] '
+    '[--mode tab|window|pane|named|background] [--window shared|current|<名字>] '
     '[--topics a,b] [--name x] [--dry-run]',
     detail=('**先跑 `agentnet roles` 看菜单。**\n'
             '**角色、启动命令、权限模式都来自人类维护的策略配置**，agent 只能报一个角色名——'

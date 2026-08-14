@@ -439,6 +439,46 @@ class TestLetterHeadline(Base):
         self.assertTrue(letter_first.startswith('[LETTER]'))
 
 
+class TestSpawnWindowTargeting(Base):
+    """"开在发起方当前窗口"是平台限制，不是偶发失败——措辞与默认值都要如实反映。
+
+    实测（`0de75e6c` 报告）：6 次 spawn **6 次**降级。两条退路都验死了——`WT_WINDOWID`
+    未实现；进程树反查也不行（本机一个 WindowsTerminal.exe 托管 23 个窗口）。
+    """
+
+    def build(self, window: str) -> tuple:
+        return an.build_launch(mode='tab', window=window, title='t', cwd='C:/x',
+                               child=['claude'], slug='ws-1', allow_focus=False)
+
+    def test_default_targets_the_shared_window(self) -> None:
+        """默认不再去试"当前窗口"——成功率≈0，而尝试要抢前台、成功了反而夺走用户焦点。"""
+        _, _, target, notes = self.build('shared')
+        self.assertEqual(target, an.workspace_window_name('ws-1'))
+        self.assertEqual(notes, [], '默认路径不该报告任何降级——它本来就不是降级')
+
+    def test_explicit_name_is_honoured(self) -> None:
+        _, _, target, _ = self.build('my-window')
+        self.assertEqual(target, 'my-window')
+
+    def test_limit_is_stated_as_a_limit_not_a_failure(self) -> None:
+        """措辞决定调用方会不会反复重试、会不会向用户承诺做不到的事。"""
+        self.assertIn('WT_WINDOWID', an.WINDOW_TARGETING_LIMIT)
+        for misleading in ('未能', '失败', '重试'):
+            self.assertNotIn(misleading, an.WINDOW_TARGETING_LIMIT,
+                             f'限制说明里不该出现暗示"下次可能成功"的字眼：{misleading}')
+
+
+class TestRearmNotice(Base):
+
+    def test_warns_against_self_backgrounding(self) -> None:
+        """只讲"脚本 spawn 后继进程"这一种形态，读者要自己完成类比才受益——
+
+        而需要读者补一步推理的警告等于没警告：实测有人读过原文后仍用 `poll &` 踩坑。
+        """
+        self.assertIn('&', an.REARM_NOTICE)
+        self.assertIn('nohup', an.REARM_NOTICE)
+
+
 class TestProvenance(Base):
     """被拉起的实例必须知道自己是被谁起来的，否则它会推错整条授权链。
 
