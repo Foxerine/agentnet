@@ -246,7 +246,21 @@ LETTER_FIELD_ORDER: tuple[str, ...] = (
     'id', 'thread', 'from', 'to', 'to_topic', 'kind', 'subject', 'created_at', 'reply_to',
 )
 
-LETTER_KINDS = ('letter', 'review-request', 'review-reply', 'errand', 'control')
+LETTER_KINDS = ('letter', 'review-request', 'review-reply',
+                'review-resolved', 'review-blocked', 'errand', 'control')
+
+TERMINAL_REVIEW_KINDS = frozenset({'review-resolved', 'review-blocked'})
+"""把一条评审线程判为**终态**的两个 kind。
+
+评审用信件表达时，``review_channel.py`` 那套 STATUS/ROUND 状态机里唯一**不是**免费
+得到的性质，就是"这轮评审结束了没、结论是什么"。其余三条都由构造自然满足：
+轮次校验 = 你只能回复收到的信；append-only = 每封信一个文件；单次原子写 = 文件名唯一。
+
+所以不引入线程状态字段，只在既有的 ``kind`` 上加两个值：``review-resolved``（无阻塞，
+放行）与 ``review-blocked``（有阻塞项，需返工）。一条线程的最后一封信若是这两者之一，
+它就结束了——**判据是数据本身**，不需要谁去维护一个额外的状态位，
+也就没有"状态位与内容不同步"这种 STATUS/ROUND 机制特有的竞态。
+"""
 
 DEFAULT_BODY = f"""{SECTION_SCOPE}
 
@@ -1760,7 +1774,18 @@ def cmd_thread(args: argparse.Namespace) -> None:
     if not seen:
         _die(f"线程 `{args.thread}` 下没有信件")
     ordered = sorted(seen.values(), key=lambda item: item[0].get('created_at') or now())
-    print(f"线程 {args.thread} —— 共 {len(ordered)} 封\n")
+    print(f"线程 {args.thread} —— 共 {len(ordered)} 封")
+    # 终态由**最后一封信的 kind** 决定，不额外维护状态位——所以这里读的就是真相本身，
+    # 不存在"状态位说结束了、内容其实还没"的不同步。
+    last_kind = str(ordered[-1][0].get('kind') or '')
+    if last_kind in TERMINAL_REVIEW_KINDS:
+        verdict = '无阻塞，放行' if last_kind == 'review-resolved' else '**有阻塞项，需返工**'
+        print(f"状态：已结束（{last_kind}）—— {verdict}")
+    elif any(str(meta.get('kind') or '').startswith('review') for meta, _ in ordered):
+        holder = str(ordered[-1][0].get('to') or '?')[:8]
+        print(f"状态：进行中 —— 轮到 {holder}（终态靠 `--kind review-resolved` "
+              f"或 `review-blocked` 的回信来标记）")
+    print()
     for index, (meta, body) in enumerate(ordered, start=1):
         arrow = '→' if str(meta.get('from')) == ctx.agent_id else '←'
         other = meta.get('to') if arrow == '→' else meta.get('from')

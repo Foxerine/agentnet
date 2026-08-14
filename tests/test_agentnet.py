@@ -383,6 +383,26 @@ class TestAtomicWriteUnderContention(Base):
         self.assertRegex(target.read_text(encoding='utf-8'), r'^holder=w\d\n$')
 
 
+class TestReviewTerminalState(Base):
+    """评审用信件表达时，唯一不是免费得到的性质是"这轮结束了没、结论是什么"。
+
+    其余三条由构造满足：轮次校验＝只能回复收到的信；append-only＝一封一文件；
+    单次原子写＝文件名唯一。所以只加两个 kind，不加线程状态字段。
+    """
+
+    def test_terminal_kinds_are_accepted_by_cli(self) -> None:
+        for kind in ('review-resolved', 'review-blocked'):
+            self.assertIn(kind, an.LETTER_KINDS, f'{kind} 不在允许的 kind 里，send 会被拒')
+
+    def test_terminal_set_matches_the_kinds(self) -> None:
+        """判据集合与允许值必须同源，否则会出现"发得出去但判不出终态"的 kind。"""
+        self.assertTrue(an.TERMINAL_REVIEW_KINDS.issubset(set(an.LETTER_KINDS)))
+
+    def test_ongoing_review_kinds_are_not_terminal(self) -> None:
+        for kind in ('review-request', 'review-reply'):
+            self.assertNotIn(kind, an.TERMINAL_REVIEW_KINDS, f'{kind} 不该被当成终态')
+
+
 class TestProvenance(Base):
     """被拉起的实例必须知道自己是被谁起来的，否则它会推错整条授权链。
 
