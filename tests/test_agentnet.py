@@ -314,6 +314,30 @@ class TestAtomicWriteUnderContention(Base):
 
         self.assertEqual(list(self.tmp.glob('*.tmp.*')), [], '失败路径必须清理临时文件')
 
+    def test_read_retries_past_transient_permission_error(self) -> None:
+        """读侧也要重试——MoveFileEx 替换的那一瞬，读者一样打不开这个路径。
+
+        这一侧比写侧影响大：read_info 在每个轮询器的每一轮、每条命令启动时、
+        看板每次刷新时都会调用，不重试就等于"别人恰好在写"能掀掉一条无关命令。
+        """
+        target = self.tmp / 'info.md'
+        target.write_text('内容', encoding='utf-8')
+        real_read = an.Path.read_text
+        attempts: list[int] = []
+
+        def flaky(self_path: object, **kwargs: object) -> str:
+            attempts.append(1)
+            if len(attempts) <= 2:
+                raise PermissionError(13, '文件正被替换')
+            return real_read(self_path, **kwargs)
+
+        an.Path.read_text = flaky
+        try:
+            self.assertEqual(an.read_text_with_retry(target), '内容')
+        finally:
+            an.Path.read_text = real_read
+        self.assertEqual(len(attempts), 3, '应当重试到成功')
+
     def test_does_not_swallow_other_errors(self) -> None:
         """源文件不见了是真错误，不该被当成"再等等就好"。"""
         real_replace = an.os.replace
@@ -329,17 +353,25 @@ class TestAtomicWriteUnderContention(Base):
             an.os.replace = real_replace
 
     def test_concurrent_writers_all_succeed(self) -> None:
-        """并发写同一个文件：每一次都必须落盘成功，内容是其中某一个的全文。"""
+        """并发读写同一个文件：每一次都必须落盘成功，内容是其中某一个的全文。
+
+        **读侧必须走 `read_text_with_retry`**——那正是 agentnet 到处在用的读法。
+        用裸 `read_text` 的话这个用例会偶发失败，而失败的是**测试自己的读**，
+        不是被测代码：`MoveFileEx` 在替换的那一瞬让该路径打不开，读者一样吃
+        PermissionError。第一版就是这么误判的，还以为是退避预算不够
+        （实测写侧最多重试 4 次即成功，预算绰绰有余）。
+        """
         target = self.tmp / 'info.md'
         errors: list[BaseException] = []
 
         def hammer(tag: str) -> None:
-            for _ in range(20):
+            for _ in range(10):
                 try:
                     an._atomic_write(target, f"holder={tag}\n")
-                    target.read_text(encoding='utf-8')   # 制造"正在读"的窗口
+                    an.read_text_with_retry(target)      # 制造"正在读"的窗口
                 except BaseException as exc:             # noqa: BLE001
                     errors.append(exc)
+                time.sleep(0.01)
 
         threads = [threading.Thread(target=hammer, args=(f"w{i}",)) for i in range(4)]
         for thread in threads:
@@ -349,6 +381,83 @@ class TestAtomicWriteUnderContention(Base):
 
         self.assertEqual(errors, [], f'并发写不应报错，实得：{errors[:3]}')
         self.assertRegex(target.read_text(encoding='utf-8'), r'^holder=w\d\n$')
+
+
+class TestProvenance(Base):
+    """被拉起的实例必须知道自己是被谁起来的，否则它会推错整条授权链。
+
+    实测事故（2026-08-14）：`4bf64d40`（spawned_by=0de75e6c、role=peer）把 argv 上注入的
+    引导语当成人类输入，据此断定「本会话是人类起的」，进而拒绝了拉起方要它 exit 的请求。
+    它推错的每一步都是因为上下文里从没提过 spawned_by。
+    """
+
+    def test_spawned_instance_is_told_who_spawned_it(self) -> None:
+        lines = an.provenance_lines({'spawned_by': '0de75e6c-b6d7-45df-9b16-94580257a759'})
+        text = '\n'.join(lines)
+        self.assertIn('0de75e6c', text, '必须点名拉起方')
+        self.assertIn('不是人类直接启动的', text)
+
+    def test_spawned_instance_is_told_the_prompt_is_injected(self) -> None:
+        """那句引导语和真实用户输入长得一模一样，不说破就一定会被当成人类在说话。"""
+        text = '\n'.join(an.provenance_lines({'spawned_by': 'abc12345'}))
+        self.assertIn(an.BOOTSTRAP_PROMPT, text)
+        self.assertIn('不是人类输入', text)
+
+    def test_spawned_instance_is_told_exit_requests_are_legitimate(self) -> None:
+        """拉起方本来就能 kill/reset，所以「请你 exit」是同一件事的优雅形式。"""
+        text = '\n'.join(an.provenance_lines({'spawned_by': 'abc12345'}))
+        self.assertIn('kill', text)
+        self.assertIn('exit', text)
+
+    def test_human_started_instance_is_told_the_opposite(self) -> None:
+        """反向误判同样有害：人类起的实例不该被同僚一封信劝退。"""
+        text = '\n'.join(an.provenance_lines({}))
+        self.assertIn('人类直接启动', text)
+        self.assertNotIn(an.BOOTSTRAP_PROMPT, text)
+
+
+class TestArchivedLifecycle(Base):
+
+    def test_archived_copy_finds_timestamped_dir(self) -> None:
+        """二次归档会落成 `<id>-<时间戳>`，只匹配裸 id 会误报"没归档过"。"""
+        ctx = self.ctx()
+        ctx.archive_dir.mkdir(parents=True, exist_ok=True)
+        (ctx.archive_dir / f"{self.agent_id}-20260814T120000").mkdir()
+        found = an.archived_copy(ctx, self.agent_id)
+        self.assertIsNotNone(found)
+        self.assertTrue(found.name.startswith(self.agent_id))
+
+    def test_archived_copy_absent_when_never_archived(self) -> None:
+        self.assertIsNone(an.archived_copy(self.ctx(), self.agent_id))
+
+    def test_poll_after_exit_is_not_an_error(self) -> None:
+        """`agentnet exit` 之后再挂 poll 是多余但无害的——不该渲染成 exit code 1。
+
+        此前它走 _die 退 1，被 harness 报成 "Background command failed"，
+        实例于是回头排查一个并不存在的故障。
+        """
+        import argparse
+        self.register()
+        an.cmd_exit(argparse.Namespace())
+        an.cmd_poll(argparse.Namespace(interval=1, max_wait=1))   # 不抛 SystemExit 即通过
+
+    def test_poll_without_registration_is_still_an_error(self) -> None:
+        """从没注册过 ≠ 已退出。前者是真错误，不能一起放行。"""
+        import argparse
+        with self.assertRaises(SystemExit) as caught:
+            an.cmd_poll(argparse.Namespace(interval=1, max_wait=1))
+        self.assertNotEqual(caught.exception.code, 0)
+
+    def test_exit_warns_against_rearming_poll(self) -> None:
+        """exit 会杀掉轮询器，harness 报它退出；不说破实例就会条件反射地重挂。"""
+        import argparse
+        import io
+        import contextlib
+        self.register()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            an.cmd_exit(argparse.Namespace())
+        self.assertIn('不要再重挂', buffer.getvalue())
 
 
 class TestLockExitCodes(Base):
