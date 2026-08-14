@@ -13,6 +13,8 @@ import importlib.util
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import timedelta
 from pathlib import Path
@@ -267,6 +269,88 @@ class TestWorkspaceIsolation(Base):
 # 锁：互斥 / 租约懒过期 / 释放后不留僵尸目录
 # ══════════════════════════════════════════════════════════════════════════
 
+class TestAtomicWriteUnderContention(Base):
+    """Windows 上 `os.replace` 会被"目标正被读取"挡住（POSIX 不会）。
+
+    一个 agent 同时跑着多个轮询器是**被容忍**的状态（harness 的退出通知乱序到达，
+    实例照旧通知重挂就会短暂并存），每个都在秒级读写同一份 info.md——所以原子写
+    必须扛住这一下，而不是要求调用方保证单写者。
+    """
+
+    def test_retries_past_transient_permission_error(self) -> None:
+        target = self.tmp / 'info.md'
+        real_replace = an.os.replace
+        attempts: list[int] = []
+
+        def flaky(src: object, dst: object) -> None:
+            attempts.append(1)
+            if len(attempts) <= 2:
+                raise PermissionError(13, '目标正被另一个进程读取')
+            real_replace(src, dst)
+
+        an.os.replace = flaky
+        try:
+            an._atomic_write(target, '内容')
+        finally:
+            an.os.replace = real_replace
+
+        self.assertEqual(target.read_text(encoding='utf-8'), '内容')
+        self.assertEqual(len(attempts), 3, '应当重试到成功')
+
+    def test_leaves_no_temp_file_when_giving_up(self) -> None:
+        """退避耗尽后必须响亮失败，且不留下看着像正常产物的临时文件。"""
+        target = self.tmp / 'info.md'
+        real_replace = an.os.replace
+
+        def always_locked(src: object, dst: object) -> None:
+            raise PermissionError(13, '一直被占')
+
+        an.os.replace = always_locked
+        try:
+            with self.assertRaises(PermissionError):
+                an._atomic_write(target, '内容')
+        finally:
+            an.os.replace = real_replace
+
+        self.assertEqual(list(self.tmp.glob('*.tmp.*')), [], '失败路径必须清理临时文件')
+
+    def test_does_not_swallow_other_errors(self) -> None:
+        """源文件不见了是真错误，不该被当成"再等等就好"。"""
+        real_replace = an.os.replace
+
+        def missing(src: object, dst: object) -> None:
+            raise FileNotFoundError(2, '源文件不存在')
+
+        an.os.replace = missing
+        try:
+            with self.assertRaises(FileNotFoundError):
+                an._atomic_write(self.tmp / 'info.md', '内容')
+        finally:
+            an.os.replace = real_replace
+
+    def test_concurrent_writers_all_succeed(self) -> None:
+        """并发写同一个文件：每一次都必须落盘成功，内容是其中某一个的全文。"""
+        target = self.tmp / 'info.md'
+        errors: list[BaseException] = []
+
+        def hammer(tag: str) -> None:
+            for _ in range(20):
+                try:
+                    an._atomic_write(target, f"holder={tag}\n")
+                    target.read_text(encoding='utf-8')   # 制造"正在读"的窗口
+                except BaseException as exc:             # noqa: BLE001
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=hammer, args=(f"w{i}",)) for i in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [], f'并发写不应报错，实得：{errors[:3]}')
+        self.assertRegex(target.read_text(encoding='utf-8'), r'^holder=w\d\n$')
+
+
 class TestLockExitCodes(Base):
     """竞争失败必须与"agentnet 用不了"用不同的退出码区分开。
 
@@ -285,8 +369,62 @@ class TestLockExitCodes(Base):
         an.try_acquire_lock(ctx, 'scpm', 'someone-else', 999, 'held by other', 600)
         with self.assertRaises(SystemExit) as caught:
             an.cmd_lock(argparse.Namespace(
-                action='acquire', name='scpm', purpose='mine', ttl=600, all=False))
+                action='acquire', name='scpm', purpose='mine', ttl=600, all=False,
+                wait=False, max_wait=0, poll_interval=1))
         self.assertEqual(caught.exception.code, an.EXIT_LOCK_HELD)
+
+
+class TestLockWaiting(Base):
+    """`--wait` 是 SCPM 迁移的前置条件：旧脚本的默认行为就是"等到拿到为止"。"""
+
+    def wait_args(self, **overrides: object) -> object:
+        import argparse
+        defaults = dict(action='acquire', name='scpm', purpose='mine', ttl=600,
+                        all=False, wait=True, max_wait=2, poll_interval=1)
+        defaults.update(overrides)
+        return argparse.Namespace(**defaults)
+
+    def test_returns_immediately_when_free(self) -> None:
+        self.register()
+        ok, _ = an.acquire_waiting(self.ctx(), self.wait_args())
+        self.assertTrue(ok)
+
+    def test_gives_up_at_max_wait(self) -> None:
+        """软超时必须真的生效——否则一个持续续租的持有者能让调用方永远不返回。"""
+        self.register()
+        ctx = self.ctx()
+        an.try_acquire_lock(ctx, 'scpm', 'someone-else', 999, 'held by other', 600)
+        started = time.monotonic()
+        ok, held = an.acquire_waiting(ctx, self.wait_args())
+        self.assertFalse(ok)
+        self.assertEqual((held or {}).get('holder'), 'someone-else')
+        self.assertLess(time.monotonic() - started, 15, '不该远超 max_wait')
+
+    def test_takes_over_once_holder_releases(self) -> None:
+        """等待的意义就在这里：对方释放后自动拿到，不需要调用方重试。"""
+        self.register()
+        ctx = self.ctx()
+        an.try_acquire_lock(ctx, 'scpm', 'someone-else', 999, 'brief', 600)
+
+        def hand_over() -> None:
+            time.sleep(1)
+            an.release_lock(ctx, 'scpm', 'someone-else')
+
+        releaser = threading.Thread(target=hand_over)
+        releaser.start()
+        try:
+            ok, _ = an.acquire_waiting(ctx, self.wait_args(max_wait=20))
+        finally:
+            releaser.join()
+        self.assertTrue(ok, '对方释放后应当自动接手')
+
+    def test_expired_lease_is_taken_over_without_waiting_out_max(self) -> None:
+        """租约到期即可抢占——这正是"孤儿锁不再靠人眼判断"的机制。"""
+        self.register()
+        ctx = self.ctx()
+        an.try_acquire_lock(ctx, 'scpm', 'dead-holder', 999, 'crashed', -1)
+        ok, _ = an.acquire_waiting(ctx, self.wait_args())
+        self.assertTrue(ok)
 
 
 class TestLocks(Base):

@@ -330,15 +330,54 @@ def _atomic_write(path: Path, content: str) -> None:
     这类残留看着像正常产物，实测被 ``git add -A`` 顺手带进过版本库
     （里面是完整的网络快照，含路径与信件预览）。进程被 SIGKILL 时仍会留残留——
     那种情况兜不住，靠 ``.gitignore`` 挡住同名模式作为第二道防线。
+
+    **Windows 上 replace 会被"有人正在读"挡住，所以要重试**：``os.replace`` 底层是
+    ``MoveFileEx``，它需要对目标的删除权限；而 CPython 打开文件读取时**不带**
+    ``FILE_SHARE_DELETE``，于是只要另一个进程此刻正读着这个文件，replace 就抛
+    ``PermissionError``。POSIX 的 ``rename`` 没有这回事——**这段代码在 Linux 上永远
+    不会走到重试**。
+
+    这不是罕见竞态：一个 agent 可能同时有多个轮询器在跑（harness 的退出通知会乱序
+    到达，实例照着旧通知重挂就会短暂并存），每个都每隔一两秒读一次同一份 ``info.md``。
+    撞上只是时间问题。**并发轮询本身是被容忍的**（多余的那些会在下一轮退位），
+    所以这里必须扛住，而不是要求调用方保证"同一时刻只有一个写者"。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    # 临时名必须**无条件唯一**：只用 pid 的话，同一进程内的两个并发写者会撞同一个
+    # 临时文件——各写各的、再互相把对方的 tmp 搬走，得到 FileNotFoundError 或
+    # PermissionError。当前调用方都是单线程的独立进程，所以现实中撞不上；但"唯一"
+    # 是这段代码的**前提**，让它依赖调用方的线程模型是把不变式寄托在别处。
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
     try:
         tmp.write_text(content, encoding='utf-8', newline='\n')
-        os.replace(tmp, path)
+        replace_with_retry(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+
+REPLACE_RETRY_DELAYS_S = (0.02, 0.05, 0.1, 0.2, 0.4)
+"""``os.replace`` 撞上"目标正被读取"时的退避序列（累计约 0.77s）。
+
+上界是刻意的：读者只是把文件读进内存就关闭，占用以毫秒计。退到 0.77s 还不成功，
+说明不是这个竞态而是别的问题（权限、杀毒软件锁文件、路径被占）——那时候就该
+**响亮失败**，而不是无限重试把一个可诊断的错误拖成一个挂死的进程。
+"""
+
+
+def replace_with_retry(source: Path, destination: Path) -> None:
+    """``os.replace``，遇 Windows 的"目标正被打开"时短暂退避重试。
+
+    只对 ``PermissionError`` 重试。``FileNotFoundError``（源文件不见了）等**不吞**——
+    那是真错误，重试一万次也变不出文件来。最后一次直接调用，让真实异常抛出去。
+    """
+    for delay in REPLACE_RETRY_DELAYS_S:
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            time.sleep(delay)
+    os.replace(source, destination)
 
 
 def pid_alive(pid: int) -> bool:
@@ -2550,6 +2589,13 @@ LOCK_FIELD_ORDER: tuple[str, ...] = ('name', 'holder', 'holder_pid', 'acquired_a
 
 DEFAULT_LOCK_TTL_S = 600
 SWEEP_LOCK = '_sweep'
+LOCK_POLL_INTERVAL_S = 5
+LOCK_PROGRESS_INTERVAL_S = 60
+"""``--wait`` 期间多久打一次进度。
+
+**必须打**：等待是静默的，而调用它的是 LLM——看不到任何输出的等待和卡死无法区分，
+它会去猜、去重试、去问人。每分钟一行"还在等谁、等了多久"把"卡住了吗"变成可观察的事实。
+"""
 
 
 def lock_dir(ws: Workspace, name: str) -> Path:
@@ -2579,6 +2625,44 @@ def lock_expired(meta: dict[str, Any], at: datetime | None = None) -> bool:
     if expires.tzinfo is None:
         expires = expires.replace(tzinfo=reference.tzinfo)
     return expires <= reference
+
+
+def acquire_waiting(ctx: 'Ctx', args: argparse.Namespace) -> tuple[bool, dict[str, Any] | None]:
+    """反复尝试取锁直到拿到（或到达软超时）。返回与 :func:`try_acquire_lock` 同形。
+
+    **为什么值得内建，而不是让调用方写 ``while ! acquire; do sleep; done``**：
+
+    - 那个循环每个调用点都要重写一遍，而它有两个容易漏的细节——**进度输出**
+      （见 :data:`LOCK_PROGRESS_INTERVAL_S`）与**超时语义**。漏掉进度，等待就与
+      卡死不可区分；漏掉超时，脚本永远不返回。
+    - 竞争本身不是异常：N 个实例被同一次 release 唤醒时 1 胜 N-1 败，败者继续等，
+      **自然串行化**。把它写成"失败-重试"会诱导调用方把正常竞争当故障处理。
+
+    等待期间**不续租自己的任何东西**——我们还没有锁。租约只从取到那一刻开始算。
+    """
+    started = time.monotonic()
+    last_progress = 0.0
+    announced = False
+    while True:
+        ok, held = try_acquire_lock(ctx, args.name, ctx.agent_id, ctx.pid, args.purpose, args.ttl)
+        if ok:
+            waited = int(time.monotonic() - started)
+            if waited:
+                print(f"[OK] 等了 {waited}s 后拿到 `{args.name}`。")
+            return True, held
+        holder = str((held or {}).get('holder', '?'))[:8]
+        elapsed = time.monotonic() - started
+        if not announced:
+            print(f"[WAIT] `{args.name}` 正被 {holder} 持有"
+                  f"（{(held or {}).get('purpose') or '未注明用途'}），等它释放……", flush=True)
+            announced = True
+        elif elapsed - last_progress >= LOCK_PROGRESS_INTERVAL_S:
+            print(f"[WAIT] 仍在等 `{args.name}`（已 {int(elapsed)}s，持有者 {holder}，"
+                  f"租约到 {(held or {}).get('expires_at')}）", flush=True)
+            last_progress = elapsed
+        if args.max_wait and elapsed >= args.max_wait:
+            return False, held
+        time.sleep(max(1, args.poll_interval))
 
 
 def try_acquire_lock(ws: Workspace, name: str, holder: str, pid: int,
@@ -2666,16 +2750,25 @@ def _args_lock(p: argparse.ArgumentParser) -> None:
     p.add_argument('--purpose', default='', help='取锁做什么——诊断时能看到是谁在干什么')
     p.add_argument('--ttl', type=int, default=DEFAULT_LOCK_TTL_S, help=f'租约秒数（默认 {DEFAULT_LOCK_TTL_S}）')
     p.add_argument('--all', action='store_true', help='list 时连空闲的锁目录也列出来')
+    p.add_argument('--wait', action='store_true',
+                   help='acquire 时被占则等到拿到为止（每 60s 打一次进度），而不是当场失败')
+    p.add_argument('--max-wait', type=int, default=0,
+                   help='--wait 的软超时秒数（默认 0＝不设上限）')
+    p.add_argument('--poll-interval', type=int, default=LOCK_POLL_INTERVAL_S,
+                   help=f'--wait 的轮询间隔秒数（默认 {LOCK_POLL_INTERVAL_S}）')
 
 
 @command(
     'lock',
     '互斥锁：acquire / release / status / list / clear',
-    'agentnet lock acquire <名字> [--purpose "..."] [--ttl 600] | release <名字> '
-    '| clear <名字> | status <名字> | list [--all]',
+    'agentnet lock acquire <名字> [--purpose "..."] [--ttl 600] [--wait [--max-wait N]] '
+    '| release <名字> | clear <名字> | status <名字> | list [--all]',
     detail=('租约**懒过期**：过期与否由读者判定并原子抢占，不需要任何进程跑时钟。\n'
             '这直接消灭了文件锁的老问题——持锁者崩溃后锁永久悬挂、只能靠人眼判断是不是孤儿锁。\n'
             'sweep 归档死亡实例时也会一并释放它持有的锁。\n'
+            '`--wait` 被占时等到拿到为止，每 60s 打一次进度（等谁、等了多久、租约何时到期）。\n'
+            '竞争不是故障——N 个实例被同一次 release 唤醒时 1 胜 N-1 败，败者继续等，自然串行化。\n'
+            'acquire 被占时退出码是 **3**（与"agentnet 用不了"的 1 区分），调用方据此决定重试还是降级。\n'
             '`clear` 是**人工兜底**：无视持有者强行清掉一把锁（含空目录）。'
             '正常流程用不到它——租约会自己过期——留着是为了你想立刻收拾残局时不必去翻文件。'),
     add_args=_args_lock,
@@ -2743,11 +2836,17 @@ def cmd_lock(args: argparse.Namespace) -> None:
             raise SystemExit(1)
         return
 
-    ok, held = try_acquire_lock(ctx, args.name, ctx.agent_id, ctx.pid, args.purpose, args.ttl)
+    ok, held = acquire_waiting(ctx, args) if args.wait else try_acquire_lock(
+        ctx, args.name, ctx.agent_id, ctx.pid, args.purpose, args.ttl)
     if ok:
         print(f"[OK] 已取得 `{args.name}`，租约到 {held['expires_at'] if held else '?'}")
         print(f"  用完请 `agentnet lock release {args.name}`；忘了也没关系，租约到期后会被抢占。")
         return
+    if args.wait:
+        _die(f"等待 `{args.name}` 超过 {args.max_wait}s 仍未拿到。这**不正常**——"
+             f"租约最长 {args.ttl}s，到期即可抢占。\n"
+             f"  多半是有人在持续续租，或 --max-wait 设得比租约还短。当前持有者："
+             f"{str((held or {}).get('holder', '?'))[:8]}", code=EXIT_LOCK_HELD)
     holder = str((held or {}).get('holder', '?'))[:8]
     _die(f"`{args.name}` 正被 {holder} 持有，到期 {(held or {}).get('expires_at')}。\n"
          f"  等它释放，或到期后自动可抢占。当前用途：{(held or {}).get('purpose') or '（未注明）'}",

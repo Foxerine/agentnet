@@ -265,12 +265,15 @@ session-start **先判 stdin 有无 agent_id：有则是子 agent，直接退出
 互斥锁：acquire / release / status / list / clear
 
 ```
-agentnet lock acquire <名字> [--purpose "..."] [--ttl 600] | release <名字> | clear <名字> | status <名字> | list [--all]
+agentnet lock acquire <名字> [--purpose "..."] [--ttl 600] [--wait [--max-wait N]] | release <名字> | clear <名字> | status <名字> | list [--all]
 ```
 
 租约**懒过期**：过期与否由读者判定并原子抢占，不需要任何进程跑时钟。
 这直接消灭了文件锁的老问题——持锁者崩溃后锁永久悬挂、只能靠人眼判断是不是孤儿锁。
 sweep 归档死亡实例时也会一并释放它持有的锁。
+`--wait` 被占时等到拿到为止，每 60s 打一次进度（等谁、等了多久、租约何时到期）。
+竞争不是故障——N 个实例被同一次 release 唤醒时 1 胜 N-1 败，败者继续等，自然串行化。
+acquire 被占时退出码是 **3**（与"agentnet 用不了"的 1 区分），调用方据此决定重试还是降级。
 `clear` 是**人工兜底**：无视持有者强行清掉一把锁（含空目录）。正常流程用不到它——租约会自己过期——留着是为了你想立刻收拾残局时不必去翻文件。
 
 ### `exit`
