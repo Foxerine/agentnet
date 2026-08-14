@@ -575,6 +575,65 @@ class TestUnarmedPollerIsBlocking(Base):
         self.assertIn('unarmed_nagged_at', an.INFO_FIELD_ORDER)
 
 
+class TestUnackedLetterSafetyNet(Base):
+    """投递 ≠ 送达：poll 把全文打进后台输出文件，而**读那个文件是可跳过的环节**。
+
+    实测两次（`0de75e6c`）。第二次是在首行改成 `[LETTER] …必须读完` **之后**——
+    首行修复覆盖的是"看了输出仍漏读"，那次是**压根没打开输出**：在 harness 的通知层，
+    收信退出与任何后台任务完成长得一样，忙起来会整批跳过。漏了 4 封。
+
+    所以把送达保证挪到唯一跳不过的通道：Stop 钩子每回合必然触发。
+    """
+
+    def hook_output(self) -> dict:
+        import argparse, io, contextlib, json
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            an.cmd_drain(argparse.Namespace(hook=True, no_block=False))
+        return json.loads(buffer.getvalue() or '{}')
+
+    def deliver(self, subject: str = '关键前提被质疑') -> None:
+        """模拟轮询器投递了一封信（登记为未确认）。"""
+        an.record_unacked(self.ctx(), [({'from': 'aaaa1111-x', 'subject': subject},
+                                        '正文', Path('x.md'))])
+
+    def test_unacked_letter_blocks_at_stop(self) -> None:
+        self.register()
+        an.merge_info(self.ctx().info_path, {'poller_pid': os.getpid()})  # 轮询器在跑
+        self.deliver()
+        payload = self.hook_output()
+        self.assertEqual(payload.get('decision'), 'block',
+                         '未确认的信必须打断——不 block 就只是又一张会被跳过的便签')
+
+    def test_listing_names_the_sender_and_subject(self) -> None:
+        """得说清**漏了哪封**，否则 agent 无从判断要不要补看。"""
+        self.register()
+        an.merge_info(self.ctx().info_path, {'poller_pid': os.getpid()})
+        self.deliver('关键前提被质疑')
+        text = self.hook_output()['hookSpecificOutput']['additionalContext']
+        self.assertIn('aaaa1111', text)
+        self.assertIn('关键前提被质疑', text)
+        self.assertIn('agentnet last --full', text, '要给出补看的具体命令')
+
+    def test_reminder_fires_only_once(self) -> None:
+        """已读过的人不该被反复打断——提醒一次即清。"""
+        self.register()
+        an.merge_info(self.ctx().info_path, {'poller_pid': os.getpid()})
+        self.deliver()
+        self.hook_output()
+        self.assertNotIn('decision', self.hook_output())
+
+    def test_poll_delivery_registers_unacked(self) -> None:
+        """真正的接线：consume 之后必须登记，否则兜底通道永远收不到东西。"""
+        self.register()
+        ctx = self.ctx()
+        an.record_unacked(ctx, [({'from': 'bbbb2222-y', 'subject': 's'}, 'b', Path('y.md'))])
+        self.assertEqual(len(an.read_info(ctx.info_path)[0]['unacked_letters']), 1)
+
+    def test_field_is_persisted(self) -> None:
+        self.assertIn('unacked_letters', an.INFO_FIELD_ORDER)
+
+
 class TestProvenance(Base):
     """被拉起的实例必须知道自己是被谁起来的，否则它会推错整条授权链。
 

@@ -217,6 +217,7 @@ INFO_FIELD_ORDER: tuple[str, ...] = (
     # 运行态（每次命令 / 每 5 分钟心跳刷新）
     'pid', 'status', 'last_active', 'harness', 'display_name', 'poller_pid',
     'unarmed_nagged_at',
+    'unacked_letters',
     # 语义（LLM 经 charter / log 提供）
     'topics', 'topics_updated_at', 'plan_file',
     # 血缘（仅被 spawn 出来的实例有）
@@ -1653,6 +1654,33 @@ def consume(ctx: Ctx, paths: list[Path]) -> list[tuple[dict[str, Any], str, Path
     return out
 
 
+def record_unacked(ctx: Ctx, items: list[tuple[dict[str, Any], str, Path]]) -> None:
+    """把刚投递的信登记为**未确认**，交给 Stop 钩子兜底。
+
+    为什么需要这一步——**投递与送达不是一回事**。``poll`` 把信 move 进 ``read/`` 并
+    打印全文，但那份全文落在一个**后台任务的输出文件**里，而"agent 会去读它"是一个
+    **可跳过的环节**。可跳过的环节迟早会被跳过：
+
+    实测两次（``0de75e6c``）。第二次是在我把首行改成 ``[LETTER] …必须读完`` **之后**——
+    首行修复解决的是"看了输出仍漏读"，而它那次是**压根没打开输出**：在 harness 的通知层，
+    收信退出与任何后台任务完成长得一模一样（``Background command ... completed``），
+    忙起来会整批跳过。那次漏了 4 封，其中一封在质疑双方的共同前提。
+
+    通知层我控制不了（描述文字由调用方传给 Bash 工具，退出码非 0 又会被渲染成 "failed"），
+    所以把**保证**挪到唯一不可跳过的通道上：Stop 钩子每回合必然触发。
+    登记在这里，钩子在回合末发现还有未确认的就打断一次并列出它们。
+
+    **刻意只登记摘要不重复全文**：全文已在 poll 输出里，钩子的职责是"确保你知道它存在"，
+    不是把 60 行正文再刷一遍。真没看过就 ``agentnet last --full`` 补。
+    """
+    if not items:
+        return
+    digest = [f"{str(meta.get('from', '?'))[:8]} | {meta.get('subject', '')}"
+              for meta, _, _ in items]
+    existing = read_info(ctx.info_path)[0].get('unacked_letters') or []
+    merge_info(ctx.info_path, {'unacked_letters': [*existing, *digest]}, create=False)
+
+
 def render_letters(items: list[tuple[dict[str, Any], str, Path]]) -> str:
     """把信件渲染成**全文**（带边界横幅）。
 
@@ -1785,6 +1813,9 @@ def cmd_poll(args: argparse.Namespace) -> None:
             if pending:
                 items = consume(ctx, pending)
                 if items:
+                    # 登记为未确认：poll 的输出是**可跳过的**（实测被整批跳过两次），
+                    # 真正的送达保证由 Stop 钩子在回合末兜底。
+                    record_unacked(ctx, items)
                     # 刷新心跳后再退出：给 agent 留出处理时间，别让它在处理途中被判死
                     merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': None},
                                expect=mine, create=False)
@@ -1854,9 +1885,22 @@ def cmd_drain(args: argparse.Namespace) -> None:
     if armed and nagged:
         merge_info(ctx.info_path, {'unarmed_nagged_at': None}, create=False)
 
+    # 轮询器投递过、但从未在回合里被确认的信。**这是送达的兜底通道**——
+    # poll 把全文打进一个后台任务的输出文件，而读那个文件是可跳过的环节
+    # （实测被整批跳过两次，第二次漏了 4 封）。Stop 钩子每回合必然触发，跳不过。
+    unacked = [str(x) for x in (meta.get('unacked_letters') or [])]
+
     chunks: list[str] = []
     if items:
         chunks.append(render_letters(items))
+    if unacked:
+        listing = '\n'.join(f"      - {line}" for line in unacked)
+        chunks.append(
+            f"[!] 轮询器投递过 {len(unacked)} 封信，但**本回合里没有迹象表明你读过**：\n"
+            f"{listing}\n"
+            "    全文在那次后台任务的输出里；没看到就跑 `agentnet last --full` 补看。\n"
+            "    （若你已经读过并处理了，忽略本条即可——它只提醒一次。）")
+        merge_info(ctx.info_path, {'unacked_letters': None}, create=False)
     if not armed:
         chunks.append("[!] 你的 agentnet 轮询器**未运行**——空闲时收不到信，"
                       f"{dead_after_s() // 60} 分钟后会被判定死亡，"
@@ -1890,6 +1934,10 @@ def cmd_drain(args: argparse.Namespace) -> None:
     reason = ''
     if items:
         reason = f'收到 {len(items)} 封 agentnet 信件，先处理'
+    elif unacked:
+        # 必须 block：这条的**全部意义**就是覆盖"agent 压根没打开 poll 的输出"那种情形，
+        # 而那种情形下不 block 就等于再发一张会被跳过的便签。
+        reason = f'有 {len(unacked)} 封已投递但未确认的信件，先确认读过再继续'
     elif not armed and not nagged:
         # **每个掉线周期只强制一次。** 此前这里只注入上下文不 block，理由是"会死循环"——
         # 顾虑是真的，但结论下错了：`additionalContext` 不带 block 时回合照常结束，
