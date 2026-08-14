@@ -217,10 +217,10 @@ agentnet log "在做什么" [--plan <计划文件路径>] [--pivot]
 
 ### `spawn`
 
-拉起一个新 agent（默认开在发起方所在窗口的新分页）并转交任务
+拉起一个新 agent（默认开在本 workspace 的约定窗口）并转交任务
 
 ```
-agentnet spawn (--task-file t.md | --task "...") [--role <角色名>] [--mode tab|window|pane|named|background] [--window <id|名字>] [--topics a,b] [--name x] [--dry-run]
+agentnet spawn (--task-file t.md | --task "...") [--role <角色名>] [--mode tab|window|pane|named|background] [--window shared|current|<名字>] [--topics a,b] [--name x] [--dry-run]
 ```
 
 **先跑 `agentnet roles` 看菜单。**
