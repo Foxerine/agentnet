@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import io
 import json
@@ -31,7 +32,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, TypeVar
 
 # ══════════════════════════════════════════════════════════════════════════
 # 常量
@@ -215,6 +216,7 @@ INFO_FIELD_ORDER: tuple[str, ...] = (
     'id', 'workspace', 'kind', 'cwd', 'registered_at',
     # 运行态（每次命令 / 每 5 分钟心跳刷新）
     'pid', 'status', 'last_active', 'harness', 'display_name', 'poller_pid',
+    'unarmed_nagged_at',
     # 语义（LLM 经 charter / log 提供）
     'topics', 'topics_updated_at', 'plan_file',
     # 血缘（仅被 spawn 出来的实例有）
@@ -385,36 +387,92 @@ def _atomic_write(path: Path, content: str) -> None:
         tmp.write_text(content, encoding='utf-8', newline='\n')
         replace_with_retry(tmp, path)
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        # 清理**不能**盖掉真正的错误：若这里自己抛（杀软占着临时文件之类），
+        # 调用方看到的就成了"删不掉临时文件"，而不是最初那个写失败的原因。
+        # 残留由 `.gitignore` 的 `*.tmp.*` 兜底，比丢失错误现场划算。
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
         raise
 
 
 REPLACE_RETRY_DELAYS_S = (0.02, 0.05, 0.1, 0.2, 0.4)
 """替换/读取撞上对方时的退避序列（累计约 0.77s）。**两个方向共用。**
 
-Windows 上 ``MoveFileEx`` 与"打开文件"互斥，所以同一个竞态有两侧：写者被"有人正在读"
-挡住（:func:`replace_with_retry`），读者被"有人正在换"挡住（:func:`read_text_with_retry`）。
-两侧都会抛 ``PermissionError``，都只需等对方那几毫秒过去。
+Windows 上"打开文件"与"换掉/删掉它"互斥，所以同一个竞态有**三**张面孔：
+写者被"有人正在读"挡住、读者被"有人正在换"挡住、**删除者被"有人正在读"挡住**。
+三者都抛 ``PermissionError``（删除是 WinError 32），都只需等对方那几毫秒过去。
 
-上界是刻意的：双方的占用都以毫秒计（实测 4 写者并发时最多重试 4 次、80ms 即成功）。
+**第三张是补的**：先只修了读写两侧就发布，结果 ``release_lock`` 的 ``unlink`` 在
+``_sweep`` 锁上撞到 WinError 32，**异常炸穿轮询器主循环、把我打下线**——
+「修复前先枚举根因的全部实例」，我修了三分之二就收工，剩下那个等着崩给我看。
+
+上界是刻意的：各方的占用都以毫秒计（实测 4 写者并发时最多重试 4 次、80ms 即成功）。
 退到 0.77s 还不成功，说明不是这个竞态而是别的问题（权限、杀软锁文件、路径被占）——
 那时候就该**响亮失败**，而不是无限重试把一个可诊断的错误拖成一个挂死的进程。
 """
 
+_Result = TypeVar('_Result')
 
-def replace_with_retry(source: Path, destination: Path) -> None:
-    """``os.replace``，遇 Windows 的"目标正被打开"时短暂退避重试。
 
-    只对 ``PermissionError`` 重试。``FileNotFoundError``（源文件不见了）等**不吞**——
-    那是真错误，重试一万次也变不出文件来。最后一次直接调用，让真实异常抛出去。
+def retry_on_sharing_violation(action: Callable[[], _Result]) -> _Result:
+    """执行一次文件系统动作，遇 Windows 的共享冲突短暂退避重试。
+
+    只对 ``PermissionError`` 重试——``FileNotFoundError`` 等**不吞**，那是真错误，
+    重试一万次也变不出文件来。最后一次直接调用，让真实异常抛出去。
+
+    做成通用外壳而不是三个各自写循环的函数：这个竞态每多一种文件操作就多一张面孔
+    （读 / 换 / 删，将来可能还有别的），把退避逻辑集中在一处，新增操作时只需包一层，
+    不会像上次那样漏掉其中一种。
     """
     for delay in REPLACE_RETRY_DELAYS_S:
         try:
-            os.replace(source, destination)
-            return
+            return action()
         except PermissionError:
             time.sleep(delay)
-    os.replace(source, destination)
+    return action()
+
+
+def replace_with_retry(source: Path, destination: Path) -> None:
+    """``os.replace``，遇"目标正被打开"时退避重试。"""
+    retry_on_sharing_violation(lambda: os.replace(source, destination))
+
+
+def run_opportunistic(action: Callable[[], object], what: str) -> None:
+    """跑一个**机会性副业**，失败只报告不传播。
+
+    轮询器的本职是收信与心跳。sweep、看板刷新这类搭车任务失败一次，下个周期重来即可；
+    但若让它们的异常炸穿主循环，后果严重得不成比例——进程退出 ⇒ 收不到信 ⇒
+    5 分钟后被判死 ⇒ **别人投信给你会被当场拒绝**。
+
+    所以这里刻意宽catch：判据是"这件事失败了要不要停下整个轮询器"，答案是不要。
+    但**不静默**——打出来，否则一个一直失败的 sweep 会无人察觉。
+    """
+    try:
+        action()
+    except Exception as exc:                                   # noqa: BLE001
+        print(f"[WARN] {what}失败（不影响收信与心跳，下个周期重试）：{type(exc).__name__}: {exc}",
+              flush=True)
+
+
+def sweep_under_lock(ctx: 'Ctx') -> None:
+    """取到 sweep 锁才扫，避免 N 个轮询器同时扫。取不到就跳过——别人正在扫。"""
+    got, _ = try_acquire_lock(ctx, SWEEP_LOCK, ctx.agent_id, os.getpid(),
+                              'periodic sweep by poller', 120)
+    if not got:
+        return
+    try:
+        cmd_sweep(argparse.Namespace(dry_run=False, quiet=True))
+    finally:
+        release_lock(ctx, SWEEP_LOCK, ctx.agent_id)
+
+
+def unlink_with_retry(path: Path) -> None:
+    """删文件，遇"有人正在读它"时退避重试。
+
+    锁文件是重灾区：``release_lock`` 删它的同时，别的实例可能正读它判断是否过期。
+    删除失败若抛穿调用栈，会把顺带跑 sweep 的**轮询器**一起打死（实测）。
+    """
+    retry_on_sharing_violation(lambda: path.unlink(missing_ok=True))
 
 
 def pid_alive(pid: int) -> bool:
@@ -542,12 +600,7 @@ def read_text_with_retry(path: Path, encoding: str = 'utf-8') -> str:
     ``FileNotFoundError`` 不在此列：调用方在此之前已判过 ``exists()``，真的不存在是
     另一回事，交给上层响亮失败。
     """
-    for delay in REPLACE_RETRY_DELAYS_S:
-        try:
-            return path.read_text(encoding=encoding)
-        except PermissionError:
-            time.sleep(delay)
-    return path.read_text(encoding=encoding)
+    return retry_on_sharing_violation(lambda: path.read_text(encoding=encoding))
 
 
 def parse_doc(path: Path) -> tuple[dict[str, Any], str]:
@@ -1593,7 +1646,7 @@ def consume(ctx: Ctx, paths: list[Path]) -> list[tuple[dict[str, Any], str, Path
             continue
         target = read_dir / path.name
         try:
-            os.replace(path, target)
+            replace_with_retry(path, target)
         except (FileNotFoundError, PermissionError):
             continue  # 另一个消费者抢先了
         out.append((meta, body, target))
@@ -1743,16 +1796,15 @@ def cmd_poll(args: argparse.Namespace) -> None:
                 merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': me},
                            expect=mine, create=False)
                 last_beat = moment
-                # 没有守护进程，所以 sweep 搭轮询器的车跑——它本就是常驻的周期性载体。
-                # 用锁互斥 + 跟着心跳限频，避免 N 个 agent 同时扫。
-                got, _ = try_acquire_lock(ctx, SWEEP_LOCK, ctx.agent_id, os.getpid(),
-                                          'periodic sweep by poller', 120)
-                if got:
-                    try:
-                        cmd_sweep(argparse.Namespace(dry_run=False, quiet=True))
-                    finally:
-                        release_lock(ctx, SWEEP_LOCK, ctx.agent_id)
-                refresh_dashboard_data()  # 长驻进程内部改了状态，也要让看板跟上
+                # 没有守护进程，所以 sweep 与看板刷新搭轮询器的车跑——它本就是常驻的
+                # 周期性载体。用锁互斥 + 跟着心跳限频，避免 N 个 agent 同时扫。
+                #
+                # **它们的异常绝不能炸穿主循环。** 轮询器的本职是收信与心跳；sweep 和
+                # 看板都是**机会性副业**，失败一次下个周期再来即可。而它们炸穿的后果
+                # 严重得不成比例：进程退出 ⇒ 收不到信 ⇒ 5 分钟后被判死 ⇒ 别人投信被拒。
+                # 实测：`release_lock` 的 unlink 撞上 WinError 32，把整个轮询器带走了。
+                run_opportunistic(lambda: sweep_under_lock(ctx), 'sweep')
+                run_opportunistic(refresh_dashboard_data, '看板刷新')
             if Path(__file__).stat().st_mtime != script_stamp:
                 merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': None},
                            expect=mine, create=False)
@@ -1796,13 +1848,25 @@ def cmd_drain(args: argparse.Namespace) -> None:
     poller = meta.get('poller_pid')
     armed = isinstance(poller, int) and pid_alive(poller)
 
+    # 掉线是**对整个网络的伤害**（别人投信给我会被当场拒绝），所以每个掉线周期
+    # 强制打断一次。`nagged` 记录"本周期已强制过"，避免变成每回合死循环。
+    nagged = meta.get('unarmed_nagged_at') is not None
+    if armed and nagged:
+        merge_info(ctx.info_path, {'unarmed_nagged_at': None}, create=False)
+
     chunks: list[str] = []
     if items:
         chunks.append(render_letters(items))
     if not armed:
         chunks.append("[!] 你的 agentnet 轮询器**未运行**——空闲时收不到信，"
-                      f"{dead_after_s() // 60} 分钟后会被判定死亡。\n"
-                      "    立刻用后台方式运行 `agentnet poll`。")
+                      f"{dead_after_s() // 60} 分钟后会被判定死亡，"
+                      "**别人投信给你会被当场拒绝**。\n"
+                      "    立刻用**你的 harness 的后台机制**运行 `agentnet poll`"
+                      "（Claude Code 是 Bash 工具的 run_in_background）——\n"
+                      "    自己用 `&` / `nohup` 挂**不算**：那种进程 harness 追踪不到，"
+                      "它退出时唤不醒你。\n"
+                      "    挂完用 `agentnet whoami` 确认显示「poller: 运行中」——"
+                      "**发出命令不等于挂上了**。")
     if not chunks:
         if args.hook:
             print('{}')
@@ -1821,12 +1885,23 @@ def cmd_drain(args: argparse.Namespace) -> None:
     payload: dict[str, Any] = {
         'hookSpecificOutput': {'hookEventName': 'Stop', 'additionalContext': text},
     }
-    # **只在真有信件时 block**，且 --no-block（续接轮次）一律不 block。
-    # 若"轮询器未运行"也 block，一个始终不启动它的 agent 会每回合被挡回去 → 死循环；
-    # 那种情况只需把提醒注进上下文，让它自己去启动。
-    if items and not args.no_block:
+    # `--no-block`（续接轮次，harness 的 stop_hook_active）一律不 block：
+    # 否则两边互相续命，回合永远结束不了。
+    reason = ''
+    if items:
+        reason = f'收到 {len(items)} 封 agentnet 信件，先处理'
+    elif not armed and not nagged:
+        # **每个掉线周期只强制一次。** 此前这里只注入上下文不 block，理由是"会死循环"——
+        # 顾虑是真的，但结论下错了：`additionalContext` 不带 block 时回合照常结束，
+        # 那条提醒就成了一张便签，而它出现的时机恰是把控制权交还用户的一刻，
+        # 最容易被下一条指令盖过去。**实测我自己就这么掉线了整整一段时间，
+        # 期间漏收一封信，而每一回合钩子都在提醒我。**
+        # 精确化后循环风险消失：强制一次 → 记下 → 之后降级为便签 → 挂上后清零。
+        reason = '你的 agentnet 轮询器未运行，先挂上再继续（本次掉线只打断这一次）'
+        merge_info(ctx.info_path, {'unarmed_nagged_at': now()}, create=False)
+    if reason and not args.no_block:
         payload['decision'] = 'block'
-        payload['reason'] = f'收到 {len(items)} 封 agentnet 信件，先处理'
+        payload['reason'] = reason
     print(json.dumps(payload, ensure_ascii=False))
 
 
@@ -2964,7 +3039,7 @@ def try_acquire_lock(ws: Workspace, name: str, holder: str, pid: int,
             os.rename(path, stealing)
         except OSError:
             return False, read_lock(ws, name)
-        stealing.unlink(missing_ok=True)
+        unlink_with_retry(stealing)
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
@@ -2995,7 +3070,7 @@ def release_lock(ws: Workspace, name: str, holder: str | None) -> tuple[bool, st
         return False, '锁本就不存在'
     if holder is not None and str(held.get('holder')) != holder:
         return False, f"锁由 {str(held.get('holder'))[:8]} 持有，不是你"
-    lock_path(ws, name).unlink(missing_ok=True)
+    unlink_with_retry(lock_path(ws, name))
     _prune_lock_dir(ws, name)
     return True, '已释放'
 
@@ -3074,7 +3149,7 @@ def cmd_lock(args: argparse.Namespace) -> None:
         if not args.name:
             _die('`lock clear` 需要锁名')
         held = read_lock(ctx, args.name)
-        lock_path(ctx, args.name).unlink(missing_ok=True)
+        unlink_with_retry(lock_path(ctx, args.name))
         _prune_lock_dir(ctx, args.name)
         if held:
             print(f"[OK] 已强行清除 `{args.name}`（原持有者 {str(held.get('holder'))[:8]}，"
@@ -3358,7 +3433,7 @@ def run_console_action(ws: Workspace, action: dict[str, Any]) -> str:
             cmd_sweep(argparse.Namespace(dry_run=False, quiet=True))
             return 'sweep 已执行'
         if verb == 'lock_clear':
-            lock_path(ws, target).unlink(missing_ok=True)
+            unlink_with_retry(lock_path(ws, target))
             _prune_lock_dir(ws, target)
             return f"已清除锁 `{target}`"
         matches = [aid for aid, _, _ in iter_agents(ws)
@@ -3420,13 +3495,13 @@ def process_console_queue(ws: Workspace, actor: str) -> int:
         except (OSError, ValueError) as exc:
             # **不静默丢弃**：畸形队列意味着有人下了指令却没被执行，
             # 必须留下痕迹，否则用户只会看到"我点了没反应"。
-            queue_path.unlink(missing_ok=True)
+            unlink_with_retry(queue_path)
             actions = []
             results.append({'at': now().isoformat(), 'action': {'verb': '(队列文件)'},
                             'result': f'解析失败已丢弃：{type(exc).__name__}: {exc}'})
         results += [{'at': now().isoformat(), 'action': a, 'result': run_console_action(ws, a)}
                     for a in actions if isinstance(a, dict)]
-        queue_path.unlink(missing_ok=True)
+        unlink_with_retry(queue_path)
         log_path = ROOT / CONSOLE_LOG
         history: list[Any] = []
         if log_path.exists():

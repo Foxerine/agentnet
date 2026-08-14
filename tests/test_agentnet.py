@@ -338,6 +338,45 @@ class TestAtomicWriteUnderContention(Base):
             an.Path.read_text = real_read
         self.assertEqual(len(attempts), 3, '应当重试到成功')
 
+    def test_unlink_retries_past_transient_permission_error(self) -> None:
+        """删除侧是这个竞态的**第三张面孔**，先前漏了——`release_lock` 的 unlink 撞上
+        WinError 32，异常炸穿轮询器主循环，直接把实例打下线。"""
+        target = self.tmp / 'current.lock'
+        target.write_text('x', encoding='utf-8')
+        real_unlink = an.Path.unlink
+        attempts: list[int] = []
+
+        def flaky(self_path: object, **kwargs: object) -> None:
+            attempts.append(1)
+            if len(attempts) <= 2:
+                raise PermissionError(32, '另一个程序正在使用此文件')
+            real_unlink(self_path, **kwargs)
+
+        an.Path.unlink = flaky
+        try:
+            an.unlink_with_retry(target)
+        finally:
+            an.Path.unlink = real_unlink
+        self.assertFalse(target.exists())
+        self.assertEqual(len(attempts), 3)
+
+    def test_opportunistic_failure_does_not_propagate(self) -> None:
+        """sweep / 看板刷新失败**不能**停掉轮询器——它们的重要性远低于收信与心跳。"""
+        def boom() -> None:
+            raise PermissionError(32, '锁文件被占')
+
+        an.run_opportunistic(boom, 'sweep')   # 不抛即通过
+
+    def test_opportunistic_failure_is_reported(self) -> None:
+        """宽 catch 但**不静默**——否则一个一直失败的 sweep 会无人察觉。"""
+        import io
+        import contextlib as ctxlib
+        buffer = io.StringIO()
+        with ctxlib.redirect_stdout(buffer):
+            an.run_opportunistic(lambda: (_ for _ in ()).throw(RuntimeError('炸了')), 'sweep')
+        self.assertIn('sweep', buffer.getvalue())
+        self.assertIn('炸了', buffer.getvalue())
+
     def test_does_not_swallow_other_errors(self) -> None:
         """源文件不见了是真错误，不该被当成"再等等就好"。"""
         real_replace = an.os.replace
@@ -477,6 +516,63 @@ class TestRearmNotice(Base):
         """
         self.assertIn('&', an.REARM_NOTICE)
         self.assertIn('nohup', an.REARM_NOTICE)
+
+
+class TestUnarmedPollerIsBlocking(Base):
+    """掉线必须**打断一次**，不能只留一张便签。
+
+    实测（本机，2026-08-14）：钩子每回合都在注入"轮询器未运行"，而我掉线了整整一段
+    时间、期间漏收一封信。原因是 `additionalContext` 不带 `decision: block` 时回合照常
+    结束——那条提醒出现的时机恰是把控制权交还用户的一刻，最容易被下一条指令盖过去。
+    **提醒了没人动，不是使用者不上心，是提醒没有与后果匹配的强制力。**
+    """
+
+    def hook_output(self) -> dict:
+        import argparse, io, contextlib, json
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            an.cmd_drain(argparse.Namespace(hook=True, no_block=False))
+        return json.loads(buffer.getvalue() or '{}')
+
+    def go_offline(self) -> None:
+        an.merge_info(self.ctx().info_path, {'poller_pid': 999999})   # 不存在的 pid
+
+    def test_first_stop_after_going_offline_blocks(self) -> None:
+        self.register()
+        self.go_offline()
+        self.assertEqual(self.hook_output().get('decision'), 'block',
+                         '掉线后的第一次 Stop 必须打断，否则提醒只是便签')
+
+    def test_second_stop_does_not_block_again(self) -> None:
+        """每周期只强制一次——否则一个起不来的 agent 会被每回合挡回去，变成死循环。"""
+        self.register()
+        self.go_offline()
+        self.hook_output()                       # 第一次：block
+        self.assertNotIn('decision', self.hook_output(), '同一次掉线不该反复打断')
+
+    def test_rearming_rearms_the_nag(self) -> None:
+        """重新挂上后状态清零，下次掉线要能再强制一次——否则只保护第一次。"""
+        self.register()
+        self.go_offline()
+        self.hook_output()
+        an.merge_info(self.ctx().info_path, {'poller_pid': os.getpid()})   # 挂回来
+        self.hook_output()                                                 # 触发清零
+        self.go_offline()
+        self.assertEqual(self.hook_output().get('decision'), 'block')
+
+    def test_continuation_turn_never_blocks(self) -> None:
+        """harness 的 stop_hook_active 为真时绝不能再 block，否则两边互相续命。"""
+        import argparse, io, contextlib, json
+        self.register()
+        self.go_offline()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            an.cmd_drain(argparse.Namespace(hook=True, no_block=True))
+        self.assertNotIn('decision', json.loads(buffer.getvalue() or '{}'))
+
+    def test_nag_field_is_persisted(self) -> None:
+        """不在 INFO_FIELD_ORDER 里的字段写不出去——那会让"只强制一次"退化成每回合强制。"""
+        self.assertIn('unarmed_nagged_at', an.INFO_FIELD_ORDER)
 
 
 class TestProvenance(Base):
