@@ -403,6 +403,42 @@ class TestReviewTerminalState(Base):
             self.assertNotIn(kind, an.TERMINAL_REVIEW_KINDS, f'{kind} 不该被当成终态')
 
 
+class TestLetterHeadline(Base):
+    """收信输出的**第一行**必须自带结论。
+
+    实测事故（2026-08-14，`0de75e6c` 复盘）：它漏读了至少 6 封已送达的信。根因不在它——
+    收信与 `[RELOAD]` 共用同一条退出路径，而 RELOAD 频率高一个数量级，于是形成
+    `head -3` 看退出原因的习惯；那对 RELOAD 够（首行即 `[RELOAD]`），对收信恰好不够
+    （原先前三行是分隔线、警告块、"共 N 封"，正文在第 5 行之后）。
+    """
+
+    def letters(self, count: int = 1) -> list[tuple[dict, str, Path]]:
+        return [({'from': f'sender{i}0000', 'kind': 'letter', 'subject': f'主题{i}',
+                  'thread': 't'}, f'正文第一行\n正文第二行\n', Path(f'l{i}.md'))
+                for i in range(count)]
+
+    def test_first_line_announces_a_letter(self) -> None:
+        first = an.render_letters(self.letters()).splitlines()[0]
+        self.assertTrue(first.startswith('[LETTER]'), f'首行没有自带结论：{first!r}')
+
+    def test_first_line_survives_head_3(self) -> None:
+        """判据必须放在**任何粗略查看都会撞见**的位置——这就是那次失效的直接教训。"""
+        head = '\n'.join(an.render_letters(self.letters()).splitlines()[:3])
+        self.assertIn('[LETTER]', head)
+        self.assertIn('必须读完', head, 'head -3 里看不到"要读完"就等于没说')
+
+    def test_first_line_carries_sender_and_subject(self) -> None:
+        first = an.render_letters(self.letters()).splitlines()[0]
+        self.assertIn('sender00', first)
+        self.assertIn('主题0', first)
+
+    def test_reload_and_letter_differ_on_line_one(self) -> None:
+        """两者共用退出路径，唯一能机械区分的就是首行——不能长得像。"""
+        letter_first = an.render_letters(self.letters()).splitlines()[0]
+        self.assertNotIn('[RELOAD]', letter_first)
+        self.assertTrue(letter_first.startswith('[LETTER]'))
+
+
 class TestProvenance(Base):
     """被拉起的实例必须知道自己是被谁起来的，否则它会推错整条授权链。
 

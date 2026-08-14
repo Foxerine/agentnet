@@ -1558,8 +1558,27 @@ def render_letters(items: list[tuple[dict[str, Any], str, Path]]) -> str:
 
     命中即输出全文、直接进收信方上下文——省去二次读取，也杜绝"只读结尾漏掉顶部要点"。
     这个技巧照搬 ``review_channel.py`` 的 ``_emit_last_round``。
+
+    **第一行必须自带结论**（2026-08-14 事故，``0de75e6c`` 复盘）：一个实例漏读了至少
+    6 封已送达的信，其中两封有实质内容。根因不在它，在这里——
+
+    收信与 ``[RELOAD]`` **共用同一条退出路径**（poll 进程退出 + 输出文件有内容），
+    而 RELOAD 频率高一个数量级（那天它重挂了 20+ 次、收信只有个位数）。于是形成
+    肌肉记忆：task 完成 → ``head -3`` 看退出原因 → 是 RELOAD → 重挂。
+    ``head -3`` 对 RELOAD 恰好够（第一行就是 ``[RELOAD]``），对收信恰好**不够**：
+    原先前三行是分隔线、警告块、"共 N 封"，**正文在第 5 行之后**。
+    **低频事件被高频事件的处理习惯淹没了。**
+
+    所以第一行改成 ``[LETTER] ...`` 自带"有信、来自谁、什么主题、共多少行、必须读完"。
+    任何粗略查看都会撞见它——判据要放在**扫一眼就躲不开**的位置，而不是指望对方读完。
     """
-    lines: list[str] = [BANNER_TOP, f"共 {len(items)} 封：", '']
+    total_lines = sum(len(body.splitlines()) for _, body, _ in items)
+    senders = ', '.join(dict.fromkeys(str(meta.get('from', '?'))[:8] for meta, _, _ in items))
+    first_subject = str(items[0][0].get('subject', '')) if items else ''
+    headline = (f"[LETTER] {len(items)} 封 from {senders} —— {first_subject}"
+                f"（正文共 {total_lines} 行，**必须读完**；本次输出不会再推送第二次，"
+                f"错过后只能 `agentnet last` 补看）")
+    lines: list[str] = [headline, BANNER_TOP, f"共 {len(items)} 封：", '']
     for index, (meta, body, path) in enumerate(items, start=1):
         kind = str(meta.get('kind', 'letter'))
         # 信任提示按**信件类型**给，不一刀切：任务简报要执行，同僚来信要存疑
@@ -1762,6 +1781,49 @@ def cmd_drain(args: argparse.Namespace) -> None:
         payload['decision'] = 'block'
         payload['reason'] = f'收到 {len(items)} 封 agentnet 信件，先处理'
     print(json.dumps(payload, ensure_ascii=False))
+
+
+def _args_last(p: argparse.ArgumentParser) -> None:
+    p.add_argument('count', nargs='?', type=int, default=3, help='补看最近几封（默认 3）')
+    p.add_argument('--full', action='store_true', help='连正文一起打印，而不只是清单')
+
+
+@command(
+    'last',
+    '补看最近收到的信（正文只推送一次，漏了用它找回）',
+    'agentnet last [N] [--full]',
+    detail=('收信的正文只经 poll 退出时推送**一次**，之后信就归档进 `read/`，不会再发。\n'
+            '实测有实例因此漏读了 6 封已送达的信——它当时看 `inbox/` 是空的，就以为没人来信，\n'
+            '而空收件箱其实有两种含义：**没人来信**，和**信已过站**。\n'
+            '这个命令让"我是不是漏了什么"变成一条命令就能回答的问题。'),
+    add_args=_args_last,
+)
+def cmd_last(args: argparse.Namespace) -> None:
+    ctx = Ctx()
+    if not ctx.info_path.exists():
+        _die("你还没注册。先跑 `agentnet register`。")
+    received: list[tuple[dict[str, Any], str, Path]] = []
+    for sub in ('read', 'inbox'):
+        folder = ctx.home / sub
+        if not folder.is_dir():
+            continue
+        for path in folder.glob('*.md'):
+            meta, body = parse_doc(path)
+            received.append((meta, body, path))
+    if not received:
+        print('（还没收到过任何信）')
+        return
+    received.sort(key=lambda item: str(item[0].get('created_at') or ''))
+    chosen = received[-max(1, args.count):]
+    if args.full:
+        print(render_letters([(meta, body, path) for meta, body, path in chosen]))
+        return
+    print(f"最近 {len(chosen)} 封（共收到过 {len(received)} 封；加 --full 看正文）：")
+    for meta, body, path in chosen:
+        unread = (path.parent.name == 'inbox')
+        print(f"  {'[未读] ' if unread else ''}{meta.get('created_at')}  "
+              f"from {str(meta.get('from', '?'))[:8]}  [{meta.get('kind')}]")
+        print(f"      {meta.get('subject', '')}  （正文 {len(body.splitlines())} 行）")
 
 
 def _args_thread(p: argparse.ArgumentParser) -> None:
