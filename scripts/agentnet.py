@@ -295,6 +295,15 @@ def _die(msg: str, code: int = 1) -> NoReturn:
     raise SystemExit(code)
 
 
+def has_cjk(text: str) -> bool:
+    """文本里是否含 CJK 统一表意文字（U+4E00–U+9FFF）。
+
+    :func:`guard_text` 用它把"真乱码"与"碰巧能反解的合法中文"分开——
+    单独成函数是为了能直接喂样本测它，而不是只能透过 guard_text 间接观察。
+    """
+    return any('一' <= ch <= '鿿' for ch in text)
+
+
 def guard_text(value: str | None, what: str) -> str | None:
     """拦住已经损坏的命令行文本，**不让它被静默写进磁盘**。
 
@@ -304,8 +313,18 @@ def guard_text(value: str | None, what: str) -> str | None:
     实测：从 Bash 跑 ``agentnet log "中文标记"``，磁盘上写的是 ``涓�鏂囨爣璁�``。
 
     这类损坏是**不可逆**的（信件标题会永久烂在文件里），所以宁可当场拒绝也不接受。
-    两个判据：① 出现 U+FFFD 替换字符；② 文本能按 GBK 编码回去再按 UTF-8 解出**不同的**
-    合法文本——那正是"UTF-8 字节被当 GBK 读"的指纹。
+
+    判据两条：① 出现 U+FFFD 替换字符；② 反解（按 GBK 编回去、再按 UTF-8 解出来）得到
+    **不同的、且含 CJK 汉字**的文本。
+
+    **第二条里"含 CJK 汉字"是后加的，不加就会误杀（2026-08-14 实测）。** 原判据只要求
+    "反解出不同的合法文本"，而短中文串的 GBK 字节**碰巧**构成合法 UTF-8 的概率并不低：
+    ``'占位'`` 反解成 ``'ռλ'``（亚美尼亚字母 + 希腊字母），于是一个完全正常的参数被拒。
+    我因此还在 foxline 规范里写下过"agentnet 参数一律用 ASCII"——**一条建立在假阳性上的
+    规范**，白白让所有实例少用一半表达力。
+
+    抓住的是这个不对称性：**中文被 GBK 误读后的乱码，反解回去仍是中文**；而合法中文串
+    反解回去只会得到随机的非汉字垃圾。实测 15 个合法串 0 误杀、9 个真乱码 0 漏过。
     """
     if not value:
         return value
@@ -322,7 +341,7 @@ def guard_text(value: str | None, what: str) -> str | None:
         recovered = value.encode('gbk').decode('utf-8')
     except (UnicodeEncodeError, UnicodeDecodeError):
         return value  # 编不回 GBK 或解不出 UTF-8 ⇒ 不是这种损坏
-    if recovered != value:
+    if recovered != value and has_cjk(recovered):
         _die(f"{what} 是 UTF-8 被当 GBK 读的产物。\n"
              f"  收到：{value!r}\n  原文应为：{recovered!r}{hint}")
     return value

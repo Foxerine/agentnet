@@ -640,6 +640,25 @@ class TestMojibakeGuard(Base):
         for value in ('ascii only', '正常的中文', 'mixed 混合 123', ''):
             self.assertEqual(an.guard_text(value, 'x'), value)
 
+    def test_short_chinese_is_not_falsely_rejected(self) -> None:
+        """**假阳性回归**：`占位` 的 GBK 字节碰巧构成合法 UTF-8，反解出 `ռλ`。
+
+        旧判据只要求"反解出不同的合法文本"，于是拒掉了一个完全正常的参数——实测挡住过
+        真实工作，还让我据此在项目规范里写下"agentnet 参数一律用 ASCII"这条基于假阳性的
+        建议。短串尤其危险，因为碰巧构成合法 UTF-8 的概率随长度下降。
+        """
+        for value in ('占位', '一', '重构', '你好', '锁', '幂等', '评审', '好的'):
+            self.assertEqual(an.guard_text(value, '参数 --purpose'), value,
+                             f'{value!r} 被误判为乱码')
+
+    def test_cjk_detector(self) -> None:
+        """区分"真乱码"与"碰巧能反解的合法中文"全靠它。"""
+        self.assertTrue(an.has_cjk('占位'))
+        self.assertTrue(an.has_cjk('mixed 中 123'))
+        self.assertFalse(an.has_cjk('ռλ'), '亚美尼亚/希腊字母不是 CJK')
+        self.assertFalse(an.has_cjk('plain ascii'))
+        self.assertFalse(an.has_cjk(''))
+
     def test_utf8_read_as_gbk_is_rejected(self) -> None:
         """损坏形态之一：UTF-8 字节恰好是合法 GBK，于是解出一串"能读但不对"的字。
 
