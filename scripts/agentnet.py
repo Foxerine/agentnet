@@ -1119,6 +1119,13 @@ def _args_readme(p: argparse.ArgumentParser) -> None:
     group.add_argument('--check', action='store_true', help='校验磁盘版本与生成版本是否一致')
 
 
+DASHBOARD_SHOT = 'docs/dashboard.png'
+"""README 里那张控制台截图的仓库内相对路径。
+
+**是相对路径而非绝对 URL**：这样在 GitHub 网页、本地 Markdown 预览、以及任何 fork
+里都能正确显示，不依赖仓库叫什么名字或托管在谁那儿。
+"""
+
 SKILL_PATH = Path(__file__).resolve().parent.parent / 'skill' / 'SKILL.md'
 """agent skill 文档。**手写**——它讲的是 ``--help`` 给不了的判断，故不参与生成与比对。
 
@@ -1178,11 +1185,34 @@ def render_readme() -> str:
     lines: list[str] = [
         '# AgentNet',
         '',
-        '> **本文件由 `agentnet readme --write` 从 `scripts/agentnet.py` 生成，请勿手改。**',
-        '> 改了实现就重新生成；`agentnet readme --check` 会校验二者一致。',
+        '**同一台机器上的多个 AI 编码 agent 组成一张网络**：互相投信、拉起彼此、'
+        '抢互斥锁、声明各自负责什么。',
         '',
-        'agent 之间的文件系统网络：注册、声明主题、互相投信、拉起并控制其它 agent。',
-        '**没有守护进程**——文件系统就是真相源，没有可以挂掉的服务。',
+        '**没有守护进程**——文件系统就是真相源，没有可以挂掉的服务。'
+        '零第三方依赖，只要有 Python 3.11+。',
+        '',
+        f'![AgentNet 控制台]({DASHBOARD_SHOT})',
+        '',
+        '<sub>真实负载下的控制台：左边花名册与拉起树，中间 agent 之间的通信关系图，'
+        '右边实时消息流，底部互斥锁的持有者与租约。</sub>',
+        '',
+        '## 为什么',
+        '',
+        '多个 agent 同时在一个仓库上干活时，协调手段通常只有三种，且都有明确的缺陷：',
+        '',
+        '| 手段 | 缺陷 |',
+        '|---|---|',
+        '| 文件锁 | 无租约 ⇒ 持有者崩溃后锁永久悬挂，只能靠人眼判断是不是孤儿锁 |',
+        '| 互审通道 | **人类充当消息总线**——要把文件名手动转发给下一个 agent |',
+        '| 交接文档 | 无投递、无送达确认、无路由 |',
+        '',
+        'AgentNet 把这三件事收进一套设施：**租约锁**（崩溃后自动可抢占）、'
+        '**maildir 投递**（文件名唯一 ⇒ 并发零冲突）、**拉起即交接**'
+        '（`spawn` 直接把任务投进新实例的收件箱）。',
+        '',
+        '设计手法是**用构造消除争用，而不是用锁解决争用**：每个文件只有一个写者；'
+        '投递靠唯一文件名；租约**懒过期**——由读者判定并原子抢占，'
+        '不需要任何进程跑时钟。',
         '',
         '## 你是一个 agent？照这个顺序做',
         '',
@@ -1314,6 +1344,15 @@ def render_readme() -> str:
         '- **每文件单写者**——`info.md` 只有该 agent 自己写',
         '- **maildir**——信件文件名唯一，并发投递零冲突',
         '- **租约懒过期**——过期与否由读者判定，不需要跑时钟的进程',
+        '',
+        '## 许可',
+        '',
+        'MIT，见 [LICENSE](LICENSE)。',
+        '',
+        '---',
+        '',
+        '<sub>本文件由 <code>agentnet readme --write</code> 从 <code>scripts/agentnet.py</code>',
+        '生成，请勿手改——改了实现就重新生成，`agentnet readme --check` 会校验二者一致。</sub>',
         '',
     ]
     return '\n'.join(lines) + '\n'
