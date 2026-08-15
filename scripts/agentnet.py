@@ -1541,7 +1541,7 @@ def _args_send(p: argparse.ArgumentParser) -> None:
     p.add_argument('--to', required=True, help='收件人 agent id（可用前缀）或 @主题（群发给认领者）')
     p.add_argument('--subject', required=True, help='主题行')
     p.add_argument('--body-file', help='正文 .md 文件')
-    p.add_argument('--body', help='正文（短消息用；长内容用 --body-file）')
+    p.add_argument('--body', help='正文（**仅限短的纯文本**）。含反引号 / $ / 引号时**必须**改用 --body-file：shell 会先做命令替换，反引号那段会被**静默换成命令输出或空串**，agentnet 收到时已无痕迹、无从告警')
     p.add_argument('--kind', default='letter', choices=LETTER_KINDS, help='信件类型')
     p.add_argument('--thread', help='线程 id；省略则以本信 id 开新线程')
     p.add_argument('--force', action='store_true', help='对方已死也强行投递')
@@ -1585,7 +1585,7 @@ def cmd_send(args: argparse.Namespace) -> None:
 def _args_reply(p: argparse.ArgumentParser) -> None:
     p.add_argument('--to-letter', required=True, help='要回复的信件路径（poll 输出里给了）')
     p.add_argument('--body-file', help='正文 .md 文件')
-    p.add_argument('--body', help='正文（短消息用）')
+    p.add_argument('--body', help='正文（**仅限短的纯文本**）。含反引号 / $ / 引号时**必须**改用 --body-file：shell 会先做命令替换，反引号那段会被**静默换成命令输出或空串**，agentnet 收到时已无痕迹、无从告警')
     p.add_argument('--subject', help='主题行（省略则沿用 "Re: 原主题"）')
     p.add_argument('--kind', default=None, choices=LETTER_KINDS, help='默认按原信推断')
     p.add_argument('--force', action='store_true', help='对方已死也强行投递')
@@ -1675,6 +1675,16 @@ def record_unacked(ctx: Ctx, items: list[tuple[dict[str, Any], str, Path]]) -> N
 
     **刻意只登记摘要不重复全文**：全文已在 poll 输出里，钩子的职责是"确保你知道它存在"，
     不是把 60 行正文再刷一遍。真没看过就 ``agentnet last --full`` 补。
+
+    **为什么不去检测"到底读没读"**（``0de75e6c`` 两封反馈，后一封修正了前一封）：
+    实测 3 次触发里 **2 次是误报**——它从 task output 文件直接读了全文并据此工作了
+    一整轮。它最初建议"把读过 output 文件也算作已读"，随后**自己推翻了**：第三次它是
+    从**评审通道**（那封信的信源）拿到等价信息、压根没读信，而这类**旁路无从枚举**。
+    按第一个方案改只会漏掉旁路、给出**虚假的安全感**——漏报的守卫比没有守卫更危险。
+
+    agentnet 能看到的只有自己被调用过什么，看不到 agent 从哪条路径获知。所以结论是
+    **不追求消除误报，而是把误报的代价压到一眼**：措辞从"你没读过"（指控 + 引导重复
+    消费）改成"这几封已投递，认得出就忽略"。抓对的那 1/3 一分不少，误报的 2/3 只花一眼。
     """
     if not items:
         return
@@ -1916,10 +1926,12 @@ def cmd_drain(args: argparse.Namespace) -> None:
     if unacked:
         listing = '\n'.join(f"      - {line}" for line in unacked)
         chunks.append(
-            f"[!] 轮询器投递过 {len(unacked)} 封信，但**本回合里没有迹象表明你读过**：\n"
+            f"[对账] 轮询器投递过这 {len(unacked)} 封信（全文在那次后台任务的输出里）：\n"
             f"{listing}\n"
-            "    全文在那次后台任务的输出里；没看到就跑 `agentnet last --full` 补看。\n"
-            "    （若你已经读过并处理了，忽略本条即可——它只提醒一次。）")
+            "    **认得出、已经读过 ⇒ 忽略本条，继续你手上的事。**\n"
+            "    有哪封眼生 ⇒ `agentnet last --full` 补看。\n"
+            "    （agentnet 无从知道你是从输出里读的、还是从别处得知的，所以只把清单摆出来"
+            "让你自己对账；只提醒一次。）")
         merge_info(ctx.info_path, {'unacked_letters': None}, create=False)
     if not armed:
         chunks.append("[!] 你的 agentnet 轮询器**未运行**——空闲时收不到信，"
@@ -1957,7 +1969,7 @@ def cmd_drain(args: argparse.Namespace) -> None:
     elif unacked:
         # 必须 block：这条的**全部意义**就是覆盖"agent 压根没打开 poll 的输出"那种情形，
         # 而那种情形下不 block 就等于再发一张会被跳过的便签。
-        reason = f'有 {len(unacked)} 封已投递但未确认的信件，先确认读过再继续'
+        reason = f'对一下账：轮询器投递过 {len(unacked)} 封信，认得出就继续'
     elif not armed and not nagged:
         # **每个掉线周期只强制一次。** 此前这里只注入上下文不 block，理由是"会死循环"——
         # 顾虑是真的，但结论下错了：`additionalContext` 不带 block 时回合照常结束，
