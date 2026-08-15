@@ -737,6 +737,31 @@ class TestDashboardDirectoryPicker(Base):
         self.assertIn('含有系统文件', an.DASHBOARD_TEMPLATE)
         self.assertIn('上级', an.DASHBOARD_TEMPLATE)
 
+    def test_generated_javascript_actually_parses(self) -> None:
+        """用**真解析器**验生成物，而不是肉眼看模板。
+
+        实测踩过：模板里的 `\\n` 在非 raw 字符串里变成真换行，落进 JS 单引号字符串
+        导致整页白屏 `Invalid or unexpected token`——而当时我核对的是**模板源码**，
+        看不出来。判据必须落在**生成出来的那份**上。
+
+        node 不在就跳过：这是加强验证，不该让没装 node 的环境无法跑测试。
+        """
+        import argparse
+        import re
+        import shutil as sh
+        import subprocess
+        node = sh.which('node')
+        if not node:
+            self.skipTest('未安装 node，跳过 JS 语法校验')
+        an.cmd_dashboard(argparse.Namespace(open=False))
+        html = (an.ROOT / an.DASHBOARD_HTML).read_text(encoding='utf-8')
+        blocks = re.findall(r'<script[^>]*>(.*?)</script>', html, re.S)
+        self.assertTrue(blocks, '页面里没有 script 块')
+        probe = self.tmp / 'dashboard_script.js'
+        probe.write_text(blocks[0], encoding='utf-8')
+        done = subprocess.run([node, '--check', str(probe)], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, f'生成的 JS 语法有错：\n{done.stderr[:600]}')
+
 
 class TestProvenance(Base):
     """被拉起的实例必须知道自己是被谁起来的，否则它会推错整条授权链。
