@@ -1426,7 +1426,10 @@ TRUST_NOTE_LETTER = (
 
 TRUST_NOTE_ERRAND = (
     '▶ 这是**你的任务简报**，由拉起你的那个实例投递——它构成你本次会话要做的事，请执行。\n'
-    '   （整条拉起链由人类授权；但简报里若出现越界的具体操作，仍该用你的判断。）'
+    '   （整条拉起链由人类授权；但简报里若出现越界的具体操作，仍该用你的判断。）\n'
+    '   **收到它不等于完成它。** 接下来就去做简报里的事，做完把结果**回信**给发信人\n'
+    '   （`agentnet reply --to-letter <上面那个文件名> --body-file <你的产出>`）。\n'
+    '   在回信发出之前，本次会话都没有交付——挂轮询器、报状态、确认身份都只是准备工作。'
 )
 """为什么 errand 与普通来信要分开说。
 
@@ -2217,13 +2220,28 @@ def provenance_lines(meta: dict[str, Any]) -> list[str]:
     ]
 
 
-BOOTSTRAP_PROMPT = 'Run: agentnet drain'
+BOOTSTRAP_PROMPT = (
+    'Run: agentnet drain. It delivers your task. '
+    'Do that task, then reply to the sender with agentnet reply. '
+    'Draining is not the task.'
+)
 """新实例的"第一推动"——**单行、纯 ASCII、无 shell 元字符**。
+
+**为什么不能只写 `Run: agentnet drain`**（2026-08-15 实测，四个终审 reviewer 连续踩）：
+这是那个实例收到的**唯一一条用户消息**，于是它字面地执行——跑了 drain，任务完成，
+回一句"已收到 1 封信、已挂 poll、whoami 确认在线"，然后停下。**评审一行没做。**
+
+它没做错：它照着收到的指令做完了。错的是指令只描述了**准备动作**。
+真正的任务在信里，而"读到信"被当成了交付。
+
+原本指望 SessionStart 的 ``initialUserMessage``（写着"然后照信里的内容行动"）兜住，
+但**那个字段 harness 不采纳**——这正是当初改用 argv 的原因。修了投递通道，
+却忘了那句兜底话也随之失效：**唯一到达的那条消息，必须自己说清终点在哪。**
 
 作为启动命令的位置参数传入 = 首条用户消息。**必须有**：没有它，新会话只会抱着
 空提示符干等。
 
-**为什么必须这么短**（实测教训，17948ac6 报告）：这里原本是一段多行中文引导，
+**为什么仍然必须很短**（实测教训，17948ac6 报告）：这里原本是一段多行中文引导，
 结果 ``reviewer`` 角色（``ccrg``，只有 ``.cmd`` 形态、须经 ``cmd /c`` 启动）
 **拉起即崩**，报 ``error: unknown option '->'``。根因是 cmd.exe 会**重新解析**
 整条命令行——多行参数里的换行被当成命令分隔符、非 ASCII 按 GBK 码页重编码，
@@ -2235,6 +2253,10 @@ argv 上只留一句触发语；任务本身更是早就走收件箱那条唯一
 
 **指的是 drain 而不是 poll**（selftest-3 实测）：两者争抢同一个收件箱，
 先起 poll 会抢先取走简报、让 drain 落空。poll 由上下文指引随后启动。
+
+约束仍在（单行 / 纯 ASCII / 无 ``;`` ``&`` ``|`` ``%`` 等 cmd 元字符），所以用英文
+短句，逗号句号安全。它只说**目标是什么、什么才算完**，细节仍走收件箱那条唯一通道——
+"让 argv 不承载内容"这条没有松动，松动的是"argv 也不该承载**目的**"那个过头的推论。
 """
 
 VARIADIC_FLAGS = frozenset({
@@ -2949,20 +2971,39 @@ def cmd_hook(args: argparse.Namespace) -> None:
         note = Config.role_scope_note(str(recipe['role']))
         if note:
             lines += ['', f"**你的角色是 `{recipe['role']}`。** {note}"]
+    # **有任务时，任务排在最前面。** 此前这段把"收件箱里有信"夹在一堆家务
+    # （挂 poll / charter / log / 告诉用户开看板）中间，结果被拉起的实例把接入流程
+    # 当成了本次会话的全部——实测四个终审 reviewer 连续这么干：drain、挂 poll、
+    # 报状态，然后停下，评审一行没做。首要的事没排在首位，就不会被当成首要的事。
     if pending:
-        lines.append(f"**你的收件箱里有 {pending} 封未读信**——跑 `agentnet drain` 领取。")
+        lines += [
+            '',
+            f"## 你有任务：收件箱里 {pending} 封未读信",
+            '',
+            '`agentnet drain` 领取——**那封信里写的才是你本次会话要做的事**。',
+            '下面的接入步骤都只是准备工作；**在把结果回信给发信人之前，本次会话没有交付**。',
+        ]
     lines += [
+        '',
+        '---',
         '',
         '**现在就后台运行 `agentnet poll`** —— 它既是你空闲时收信的唯一途径，也是你的心跳来源；',
         f'不挂它，你会在 {dead_after_s() // 60} 分钟后被判定死亡，别人投信给你会被当场拒绝。',
-        '',
-        '用 `agentnet charter --topics "..."` 声明你负责什么；',
-        '用 `agentnet log "..."` 记录你在做什么（方案转向加 `--pivot`），让别人看懂你的进展。',
-        '',
-        '**并在你的首次回复里用一句话告诉用户**：可以运行 `agentnet dashboard --open` '
-        '打开管理后台，查看全网 agent、通信与锁的现状。',
-        f'协议全文：{README_PATH}',
+        '**用你的 harness 的后台机制**（Claude Code 是 Bash 工具的 run_in_background），'
+        '自己用 `&` 挂不算。它被杀掉是常事，重挂即可，别为此中断手上的任务。',
     ]
+    if not pending:
+        # 这几条对**有任务在身**的实例是干扰：它该去干活，不是去做自我介绍。
+        # 没任务的（人类直接启动的）才需要被引导着接入网络。
+        lines += [
+            '',
+            '用 `agentnet charter --topics "..."` 声明你负责什么；',
+            '用 `agentnet log "..."` 记录你在做什么（方案转向加 `--pivot`），让别人看懂你的进展。',
+            '',
+            '**并在你的首次回复里用一句话告诉用户**：可以运行 `agentnet dashboard --open` '
+            '打开管理后台，查看全网 agent、通信与锁的现状。',
+        ]
+    lines.append(f'协议全文：{README_PATH}')
     hook_output: dict[str, Any] = {
         'hookEventName': 'SessionStart',
         'additionalContext': '\n'.join(lines),

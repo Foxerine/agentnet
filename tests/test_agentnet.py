@@ -685,6 +685,21 @@ class TestPollerRetiresOnTerminalStatus(Base):
         self.assertIn('归档', str(an.retirement_reason(ctx, os.getpid())))
 
 
+class TestErrandFraming(Base):
+    """任务简报必须说清"收到 ≠ 完成"，否则实例会把读信当交付。"""
+
+    def test_errand_note_demands_delivery(self) -> None:
+        note = an.TRUST_NOTE_ERRAND
+        self.assertIn('回信', note, '要说明做完必须回信')
+        self.assertIn('agentnet reply', note, '要给出具体命令')
+        self.assertIn('准备工作', note, '要点破挂 poll / 报状态只是准备')
+
+    def test_ordinary_letter_note_stays_untrusted(self) -> None:
+        """别把这层放宽误伤到同僚来信——那仍是不可信输入。"""
+        self.assertIn('不可信', an.TRUST_NOTE_LETTER)
+        self.assertNotIn('请执行', an.TRUST_NOTE_LETTER)
+
+
 class TestProvenance(Base):
     """被拉起的实例必须知道自己是被谁起来的，否则它会推错整条授权链。
 
@@ -1109,6 +1124,23 @@ class TestSpawnArgv(Base):
         """多行 / 非 ASCII 会被 cmd.exe 与 commander 一路拆碎（实测崩在 `->`）。"""
         self.assertNotIn('\n', an.BOOTSTRAP_PROMPT)
         an.BOOTSTRAP_PROMPT.encode('ascii')   # 非 ASCII 会当场 UnicodeEncodeError
+
+    def test_bootstrap_prompt_has_no_cmd_metacharacters(self) -> None:
+        """它要穿过 cmd.exe（.cmd 类启动器），元字符会被当成命令分隔。"""
+        for char in ';&|<>^%"':
+            self.assertNotIn(char, an.BOOTSTRAP_PROMPT, f'{char!r} 会被 cmd.exe 解释')
+
+    def test_bootstrap_prompt_names_the_real_goal(self) -> None:
+        """**它是那个实例收到的唯一一条用户消息**，必须自己说清终点在哪。
+
+        实测（2026-08-15）：只写 `Run: agentnet drain` 时，四个终审 reviewer 连续
+        把"跑完 drain"当成交付——读了信、挂了 poll、报了状态，然后停下，评审一行没做。
+        它们没做错，是指令只描述了准备动作。
+        """
+        prompt = an.BOOTSTRAP_PROMPT.lower()
+        self.assertIn('drain', prompt)
+        self.assertIn('task', prompt, '要说明 drain 交付的是任务，不是终点')
+        self.assertIn('reply', prompt, '要说明做完必须回信，否则没有交付')
 
     def test_guard_fires_on_swallowed_positional(self) -> None:
         """守卫本身必须在该响的时候真的响——只测好输入测不出这个。"""
