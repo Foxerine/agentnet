@@ -634,6 +634,57 @@ class TestUnackedLetterSafetyNet(Base):
         self.assertIn('unacked_letters', an.INFO_FIELD_ORDER)
 
 
+class TestPollerRetiresOnTerminalStatus(Base):
+    """已终止的 agent 不得因为轮询器还在刷心跳而"假装活着"。
+
+    实测：`6355c527` 的 `status = "exited"`，它的轮询器却仍每 5 分钟刷新 `last_active`
+    ——花名册上它看起来一直健在，别人会把活派给一个不存在的实例。
+
+    本设计的核心等价关系是「心跳停 ⟺ 收不到信 ⟺ 事实上已死」；漏掉这一支就把它打破了。
+    退位此前只覆盖两种情形（登记文件消失、被新轮询器接管），少了第三种：**自己进了终态**。
+    """
+
+    def test_terminal_statuses_are_the_existing_set(self) -> None:
+        """复用既有常量，不另造同义集合——两套定义迟早会分叉。"""
+        self.assertEqual(an.TERMINAL_STATUSES, frozenset({'exited', 'archived'}))
+
+    def test_exited_agent_is_not_counted_alive(self) -> None:
+        """终态不按心跳推算——即便 last_active 是刚刚。"""
+        meta = {'status': an.STATUS_EXITED, 'last_active': an.now()}
+        self.assertEqual(an.effective_status(meta), an.STATUS_EXITED)
+
+    def test_retires_when_own_status_is_terminal(self) -> None:
+        """守卫要在该响时真的响：exited + 自己仍是在册轮询器 = 必须退位。"""
+        self.register()
+        ctx = self.ctx()
+        me = os.getpid()
+        an.merge_info(ctx.info_path, {'status': an.STATUS_EXITED,
+                                      'poller_pid': me, 'last_active': an.now()})
+        reason = an.retirement_reason(ctx, me)
+        self.assertIsNotNone(reason, 'exited 的 agent 其轮询器必须退位，否则造出假活')
+        self.assertIn('exited', str(reason))
+
+    def test_keeps_running_while_active(self) -> None:
+        """反向：正常在册时不能误退位，否则谁都收不到信。"""
+        self.register()
+        ctx = self.ctx()
+        me = os.getpid()
+        an.merge_info(ctx.info_path, {'status': an.STATUS_ACTIVE, 'poller_pid': me})
+        self.assertIsNone(an.retirement_reason(ctx, me))
+
+    def test_retires_when_superseded(self) -> None:
+        self.register()
+        ctx = self.ctx()
+        an.merge_info(ctx.info_path, {'status': an.STATUS_ACTIVE, 'poller_pid': 424242})
+        self.assertIn('接管', str(an.retirement_reason(ctx, os.getpid())))
+
+    def test_retires_when_registration_gone(self) -> None:
+        self.register()
+        ctx = self.ctx()
+        ctx.info_path.unlink()
+        self.assertIn('归档', str(an.retirement_reason(ctx, os.getpid())))
+
+
 class TestProvenance(Base):
     """被拉起的实例必须知道自己是被谁起来的，否则它会推错整条授权链。
 

@@ -1730,6 +1730,48 @@ def _args_poll(p: argparse.ArgumentParser) -> None:
                    help='软超时秒（默认 0=永久挂起）。标准流程勿设限时——对方一轮可能耗时数小时')
 
 
+def retirement_reason(ctx: 'Ctx', me: int) -> str | None:
+    """本轮询器是否该退位；返回退位说明，``None`` 表示继续。
+
+    :param me: 本进程 pid —— 用来判断登记里那个 poller_pid 还是不是我
+
+    **模块级函数而非 cmd_poll 里的闭包**：闭包测不到，只能间接观察，
+    而这正是"守卫要在该响时真的响"最需要直接喂输入验证的地方。
+
+    两种退位，都是"我守护的那份所有权已经不属于我了"：
+
+    **① 登记文件不在了** —— 该 agent 已被归档（``exit`` / ``sweep`` / 看板动作）。
+    必须退出而**不是**把它写回来：整个目录已经原子移进 ``archive/``，此刻再写
+    ``agents/<id>/info.md`` 会凭空造出一个只有 ``last_active`` 的空壳目录，
+    而真正的历史连同未读信还搁在归档里——花名册上于是站着一个没有身份字段的幽灵，
+    后续投给它的信也落进这个幽灵。实测踩过（``04b27904``，从看板归档一个仍在运行的
+    agent，它那个没退位的轮询器把目录写了回来）。
+
+    **② 已被新的轮询器接替** —— 一个还在 ``sleep`` 里的旧轮询器醒来后会用**自己的
+    旧 pid** 覆盖掉新主人的登记，或把它清成 None，于是 ``info.md`` 指向一个不存在的
+    进程，任何"读 poller_pid 再查存活"的外部检测（Stop 钩子就是这么做的）都会误判成
+    死亡。密集更新脚本时连续 RELOAD 会把这个窗口放大到必现。
+    """
+    if not ctx.info_path.exists():
+        return ('[退位] 本 agent 已被归档（登记文件已不在），轮询器随之退出。\n'
+                '        若这是误操作，跑 `agentnet restore <id>` 取回归档目录'
+                '（含未读信），再重新 `agentnet poll`。')
+    meta, _ = read_info(ctx.info_path)
+    if meta.get('poller_pid') != me:
+        return '[退位] 已有新的轮询器接管本 agent，本进程退出（未改动任何登记）。'
+    # **③ 本 agent 已进入终态**（`exit` / `kill` 写了 status，但目录还在）。
+    # 不退位的话就制造出**假活**：agent 已终止，而轮询器还在刷 `last_active`，
+    # 于是花名册上它看起来一直健在，别人会把活派给一个不存在的实例。
+    # 实测：`6355c527` 的 status 是 `exited`，它的轮询器却仍在心跳。
+    # 这正是本设计明确要避免的状态——「心跳停 ⟺ 收不到信 ⟺ 事实上已死」
+    # 三者本该同生共死，漏掉这一支就把等价关系打破了。
+    status = str(meta.get('status') or '')
+    if status in TERMINAL_STATUSES:
+        return (f'[退位] 本 agent 已是终态 `{status}`，轮询器随之退出——'
+                '再心跳下去会让它在花名册上假装还活着。')
+    return None
+
+
 @command(
     'poll',
     '后台长轮询：收到信即打印全文并退出（从而唤醒你）；兼任心跳',
@@ -1763,31 +1805,6 @@ def cmd_poll(args: argparse.Namespace) -> None:
         _die("你的登记在启动轮询器的瞬间消失了（被归档？）。先跑 `agentnet register`。")
     mine = {'poller_pid': me}
 
-    def retirement_reason() -> str | None:
-        """本轮询器是否该退位；返回退位说明，``None`` 表示继续。
-
-        两种退位，都是"我守护的那份所有权已经不属于我了"：
-
-        **① 登记文件不在了** —— 该 agent 已被归档（``exit`` / ``sweep`` / 看板动作）。
-        必须退出而**不是**把它写回来：整个目录已经原子移进 ``archive/``，此刻再写
-        ``agents/<id>/info.md`` 会凭空造出一个只有 ``last_active`` 的空壳目录，
-        而真正的历史连同未读信还搁在归档里——花名册上于是站着一个没有身份字段的幽灵，
-        后续投给它的信也落进这个幽灵。实测踩过（``04b27904``，从看板归档一个仍在运行的
-        agent，它那个没退位的轮询器把目录写了回来）。
-
-        **② 已被新的轮询器接替** —— 一个还在 ``sleep`` 里的旧轮询器醒来后会用**自己的
-        旧 pid** 覆盖掉新主人的登记，或把它清成 None，于是 ``info.md`` 指向一个不存在的
-        进程，任何"读 poller_pid 再查存活"的外部检测（Stop 钩子就是这么做的）都会误判成
-        死亡。密集更新脚本时连续 RELOAD 会把这个窗口放大到必现。
-        """
-        if not ctx.info_path.exists():
-            return ('[退位] 本 agent 已被归档（登记文件已不在），轮询器随之退出。\n'
-                    '        若这是误操作，跑 `agentnet restore <id>` 取回归档目录'
-                    '（含未读信），再重新 `agentnet poll`。')
-        meta, _ = read_info(ctx.info_path)
-        if meta.get('poller_pid') != me:
-            return '[退位] 已有新的轮询器接管本 agent，本进程退出（未改动任何登记）。'
-        return None
 
     deadline = None if args.max_wait <= 0 else time.monotonic() + args.max_wait
     last_beat = time.monotonic()
@@ -1799,7 +1816,7 @@ def cmd_poll(args: argparse.Namespace) -> None:
     try:
         while True:
             # 该退位就**立刻退位，且什么都不写** —— 让位比抢着做完手上的事重要。
-            retiring = retirement_reason()
+            retiring = retirement_reason(ctx, me)
             if retiring is not None:
                 print(retiring)
                 return
