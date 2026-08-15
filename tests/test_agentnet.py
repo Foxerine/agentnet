@@ -700,6 +700,44 @@ class TestErrandFraming(Base):
         self.assertNotIn('请执行', an.TRUST_NOTE_LETTER)
 
 
+class TestDashboardDirectoryPicker(Base):
+    """选目录那一步是**人给写权限**的边界，不能因为难用而被绕开或选错。
+
+    实测：用户点 sweep 时看到「无法打开此文件夹，因为其中含有系统文件」——
+    那是浏览器拒绝了**家目录**。`.agentnet` 是点开头的目录，在选择器里不显眼，
+    停在上一级就点"选择"几乎是必然。提示语当时没给路径。
+    """
+
+    def test_template_has_a_placeholder_for_the_root(self) -> None:
+        self.assertIn('__AGENTNET_ROOT__', an.DASHBOARD_TEMPLATE,
+                      '路径要烘进页面，否则提示语说不出该选哪个目录')
+
+    def test_generated_page_carries_the_absolute_path(self) -> None:
+        import argparse
+        an.cmd_dashboard(argparse.Namespace(open=False))
+        html = (an.ROOT / an.DASHBOARD_HTML).read_text(encoding='utf-8')
+        self.assertNotIn('__AGENTNET_ROOT__', html, '占位符没被替换')
+        self.assertIn('agentnet-test-', html, '页面里应含真实根目录路径')
+
+    def test_backslashes_are_escaped_for_javascript(self) -> None:
+        """Windows 路径进 JS 字符串必须转义，否则 `\\U` 之类会把页面整崩。"""
+        import argparse
+        an.cmd_dashboard(argparse.Namespace(open=False))
+        html = (an.ROOT / an.DASHBOARD_HTML).read_text(encoding='utf-8')
+        line = next(l for l in html.splitlines() if 'AGENTNET_ROOT_PATH =' in l)
+        self.assertNotRegex(line, r"(?<!\\)\\(?!\\)", f'路径里有未转义的反斜杠：{line}')
+
+    def test_handle_is_persisted_across_reloads(self) -> None:
+        """句柄只存页面变量的话，"只需选这一次"其实是每次刷新都问一次。"""
+        self.assertIn('indexedDB', an.DASHBOARD_TEMPLATE)
+        self.assertIn('queryPermission', an.DASHBOARD_TEMPLATE)
+
+    def test_error_message_names_the_actual_cause(self) -> None:
+        """报错要指向真正的成因（选到上级），而不是只把浏览器原话丢回来。"""
+        self.assertIn('含有系统文件', an.DASHBOARD_TEMPLATE)
+        self.assertIn('上级', an.DASHBOARD_TEMPLATE)
+
+
 class TestProvenance(Base):
     """被拉起的实例必须知道自己是被谁起来的，否则它会推错整条授权链。
 

@@ -4428,12 +4428,59 @@ setView(savedView);   /* 放在 setCols 之后：它会触发一次 rerender，�
    file:// 页面默认不能写盘；用 File System Access API 取一次 .agentnet 目录句柄，
    之后配置保存与动作排队都不再打扰你。
    这个"人来选一次目录"不是麻烦，是**边界**：写权限归人，agent 拿不到它。 */
+const AGENTNET_ROOT_PATH = '__AGENTNET_ROOT__';
 let rootHandle = null;
+
+/* 目录句柄存进 IndexedDB：它是可结构化克隆的，能跨页面刷新与浏览器重启保留。
+   此前只放在页面变量里，于是"只需选这一次"其实是**每次刷新都要选一次**——
+   而每问一次就多一次选错的机会，这正是那个"含有系统文件"报错的温床。 */
+function idbOpen() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('agentnet-console', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('handles');
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function idbHandle(value) {
+  const db = await idbOpen();
+  return new Promise((res, rej) => {
+    const tx = db.transaction('handles', value === undefined ? 'readonly' : 'readwrite');
+    const store = tx.objectStore('handles');
+    const req = value === undefined ? store.get('root') : store.put(value, 'root');
+    req.onsuccess = () => res(req.result);
+    req.onerror = () => rej(req.error);
+  });
+}
+
 async function ensureRoot(why) {
   if (rootHandle) return rootHandle;
   if (!window.showDirectoryPicker) throw new Error('此浏览器不支持写盘（File System Access API）');
-  alert('请在接下来的对话框里选中 .agentnet 目录\\n（' + why + '；只需选这一次）');
-  rootHandle = await window.showDirectoryPicker({mode: 'readwrite'});
+
+  /* 先试上次记住的那个——权限还在就完全不打扰 */
+  try {
+    const saved = await idbHandle();
+    if (saved) {
+      let perm = await saved.queryPermission({mode: 'readwrite'});
+      if (perm !== 'granted') perm = await saved.requestPermission({mode: 'readwrite'});
+      if (perm === 'granted') { rootHandle = saved; return rootHandle; }
+    }
+  } catch (e) { /* 记住的句柄失效就当没记过，往下走重新选 */ }
+
+  alert('接下来请选中这个目录（可直接把路径粘进对话框的地址栏）：\\n\\n'
+      + AGENTNET_ROOT_PATH + '\\n\\n'
+      + '（' + why + '）\\n'
+      + '注意：要选 .agentnet 这一层**本身**，不要停在它的上级——\\n'
+      + '浏览器会拒绝家目录，报"其中含有系统文件"。\\n'
+      + '选一次即可，之后会记住。');
+  try {
+    rootHandle = await window.showDirectoryPicker({mode: 'readwrite'});
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw new Error('你取消了目录选择，本次动作未执行');
+    throw new Error('选目录失败：' + (e && e.message ? e.message : e)
+      + ' —— 若提示"含有系统文件"，说明选到了 .agentnet 的上级；请选 ' + AGENTNET_ROOT_PATH + ' 本身');
+  }
+  try { await idbHandle(rootHandle); } catch (e) { /* 记不住不影响本次使用 */ }
   return rootHandle;
 }
 async function writeRootFile(name, text) {
@@ -4719,7 +4766,11 @@ def _args_dashboard(p: argparse.ArgumentParser) -> None:
     add_args=_args_dashboard,
 )
 def cmd_dashboard(args: argparse.Namespace) -> None:
-    _atomic_write(ROOT / DASHBOARD_HTML, DASHBOARD_TEMPLATE)
+    # 把根目录的绝对路径**烘进页面**：选目录对话框里 `.agentnet` 是点开头的目录，
+    # 既不显眼也不好找，用户很容易停在上一级就点"选择"——而上一级是家目录，
+    # 浏览器**明确拒绝**它（"其中含有系统文件"）。给出可直接粘贴的路径就没这问题。
+    _atomic_write(ROOT / DASHBOARD_HTML,
+                  DASHBOARD_TEMPLATE.replace('__AGENTNET_ROOT__', str(ROOT).replace('\\', '\\\\')))
     refresh_dashboard_data()
     html = ROOT / DASHBOARD_HTML
     print(f"[OK] 看板已生成: {html}")
