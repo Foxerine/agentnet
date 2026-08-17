@@ -519,6 +519,16 @@ class TestRearmNotice(Base):
         self.assertIn('压缩', an.REARM_NOTICE, '要点明 compact 是成因之一')
         self.assertIn('重挂即可', an.REARM_NOTICE)
 
+    def test_tells_you_to_verify_before_rearming(self) -> None:
+        """收到 killed 通知**先查 whoami**——那个词也覆盖"正常退出"和"其实还活着"。
+
+        实测：连报两次 killed，而 `whoami` 显示轮询器正常运行（pid 369724）。
+        见状就重挂会顶掉正在跑的那个：新的接管、旧的写 `[退位]` 退出、又产生一条
+        新的 killed 通知——**盲目响应会制造它试图修复的那个混乱**。
+        """
+        self.assertIn('whoami', an.REARM_NOTICE)
+        self.assertIn('只有它说未运行才重挂', an.REARM_NOTICE)
+
     def test_states_the_fallback(self) -> None:
         """没有轮询器**仍然收得到信**（Stop 钩子每回合 drain）——
 
