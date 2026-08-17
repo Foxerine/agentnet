@@ -509,6 +509,23 @@ class TestSpawnWindowTargeting(Base):
 
 class TestRearmNotice(Base):
 
+    def test_explains_that_kills_are_expected(self) -> None:
+        """轮询器被杀是**上游已知限制**（compact/会话结束时 SIGTERM 所有被追踪任务，
+        无豁免机制）。不说清楚，实例会误判成"环境有问题"而放弃重挂。
+
+        实测两个实例都栽在这：一个断定「挂不住」停止重试 ⇒ 永久离线；
+        另一个把 `killed` 当成"有人在清理"，白停一轮。
+        """
+        self.assertIn('压缩', an.REARM_NOTICE, '要点明 compact 是成因之一')
+        self.assertIn('重挂即可', an.REARM_NOTICE)
+
+    def test_states_the_fallback(self) -> None:
+        """没有轮询器**仍然收得到信**（Stop 钩子每回合 drain）——
+
+        不说这条，实例会把"降级"误当成"失效"，代价是主动退出网络。
+        """
+        self.assertIn('仍然收得到信', an.REARM_NOTICE)
+
     def test_warns_against_self_backgrounding(self) -> None:
         """只讲"脚本 spawn 后继进程"这一种形态，读者要自己完成类比才受益——
 
