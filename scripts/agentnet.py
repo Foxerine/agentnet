@@ -2713,21 +2713,25 @@ def cmd_spawn(args: argparse.Namespace) -> None:
         inner = build_claude_argv(
             resolve_launcher(launcher_parts[0]), BOOTSTRAP_PROMPT,
             new_id, name, permission_mode, Config.role_disallowed_tools(role_name))
-        needs_run = bool(role_env)   # 只有要注入 env 时才多包一层
     else:
         # 其它 harness：没有 --session-id 这类身份开关，只能靠环境变量注入身份
         inner = launcher_parts
-        needs_run = True
 
-    if needs_run:
-        # 环境变量必须由**我们自己的进程**设置：wt 给新分页的是终端自己的环境块，
-        # 在 Popen 上设 env 到不了分页里的进程。run 在自己进程里设好再 exec 子命令。
-        child = [sys.executable, script_path(), 'run', '--id', new_id]
-        if role_env:
-            child += ['--role', role_name]
-        child += ['--'] + inner
-    else:
-        child = inner
+    # **一律包一层 `agentnet run`**，即使不需要注入 env。
+    #
+    # 此前只在有 role_env 时才包（`peer` 因此是裸起 claude）。但这一层还有个更普遍的
+    # 用途：**翻译退出码**。`agentnet kill` 用 `taskkill /F` 终止目标，那给出退出码
+    # **1**；而 Windows Terminal 的 `closeOnExit: graceful` 只在退出码为 0 时关标签页
+    # ——于是被杀掉的 agent 会留下一个死掉的分页不肯关闭（用户报告）。
+    # `wt` 没有单次调用级的 closeOnExit 覆盖（只能配在 profile 里，已查证），
+    # 所以唯一的着手点就是让分页里的顶层进程自己退出 0。
+    #
+    # 代价是每个实例多一个 Python 进程（只等子进程，开销很小），换来链路上有
+    # **一个我们控制的点**可以做生命周期翻译。
+    child = [sys.executable, script_path(), 'run', '--id', new_id]
+    if role_env:
+        child += ['--role', role_name]
+    child += ['--'] + inner
 
     argv, effective_mode, target_window, notes = build_launch(
         args.mode, args.window, name, ctx.cwd, child, ctx.slug,
@@ -2905,6 +2909,48 @@ def _args_run(p: argparse.ArgumentParser) -> None:
     p.add_argument('rest', nargs=argparse.REMAINDER, help='`--` 之后是要运行的命令')
 
 
+DELIBERATE_EXIT_GRACE_S = 3.0
+"""等 ``kill`` 把终态写进 ``info.md`` 的宽限。
+
+``cmd_kill`` 是**先确认终止、再写 status**（顺序刻意：终止没成功就不该改写别人的登记）。
+于是包装层可能在那次写落盘**之前**就看到子进程已死，误判成崩溃。间隔以毫秒计，
+给 3 秒足够宽裕；等不到就按崩溃处理——**宁可多留一个分页，也不要关掉崩溃现场**。
+"""
+
+
+def exit_code_for_terminal(agent_id: str, child_code: int) -> int:
+    """把子进程退出码翻译成**终端该看到的**退出码。
+
+    要区分两种非零退出，它们该有相反的处置：
+
+    * **被 `agentnet kill` 有意终止** —— `taskkill /F` 给出退出码 1，而 Windows Terminal
+      的 ``closeOnExit: graceful`` 只在 0 时关标签页 ⇒ 分页赖着不走。这种应当返回 0。
+    * **真的崩了** —— 分页**应该**留着，让人看得到现场。这种必须原样透传。
+
+    判据用既有状态，不新增字段：进程死了、而它的登记已是终态（``exited`` / ``archived``）
+    ⇒ 是别人有意结束它的；登记还是 ``active`` ⇒ 没人下过手，那就是崩溃。
+
+    一律返回 0 会把崩溃现场也一起关掉——**那是拿一个 UX 小病换一个诊断大病**。
+    """
+    if child_code == 0:
+        return 0
+    deadline = time.monotonic() + DELIBERATE_EXIT_GRACE_S
+    while time.monotonic() < deadline:
+        try:
+            ctx = Ctx()
+            info = ctx.info_path_of(agent_id)
+            archived = archived_copy(ctx, agent_id) is not None
+            status = str(read_info(info)[0].get('status') or '') if info.exists() else ''
+        except SystemExit:
+            return child_code   # 登记读不出来就别猜，按原样透传
+        if archived or status in TERMINAL_STATUSES:
+            print(f"[agentnet] 本实例已被有意结束（{status or 'archived'}），"
+                  f"把退出码 {child_code} 翻译成 0 让终端关闭本分页。", flush=True)
+            return 0
+        time.sleep(0.2)
+    return child_code
+
+
 @command(
     'run',
     '通用包装器：为任意 agent CLI 注入身份并托管其生命周期',
@@ -2930,7 +2976,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     print(f"{banner}  →  {' '.join(rest)}", flush=True)
     # Windows 上 .cmd/.bat 不是可执行映像，CreateProcess 起不了；交给 cmd.exe 解释
     completed = subprocess.run(resolve_launcher(rest[0]) + rest[1:], env=env, check=False)
-    raise SystemExit(completed.returncode)
+    raise SystemExit(exit_code_for_terminal(agent_id, completed.returncode))
 
 
 # ══════════════════════════════════════════════════════════════════════════

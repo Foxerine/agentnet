@@ -790,6 +790,48 @@ class TestDashboardDirectoryPicker(Base):
         self.assertEqual(done.returncode, 0, f'生成的 JS 语法有错：\n{done.stderr[:600]}')
 
 
+class TestTerminalExitCode(Base):
+    """被 kill 掉的 agent 不该留下一个关不掉的分页；崩掉的**必须**留下。
+
+    `agentnet kill` 用 `taskkill /F`，那给出退出码 1（实测）；而 Windows Terminal 的
+    `closeOnExit: graceful` 只在 0 时关标签页（实测本机就是这个配置）——于是被杀的
+    实例留下死分页。`wt` 没有单次调用级的 closeOnExit 覆盖（已查证），
+    所以只能让分页里的顶层进程自己退出 0。
+    """
+
+    def test_zero_passes_through(self) -> None:
+        self.assertEqual(an.exit_code_for_terminal(self.agent_id, 0), 0)
+
+    def test_deliberate_kill_becomes_zero(self) -> None:
+        self.register()
+        an.merge_info(self.ctx().info_path, {'status': an.STATUS_EXITED})
+        self.assertEqual(an.exit_code_for_terminal(self.agent_id, 1), 0,
+                         '被有意结束的实例应让分页自动关闭')
+
+    def test_archived_agent_also_becomes_zero(self) -> None:
+        """`exit` / `sweep` 会把整个目录搬进 archive/，登记文件就不在原处了。"""
+        import argparse
+        self.register()
+        an.cmd_exit(argparse.Namespace())
+        self.assertEqual(an.exit_code_for_terminal(self.agent_id, 1), 0)
+
+    def test_crash_keeps_its_exit_code(self) -> None:
+        """**这条是重点**：一律返回 0 会把崩溃现场也关掉——
+
+        拿一个 UX 小病换一个诊断大病。登记还是 active ⇒ 没人下过手 ⇒ 就是崩了。
+        """
+        self.register()
+        started = time.monotonic()
+        self.assertEqual(an.exit_code_for_terminal(self.agent_id, 3), 3,
+                         '没人 kill 它，说明是崩溃，分页必须留着')
+        self.assertLess(time.monotonic() - started, an.DELIBERATE_EXIT_GRACE_S + 3,
+                        '等待不该远超宽限')
+
+    def test_unknown_agent_passes_through(self) -> None:
+        """读不出登记就别猜——原样透传比猜错好。"""
+        self.assertEqual(an.exit_code_for_terminal('no-such-agent-id', 7), 7)
+
+
 class TestProvenance(Base):
     """被拉起的实例必须知道自己是被谁起来的，否则它会推错整条授权链。
 
