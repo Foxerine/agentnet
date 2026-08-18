@@ -832,6 +832,77 @@ class TestTerminalExitCode(Base):
         self.assertEqual(an.exit_code_for_terminal('no-such-agent-id', 7), 7)
 
 
+class TestOrphanedWait(Base):
+    """author 等一个已经死掉的 reviewer，是这套协议里唯一会**永远卡住**的状态。
+
+    poll 刻意无超时（标准流程强制：对方一轮可能耗时数小时），所以没有任何东西会打破它。
+    reviewer 崩掉 / 被杀 / 被 sweep 归档后，那封回信永远不会来，而 author
+    **不知道自己在等一个死人**。
+    """
+
+    def spawn_child(self, name: str = 'reviewer-1') -> str:
+        """造一个"我拉起的、活着的"子实例登记。"""
+        child_id = 'cccc0000-0000-0000-0000-00000000000' + name[-1]
+        ctx = self.ctx()
+        home = ctx.agents_dir / child_id
+        for sub in ('inbox', 'read', 'sent'):
+            (home / sub).mkdir(parents=True, exist_ok=True)
+        an.merge_info(home / 'info.md', {
+            'id': child_id, 'workspace': ctx.slug, 'kind': 'claude',
+            'registered_at': an.now(), 'last_active': an.now(),
+            'status': an.STATUS_ACTIVE, 'pid': os.getpid(),
+            'display_name': name, 'spawned_by': self.agent_id,
+        })
+        return child_id
+
+    def test_my_children_are_found(self) -> None:
+        self.register()
+        child = self.spawn_child()
+        self.assertIn(child, an.my_live_children(self.ctx()))
+
+    def test_other_peoples_children_are_not_mine(self) -> None:
+        """只盯自己拉起的——别人的 reviewer 死活与我无关，报了就是噪音。"""
+        self.register()
+        child = self.spawn_child()
+        an.merge_info(self.ctx().info_path_of(child), {'spawned_by': 'someone-else'})
+        self.assertEqual(an.my_live_children(self.ctx()), {})
+
+    def test_dead_child_is_detected(self) -> None:
+        self.register()
+        child = self.spawn_child()
+        watched = an.my_live_children(self.ctx())
+        an.merge_info(self.ctx().info_path_of(child), {'status': an.STATUS_EXITED})
+        self.assertIn(child, an.dead_among(self.ctx(), watched))
+
+    def test_archived_child_is_detected(self) -> None:
+        """被 sweep 归档时整个目录会搬走，登记文件就不在原处了。"""
+        self.register()
+        child = self.spawn_child()
+        watched = an.my_live_children(self.ctx())
+        an.archive_agent(self.ctx(), child, 'sweep', 'no heartbeat')
+        self.assertIn(child, an.dead_among(self.ctx(), watched))
+
+    def test_live_child_is_not_reported(self) -> None:
+        """反向：活着的不能误报，否则 author 会被赶去重开一个正在干活的 reviewer。"""
+        self.register()
+        self.spawn_child()
+        watched = an.my_live_children(self.ctx())
+        self.assertEqual(an.dead_among(self.ctx(), watched), {})
+
+    def test_notice_is_actionable(self) -> None:
+        """光说"死了"不够——要说清回信不会来了、以及下一步做什么。"""
+        text = an.render_dead_children({'cccc0000-1111': 'gate9-reviewer'})
+        self.assertIn('cccc0000', text)
+        self.assertIn('gate9-reviewer', text)
+        self.assertIn('不会再来', text)
+        self.assertIn('spawn', text)
+
+    def test_watch_interval_is_between_loop_and_heartbeat(self) -> None:
+        """比主循环稀（省 I/O）、比心跳密（author 在等，不能拖 5 分钟）。"""
+        self.assertGreater(an.CHILD_WATCH_INTERVAL_S, 2)
+        self.assertLess(an.CHILD_WATCH_INTERVAL_S, an.heartbeat_interval_s())
+
+
 class TestProvenance(Base):
     """被拉起的实例必须知道自己是被谁起来的，否则它会推错整条授权链。
 

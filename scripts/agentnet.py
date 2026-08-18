@@ -1816,6 +1816,72 @@ def retirement_reason(ctx: 'Ctx', me: int) -> str | None:
     return None
 
 
+CHILD_WATCH_INTERVAL_S = 15
+"""多久查一次"我拉起的实例还活着吗"。
+
+比心跳（5 分钟）密得多——author 正阻塞在 poll 里等回信，早一分钟知道就少等一分钟；
+又比主循环（1-2 秒）稀得多——没必要那么勤，而且省下的是**每个轮询器**的文件读。
+"""
+
+
+def my_live_children(ctx: 'Ctx') -> dict[str, str]:
+    """我拉起的、此刻还活着的实例：``{id: 显示名}``。**只在 poll 启动时全扫一次。**"""
+    out: dict[str, str] = {}
+    for agent_id, meta, _ in iter_agents(ctx):
+        if str(meta.get('spawned_by') or '') != ctx.agent_id:
+            continue
+        if effective_status(meta, verify_pid=True) == STATUS_ACTIVE:
+            out[agent_id] = str(meta.get('display_name') or '')
+    return out
+
+
+def dead_among(ctx: 'Ctx', watched: dict[str, str]) -> dict[str, str]:
+    """``watched`` 里此刻已经死掉的那些。
+
+    **只读这几个的 ``info.md``，不全表扫描**——全扫是 N 个 agent × M 个轮询器 × 每次检查，
+    而被盯的通常只有一两个。
+
+    ``verify_pid=True``：进程没了就立刻算死，不等心跳超时。author 在等回信，
+    "还要不要继续等"这个判断经不起 5 分钟延迟。
+    """
+    dead: dict[str, str] = {}
+    for agent_id, name in watched.items():
+        info = ctx.info_path_of(agent_id)
+        if not info.exists():
+            dead[agent_id] = name          # 目录已搬进 archive/
+            continue
+        try:
+            meta, _ = read_info(info)
+        except SystemExit:
+            dead[agent_id] = name          # 登记读不出来，按死处理
+            continue
+        if effective_status(meta, verify_pid=True) != STATUS_ACTIVE:
+            dead[agent_id] = name
+    return dead
+
+
+def render_dead_children(dead: dict[str, str]) -> str:
+    """告诉 author："你等的那个已经不在了"。
+
+    这是**唯一**能终止无限等待的信号。此前没有它：author 拉起 reviewer 后阻塞在 poll
+    等回信，reviewer 崩了 / 被 sweep 归档 / 被杀，那封回信**永远不会来**，
+    而 poll 没有超时（标准流程强制无超时，因为对方一轮可能耗时数小时）——
+    于是 author 永远等下去，**且不知道自己在等一个死人**。
+    """
+    lines = ['[子实例已死] 你拉起的以下实例已经不在了，它们的回信**不会再来**：']
+    for agent_id, name in sorted(dead.items(), key=lambda kv: kv[1]):
+        lines.append(f"      - {agent_id[:8]}  {name or '(未命名)'}")
+    lines += [
+        '',
+        '    若你正等它的产出：**重新 `agentnet spawn` 一个**。评审协议本就要求'
+        '每轮终审换新实例，所以重开不是退步。',
+        '    想看它死前留下什么：`agentnet last --full`（它可能已发过部分回信），'
+        '或翻 `archive/<id>/` 里的 sent/。',
+        '    **本轮询器已退出**，处理完后照常重新后台运行 `agentnet poll`。',
+    ]
+    return '\n'.join(lines)
+
+
 @command(
     'poll',
     '后台长轮询：收到信即打印全文并退出（从而唤醒你）；兼任心跳',
@@ -1849,6 +1915,11 @@ def cmd_poll(args: argparse.Namespace) -> None:
         _die("你的登记在启动轮询器的瞬间消失了（被归档？）。先跑 `agentnet register`。")
     mine = {'poller_pid': me}
 
+
+    # 快照"我拉起的、此刻还活着的实例"。**只盯这一批**——本次等待开始时就已经死掉的
+    # 不算（那不是"我等的时候它死了"），于是无需任何持久状态，也不会为陈年旧账反复报警。
+    watched_children = my_live_children(ctx)
+    last_child_check = time.monotonic()
 
     deadline = None if args.max_wait <= 0 else time.monotonic() + args.max_wait
     last_beat = time.monotonic()
@@ -1884,6 +1955,17 @@ def cmd_poll(args: argparse.Namespace) -> None:
                     print(REARM_NOTICE)
                     return
             moment = time.monotonic()
+            # 等一个已经死掉的实例，是这套协议里唯一会**永远卡住**的状态：
+            # poll 刻意无超时（对方一轮可能耗时数小时），所以没有任何东西会打破它。
+            if watched_children and moment - last_child_check >= CHILD_WATCH_INTERVAL_S:
+                last_child_check = moment
+                gone = dead_among(ctx, watched_children)
+                if gone:
+                    merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': None},
+                               expect=mine, create=False)
+                    print(render_dead_children(gone))
+                    return
+
             if moment - last_beat >= heartbeat_interval_s():
                 merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': me},
                            expect=mine, create=False)
