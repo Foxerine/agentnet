@@ -216,7 +216,7 @@ INFO_FIELD_ORDER: tuple[str, ...] = (
     'id', 'workspace', 'kind', 'cwd', 'registered_at',
     # 运行态（每次命令 / 每 5 分钟心跳刷新）
     'pid', 'status', 'last_active', 'harness', 'display_name', 'poller_pid',
-    'unarmed_nagged_at',
+    'unarmed_blocks',
     'unacked_letters',
     # 语义（LLM 经 charter / log 提供）
     'topics', 'topics_updated_at', 'plan_file',
@@ -1995,6 +1995,22 @@ def cmd_poll(args: argparse.Namespace) -> None:
         raise
 
 
+UNARMED_BLOCK_LIMIT = 3
+"""未挂载轮询器时，Stop 钩子最多连续拦几次。
+
+**为什么要拦不止一次**：Stop 钩子触发的时刻，恰好是 agent 可能转入空闲的那一刻，
+而"空闲 + 没有轮询器"是唯一真正有害的组合——此后叫不醒它，5 分钟后判死、
+别人投信被拒。拦一次只是提醒，仍然依赖 agent 记得；用户报告的恰恰是"总是忘记"。
+
+**为什么有上限**：真的挂不上的实例（没有 Bash 工具、环境异常）不该被无限挡在回合里。
+3 次足以覆盖"忘了"，又不至于把一个挂不上的实例卡死。
+
+**注意它拦的不是"损失"而是"时机"**：没有轮询器时 agent 仍然收得到信
+（Stop 钩子每回合 drain），心跳也照常刷新（每次 agentnet 调用都 touch_activity）。
+丢的只有"空闲时被唤醒"——所以拦的目的不是止损，是**别在进入空闲前留下这个缺口**。
+"""
+
+
 def _args_drain(p: argparse.ArgumentParser) -> None:
     p.add_argument('--hook', action='store_true',
                    help='输出 Claude Code Stop 钩子的 JSON（hookSpecificOutput）而非纯文本')
@@ -2023,10 +2039,10 @@ def cmd_drain(args: argparse.Namespace) -> None:
     armed = isinstance(poller, int) and pid_alive(poller)
 
     # 掉线是**对整个网络的伤害**（别人投信给我会被当场拒绝），所以每个掉线周期
-    # 强制打断一次。`nagged` 记录"本周期已强制过"，避免变成每回合死循环。
-    nagged = meta.get('unarmed_nagged_at') is not None
-    if armed and nagged:
-        merge_info(ctx.info_path, {'unarmed_nagged_at': None}, create=False)
+    # 未挂载就拦住回合，最多 UNARMED_BLOCK_LIMIT 次；挂上后计数清零。
+    blocked_so_far = int(meta.get('unarmed_blocks') or 0)
+    if armed and blocked_so_far:
+        merge_info(ctx.info_path, {'unarmed_blocks': None}, create=False)
 
     # 轮询器投递过、但从未在回合里被确认的信。**这是送达的兜底通道**——
     # poll 把全文打进一个后台任务的输出文件，而读那个文件是可跳过的环节
@@ -2047,9 +2063,12 @@ def cmd_drain(args: argparse.Namespace) -> None:
             "让你自己对账；只提醒一次。）")
         merge_info(ctx.info_path, {'unacked_letters': None}, create=False)
     if not armed:
-        chunks.append("[!] 你的 agentnet 轮询器**未运行**——空闲时收不到信，"
-                      f"{dead_after_s() // 60} 分钟后会被判定死亡，"
-                      "**别人投信给你会被当场拒绝**。\n"
+        chunks.append("[!] 你的 agentnet 轮询器**未运行**。\n"
+                      "    现在还没事——你在干活时信件照常送达（本钩子每回合 drain 一次），"
+                      "心跳也随每次 agentnet 调用刷新。\n"
+                      f"    **但你一旦转入空闲就叫不醒了**：{dead_after_s() // 60} 分钟后判死、"
+                      "别人投信给你会被当场拒绝。\n"
+                      "    所以要在**结束本回合之前**挂上——而不是等想起来。\n"
                       "    立刻用**你的 harness 的后台机制**运行 `agentnet poll`"
                       "（Claude Code 是 Bash 工具的 run_in_background）——\n"
                       "    自己用 `&` / `nohup` 挂**不算**：那种进程 harness 追踪不到，"
@@ -2083,15 +2102,20 @@ def cmd_drain(args: argparse.Namespace) -> None:
         # 必须 block：这条的**全部意义**就是覆盖"agent 压根没打开 poll 的输出"那种情形，
         # 而那种情形下不 block 就等于再发一张会被跳过的便签。
         reason = f'对一下账：轮询器投递过 {len(unacked)} 封信，认得出就继续'
-    elif not armed and not nagged:
-        # **每个掉线周期只强制一次。** 此前这里只注入上下文不 block，理由是"会死循环"——
-        # 顾虑是真的，但结论下错了：`additionalContext` 不带 block 时回合照常结束，
-        # 那条提醒就成了一张便签，而它出现的时机恰是把控制权交还用户的一刻，
-        # 最容易被下一条指令盖过去。**实测我自己就这么掉线了整整一段时间，
-        # 期间漏收一封信，而每一回合钩子都在提醒我。**
-        # 精确化后循环风险消失：强制一次 → 记下 → 之后降级为便签 → 挂上后清零。
-        reason = '你的 agentnet 轮询器未运行，先挂上再继续（本次掉线只打断这一次）'
-        merge_info(ctx.info_path, {'unarmed_nagged_at': now()}, create=False)
+    elif not armed and blocked_so_far < UNARMED_BLOCK_LIMIT:
+        # **不让回合在未挂载的状态下结束。** Stop 钩子触发的时刻，恰好就是 agent
+        # 可能转入空闲的那一刻——而"空闲且没有轮询器"是唯一真正有害的组合：
+        # 此后叫不醒它，5 分钟后判死、别人投信被拒。钩子站在唯一正确的位置上。
+        #
+        # 此前只拦**一次**（怕死循环）。但拦一次靠的仍是 agent 记得去做，
+        # 而用户报告的正是"总是忘记"。改成**未挂就拦，上限 N 次**：
+        # 照做了下一回合自然不再拦（armed ⇒ 计数清零）；真的挂不上也不会无限循环。
+        blocked_so_far += 1
+        remaining = UNARMED_BLOCK_LIMIT - blocked_so_far
+        reason = (f'轮询器未挂载，先挂上再结束本回合'
+                  f'（第 {blocked_so_far}/{UNARMED_BLOCK_LIMIT} 次拦截'
+                  + (f'，还会再拦 {remaining} 次）' if remaining else '，此后不再拦）'))
+        merge_info(ctx.info_path, {'unarmed_blocks': blocked_so_far}, create=False)
     if reason and not args.no_block:
         payload['decision'] = 'block'
         payload['reason'] = reason

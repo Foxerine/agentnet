@@ -546,12 +546,12 @@ class TestRearmNotice(Base):
 
 
 class TestUnarmedPollerIsBlocking(Base):
-    """掉线必须**打断一次**，不能只留一张便签。
+    """**不让回合在未挂载轮询器的状态下结束。**
 
-    实测（本机，2026-08-14）：钩子每回合都在注入"轮询器未运行"，而我掉线了整整一段
-    时间、期间漏收一封信。原因是 `additionalContext` 不带 `decision: block` 时回合照常
-    结束——那条提醒出现的时机恰是把控制权交还用户的一刻，最容易被下一条指令盖过去。
-    **提醒了没人动，不是使用者不上心，是提醒没有与后果匹配的强制力。**
+    Stop 钩子触发的时刻，恰好是 agent 可能转入空闲的那一刻——而"空闲 + 没有轮询器"
+    是唯一真正有害的组合：此后叫不醒它，5 分钟后判死、别人投信被拒。
+    干活期间没有轮询器**不损失什么**（钩子每回合 drain、心跳随命令刷新），
+    所以拦截的目的不是止损，是**别在进入空闲前留下这个缺口**。
     """
 
     def hook_output(self) -> dict:
@@ -564,26 +564,29 @@ class TestUnarmedPollerIsBlocking(Base):
     def go_offline(self) -> None:
         an.merge_info(self.ctx().info_path, {'poller_pid': 999999})   # 不存在的 pid
 
-    def test_first_stop_after_going_offline_blocks(self) -> None:
+    def test_blocks_repeatedly_not_just_once(self) -> None:
+        """拦一次仍然依赖 agent 记得——而用户报告的正是"总是忘记"。"""
         self.register()
         self.go_offline()
-        self.assertEqual(self.hook_output().get('decision'), 'block',
-                         '掉线后的第一次 Stop 必须打断，否则提醒只是便签')
+        for attempt in range(an.UNARMED_BLOCK_LIMIT):
+            self.assertEqual(self.hook_output().get('decision'), 'block',
+                             f'第 {attempt + 1} 次应仍然拦截')
 
-    def test_second_stop_does_not_block_again(self) -> None:
-        """每周期只强制一次——否则一个起不来的 agent 会被每回合挡回去，变成死循环。"""
+    def test_gives_up_after_the_limit(self) -> None:
+        """真的挂不上的实例不该被无限挡在回合里。"""
         self.register()
         self.go_offline()
-        self.hook_output()                       # 第一次：block
-        self.assertNotIn('decision', self.hook_output(), '同一次掉线不该反复打断')
+        for _ in range(an.UNARMED_BLOCK_LIMIT):
+            self.hook_output()
+        self.assertNotIn('decision', self.hook_output(), '超过上限后必须放行')
 
-    def test_rearming_rearms_the_nag(self) -> None:
-        """重新挂上后状态清零，下次掉线要能再强制一次——否则只保护第一次。"""
+    def test_arming_resets_the_counter(self) -> None:
+        """挂上后计数清零，下次掉线要能重新拦满 N 次。"""
         self.register()
         self.go_offline()
         self.hook_output()
-        an.merge_info(self.ctx().info_path, {'poller_pid': os.getpid()})   # 挂回来
-        self.hook_output()                                                 # 触发清零
+        an.merge_info(self.ctx().info_path, {'poller_pid': os.getpid()})
+        self.hook_output()                                    # armed ⇒ 清零
         self.go_offline()
         self.assertEqual(self.hook_output().get('decision'), 'block')
 
@@ -597,9 +600,21 @@ class TestUnarmedPollerIsBlocking(Base):
             an.cmd_drain(argparse.Namespace(hook=True, no_block=True))
         self.assertNotIn('decision', json.loads(buffer.getvalue() or '{}'))
 
-    def test_nag_field_is_persisted(self) -> None:
-        """不在 INFO_FIELD_ORDER 里的字段写不出去——那会让"只强制一次"退化成每回合强制。"""
-        self.assertIn('unarmed_nagged_at', an.INFO_FIELD_ORDER)
+    def test_message_does_not_overstate_the_loss(self) -> None:
+        """夸大损失会损耗可信度：干活期间没有轮询器其实照常收信。
+
+        说"空闲时收不到信"是对的，但先前那句"空闲时收不到信 + 立刻判死"读起来像
+        此刻就在丢东西——而实际此刻毫无损失。措辞要把"现在没事"和"进入空闲就有事"分开。
+        """
+        self.register()
+        self.go_offline()
+        text = self.hook_output()['hookSpecificOutput']['additionalContext']
+        self.assertIn('现在还没事', text)
+        self.assertIn('转入空闲', text)
+        self.assertIn('结束本回合之前', text)
+
+    def test_counter_field_is_persisted(self) -> None:
+        self.assertIn('unarmed_blocks', an.INFO_FIELD_ORDER)
 
 
 class TestUnackedLetterSafetyNet(Base):
