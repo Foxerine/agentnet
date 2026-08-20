@@ -226,8 +226,13 @@ class TestStatus(Base):
 
         实测来源：ccrg 角色拉起即崩，SessionStart 已写好注册，花名册于是显示 active
         （17948ac6 报告）。等 5 分钟心跳超时太慢，pid 就在手边，直接查。
+
+        **心跳取宽限之外的时刻**：崩掉的壳其 last_active 停在注册那一刻不再更新，
+        所以现实中它必然会走出宽限。此处曾用 `now()`，那等于断言"pid 可以推翻
+        刚刚发生的心跳"——那个契约已被证伪（实测让活着的实例收不到信）。
         """
-        meta = {'status': an.STATUS_ACTIVE, 'last_active': an.now(), 'pid': 999999999}
+        stale = an.now() - timedelta(seconds=an.PROCESS_EVIDENCE_GRACE_S + 5)
+        meta = {'status': an.STATUS_ACTIVE, 'last_active': stale, 'pid': 999999999}
         self.assertEqual(an.effective_status(meta), an.STATUS_ACTIVE,
                          '默认不查 pid，保持函数纯粹')
         self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_PRESUMED_DEAD,
@@ -945,8 +950,12 @@ class TestLivenessFailsOpen(Base):
         self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_ACTIVE)
 
     def test_both_dead_downgrades(self) -> None:
-        """两个都死才允许判死——保留原本要抓的"注册成功但主体崩了"那种壳。"""
-        meta = self.fresh(pid=999999, poller_pid=999998)
+        """两个都死才允许判死——保留原本要抓的"注册成功但主体崩了"那种壳。
+
+        心跳取宽限之外：宽限内的新鲜心跳本身就是活着的证明，进程证据不该推翻它。
+        """
+        stale = an.now() - timedelta(seconds=an.PROCESS_EVIDENCE_GRACE_S + 5)
+        meta = self.fresh(pid=999999, poller_pid=999998, last_active=stale)
         self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_PRESUMED_DEAD)
 
     def test_no_pid_recorded_is_not_evidence_of_death(self) -> None:
@@ -958,6 +967,28 @@ class TestLivenessFailsOpen(Base):
         old = an.now() - timedelta(seconds=an.dead_after_s() + 60)
         meta = {'status': an.STATUS_ACTIVE, 'last_active': old, 'poller_pid': os.getpid()}
         self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_PRESUMED_DEAD)
+
+    def test_fresh_heartbeat_beats_dead_pids(self) -> None:
+        """**新鲜心跳是最强证据**：只有活着的进程写得动它。
+
+        第一版漏了这条，于是仍有实例带着"已静默 0 分钟"被判死——它正在干活、
+        每条命令都刷心跳，只是没挂轮询器且 pid 恰好陈旧。让两个不可靠的字段推翻
+        一个刚刚发生的事实，方向就是反的。
+        """
+        meta = {'status': an.STATUS_ACTIVE, 'last_active': an.now(),
+                'pid': 999999, 'poller_pid': 999998}
+        self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_ACTIVE)
+
+    def test_crashed_shell_still_caught_after_grace(self) -> None:
+        """宽限不能削弱本意：注册成功后崩掉的壳，心跳停在注册那一刻，出了宽限照样判死。"""
+        stale = an.now() - timedelta(seconds=an.PROCESS_EVIDENCE_GRACE_S + 5)
+        meta = {'status': an.STATUS_ACTIVE, 'last_active': stale,
+                'pid': 999999, 'poller_pid': 999998}
+        self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_PRESUMED_DEAD)
+
+    def test_grace_is_far_shorter_than_death_threshold(self) -> None:
+        """宽限只是"别推翻刚发生的事"，不是第二个判死阈值。"""
+        self.assertLess(an.PROCESS_EVIDENCE_GRACE_S, an.dead_after_s())
 
     def test_deliverable_to_a_live_agent_with_stale_pid(self) -> None:
         """端到端：这正是被拒收的那条路径。"""

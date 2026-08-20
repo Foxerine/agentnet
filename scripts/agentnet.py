@@ -808,6 +808,19 @@ def merge_info(
     return meta
 
 
+PROCESS_EVIDENCE_GRACE_S = 60
+"""心跳新到这个程度时，**不再查进程证据**——它已经证明自己活着了。
+
+只有活着的进程写得动 ``last_active``。让可能陈旧的 ``pid`` 去推翻一个一分钟内发生的
+事实，方向是反的（实测：有实例带着"已静默 0 分钟"被判死、于是收不到信）。
+
+取 60 秒而不是更长：``verify_pid`` 本来要抓的是"SessionStart 注册成功、主体随后崩溃"
+的空壳，而那种壳的心跳**停在注册那一刻**，一分钟后就出了宽限、照样被 pid 判死——
+比等满 5 分钟的心跳超时仍然快得多。宽限越长，抓壳越慢；越短，越容易误伤正在
+干活但没挂轮询器的实例。一分钟是这两者的分界。
+"""
+
+
 def any_process_alive(meta: dict[str, Any]) -> bool:
     """这份登记背后**还有没有活着的进程**——``poller_pid`` 与 ``pid`` 取并集。
 
@@ -851,19 +864,35 @@ def effective_status(meta: dict[str, Any], at: datetime | None = None,
         **任一存活即视为活着**；两个都死才允许降级。
         方向上刻意 **fail-open**——误判"死了"会让人丢上下文、白开实例，**不可逆**；
         误判"活着"最多多等一轮，**可逆**。代价不对称时，判据就该偏向可逆的那侧。
+
+        **而在两个 pid 之上还有一条更强的证据：新鲜的心跳。**（同日第二处修正）
+        只有活着的进程写得动 ``last_active``——所以心跳在 :data:`PROCESS_EVIDENCE_GRACE_S`
+        以内时**直接判活、根本不查 pid**。第一版漏了这条，于是仍有实例带着"已静默 0 分钟"
+        被判死：它正在干活、每条命令都在刷心跳，只是**没挂轮询器**且 ``pid`` 恰好陈旧。
+        让两个不可靠的字段去推翻一个刚刚发生的事实，方向就是反的。
+
+        这条不削弱 ``verify_pid`` 的本意（抓"注册成功后主体崩了"的壳）：那种壳的
+        ``last_active`` **停在注册那一刻不再更新**，一分钟后就出了宽限，照样被 pid 判死——
+        比等满 5 分钟心跳超时仍快得多。
     """
     stored = str(meta.get('status', STATUS_ACTIVE))
     if stored in TERMINAL_STATUSES:
         return stored
-    if verify_pid and not any_process_alive(meta):
-        return STATUS_PRESUMED_DEAD
     last = meta.get('last_active')
     if not isinstance(last, datetime):
         return STATUS_PRESUMED_DEAD
     reference = at or now()
     if last.tzinfo is None:
         last = last.replace(tzinfo=reference.tzinfo)
-    if (reference - last) > timedelta(seconds=dead_after_s()):
+    silent = reference - last
+    # 心跳刚刚刷新过 ⇒ **只有活着的进程写得动它** ⇒ 直接判活，不必也不该再查 pid。
+    # 顺序很关键：先看这条，再看进程证据。反过来就会让两个不可靠的 pid 字段
+    # 推翻一个刚刚发生的事实（实测：带着"已静默 0 分钟"被判死）。
+    if silent <= timedelta(seconds=PROCESS_EVIDENCE_GRACE_S):
+        return STATUS_ACTIVE
+    if verify_pid and not any_process_alive(meta):
+        return STATUS_PRESUMED_DEAD
+    if silent > timedelta(seconds=dead_after_s()):
         return STATUS_PRESUMED_DEAD
     return STATUS_ACTIVE
 
