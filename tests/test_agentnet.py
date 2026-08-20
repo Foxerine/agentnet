@@ -541,8 +541,29 @@ class TestRearmNotice(Base):
         self.assertIn('即使 `agentnet whoami` 说「运行中」'.replace('agentnet ', ''),
                       an.REARM_NOTICE)
         self.assertIn('幽灵', an.REARM_NOTICE)
-        self.assertIn('停止重挂', an.REARM_NOTICE)
+        self.assertIn(an.LOOP_EXCEPTION_LINE, an.REARM_NOTICE, '死循环例外缺失')
         self.assertNotIn('只有它说未运行才重挂', an.REARM_NOTICE)
+
+    def test_every_rearm_prompt_carries_the_loop_exception(self) -> None:
+        """**给重挂指引的每一处都必须带死循环例外**——只补一处等于没补。
+
+        2026-08-20 实测连踩两次：先是把「killed ⇒ 照样重挂」只加进 whoami 与 Stop 钩子、
+        漏了 `REARM_NOTICE`（留下两条互斥指引）；修完那处后又把死循环例外只加进
+        `REARM_NOTICE`、漏了另外两处 —— **于是 Stop 钩子拦住了正在正确执行例外的人**。
+
+        判据不是"我改了几处"，而是**"给这条指引的地方一共有几处"**。
+        这条用例把那个清单钉死，新增指引点时会红。
+        """
+        self.assertIn('死循环', an.LOOP_EXCEPTION_LINE)
+        self.assertIn('不会失联', an.LOOP_EXCEPTION_LINE, '没说清停挂的代价')
+        # **断言三处都引用了那个单一来源**，而不是各自抄一份措辞——
+        # 抄一份就会各自漂移，而漂移正是这条用例要防的。
+        self.assertIn(an.LOOP_EXCEPTION_LINE, an.REARM_NOTICE, 'REARM_NOTICE 未引用')
+        self.assertIn(an.LOOP_EXCEPTION_LINE, an.whoami_unarmed_text(), 'whoami 未引用')
+        source = Path(an.__file__).read_text(encoding='utf-8')
+        drain_block = source.split('看不到运行中的轮询器')[1].split('挂完用')[0]
+        self.assertIn('LOOP_EXCEPTION_LINE', drain_block,
+                      'drain 的未挂载提示没有引用 LOOP_EXCEPTION_LINE，多半又抄了一份')
 
     def test_states_the_fallback(self) -> None:
         """没有轮询器**仍然收得到信**（Stop 钩子每回合 drain）——

@@ -808,6 +808,29 @@ def merge_info(
     return meta
 
 
+LOOP_EXCEPTION_LINE = (
+    "若你已陷入「挂上数秒即被杀、输出为空、每回合必发」的**死循环**，**别再挂**——"
+    "继续挂只会烧回合，而信件照常每回合被 Stop 钩子 drain 到，**不会失联**。"
+)
+"""死循环例外的**单一措辞来源**。
+
+给"要不要重挂"下指引的地方有**三处**（:data:`REARM_NOTICE` / drain 的未挂载提示 /
+``whoami`` 的未运行行）。2026-08-20 连踩两次"只改一处"：
+先把「killed ⇒ 照样重挂」漏在 ``REARM_NOTICE`` 之外（留下两条互斥指引），
+修完又把死循环例外只加进 ``REARM_NOTICE`` ——
+**于是 Stop 钩子拦住了正在正确执行例外的人**。
+
+⇒ 措辞收进这一个常量，三处都引它；``TestRearmNotice`` 断言三处都含它。
+"""
+
+
+def whoami_unarmed_text() -> str:
+    """``whoami`` 里"轮询器未运行"那几行。**独立成函数是为了可测**——
+    测试读到的必须是生产真正打印的那份，不是副本。"""
+    return ("poller     : **未运行** —— 空闲时收不到信，须后台跑 `agentnet poll`\n"
+            f"             ⚠ 但{LOOP_EXCEPTION_LINE}")
+
+
 def process_evidence_of_life(meta: dict[str, Any]) -> bool:
     """有没有一个**还活着的进程**可以证明这份登记的主体仍在。
 
@@ -1125,7 +1148,7 @@ def cmd_whoami(args: argparse.Namespace) -> None:
         print("               agentnet 看不到 harness 的追踪状态，只有你看得到；"
               "未被追踪的轮询器退出时唤不醒你。")
     else:
-        print("poller     : **未运行** —— 空闲时收不到信，须后台跑 `agentnet poll`")
+        print(whoami_unarmed_text())
 
 
 def _args_who(p: argparse.ArgumentParser) -> None:
@@ -1521,11 +1544,9 @@ REARM_NOTICE = (
     "    **收到「killed」通知就重挂，即使 `whoami` 说「运行中」**：进程可能还活着、\n"
     "    但已脱离 harness 追踪（幽灵），它退出时唤不醒任何人，而这一侧看不出区别。\n"
     "    重挂会让旧的干净退位（实测无残留），代价只是一次退位。\n"
-    "    ⚠ **例外——若这变成了每回合必发的死循环**（挂上数秒即被杀、输出为空、连续多次）：\n"
-    "    **停止重挂**。那多半是会话贴着上下文上限、harness 每回合都走清理路径；\n"
-    "    继续挂只会「被杀→唤醒→重挂→再被杀」地烧回合，而**你并不会因此失联**——\n"
-    "    信件照常每回合被本钩子 drain 到，心跳也被这个循环本身维持着。\n"
-    "    等会话压力缓解（compact 之后 / 新会话）再挂回来。"
+    "    ⚠ **例外**：" + LOOP_EXCEPTION_LINE + "\n"
+    "    那多半是会话贴着上下文上限、harness 每回合都走清理路径；"
+    "等会话压力缓解（compact 之后 / 新会话）再挂回来。"
 )
 """收信后提示重挂轮询器。
 
@@ -2273,6 +2294,11 @@ def cmd_drain(args: argparse.Namespace) -> None:
                       f"    **但你一旦转入空闲就叫不醒了**：{dead_after_s() // 60} 分钟后判死、"
                       "别人投信给你会被当场拒绝。\n"
                       "    所以要在**结束本回合之前**挂上——而不是等想起来。\n"
+                      f"    ⚠ **另一个例外**：{LOOP_EXCEPTION_LINE}\n"
+                      "    那多半是会话贴着上下文上限、harness 每回合都走清理路径。"
+                      "等 compact 之后或新会话再挂回来；\n"
+                      "    **本提示会继续出现，忽略它即可。**\n"
+                      "    以上两种例外都不适用时，往下做：\n"
                       "    立刻用**你的 harness 的后台机制**运行 `agentnet poll`"
                       "（Claude Code 是 Bash 工具的 run_in_background）——\n"
                       "    自己用 `&` / `nohup` 挂**不算**：那种进程 harness 追踪不到，"
