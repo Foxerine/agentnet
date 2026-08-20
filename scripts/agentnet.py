@@ -1115,7 +1115,15 @@ def cmd_whoami(args: argparse.Namespace) -> None:
     print(f"topics     : {meta.get('topics', [])}")
     poller = meta.get('poller_pid')
     if isinstance(poller, int) and pid_alive(poller):
+        # 只说得出"进程活着"。**说不出"它还被你的 harness 追踪着"**——
+        # 而唤醒机制依赖的正是后者（见 cmd_poll 的说明）。这两件事会分家：
+        # 2026-08-20 实测 harness 报「后台任务已停止」，而 sh.exe → python 两个进程
+        # 都还活着。那种状态下心跳照刷、这里照样显示"运行中"，可它退出时唤不醒任何人。
         print(f"poller     : 运行中 (pid {poller})")
+        print("             ↑ 只证明**进程活着**。若你的 harness 通知过"
+              "「这个后台任务被停止/杀死」，**照样重挂**——")
+        print("               agentnet 看不到 harness 的追踪状态，只有你看得到；"
+              "未被追踪的轮询器退出时唤不醒你。")
     else:
         print("poller     : **未运行** —— 空闲时收不到信，须后台跑 `agentnet poll`")
 
@@ -2186,7 +2194,11 @@ def cmd_drain(args: argparse.Namespace) -> None:
     if not armed:
         chunks.append("[!] 我这一侧看不到运行中的轮询器。\n"
                       "    **先复核，再动手**：`agentnet whoami` —— 若它显示「poller: 运行中」，"
-                      "说明已经挂着了，**别重挂**（重挂会顶掉正在跑的那个）。\n"
+                      "通常说明已经挂着了，**别重挂**（重挂会顶掉正在跑的那个）。\n"
+                      "    **唯一的例外**：若你的 harness 通知过「那个后台任务被停止/杀死」，"
+                      "那就**照样重挂**——\n"
+                      "    进程可能还活着（于是这里显示「运行中」），但它已经不被追踪，"
+                      "退出时唤不醒你。agentnet 看不到追踪状态，只有你看得到。\n"
                       "    确认确实没挂，再往下做：\n"
                       "    现在还没事——你在干活时信件照常送达（本钩子每回合 drain 一次），"
                       "心跳也随每次 agentnet 调用刷新。\n"
