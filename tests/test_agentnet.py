@@ -1916,6 +1916,30 @@ class TestPartialDeliveryIsNotSilent(Base):
                          '死掉的收件人掐断了整批，后面的人一封都没收到')
         self.assertEqual(len(an.inbox_letters(self.ctx(), dead)), 0)
 
+    def test_unresolvable_recipient_does_not_block_the_ones_after_it(self) -> None:
+        """**第二个中止点**：解析失败（归档 / 找不到 / 前缀不唯一）同样不能掐断整批。
+
+        第一次只修了"不可投递"那一处，于是一个**已归档**的收件人照旧让排在它后面的
+        全部没投出去——同一个模式的兄弟实例，漏修一个等于没修
+        （见 feedback_enumerate_root_cause_instances_before_fixing）。
+        """
+        self.register()
+        alive = self.peer('0007', alive=True)
+        with self.assertRaises(SystemExit) as caught:
+            an.cmd_send(argparse.Namespace(
+                to=['no-such-agent-xyz', alive], subject='s', body='b', body_file=None,
+                kind='letter', thread=None, force=False))
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(len(an.inbox_letters(self.ctx(), alive)), 1,
+                         '解析不出来的 token 掐断了整批')
+
+    def test_single_target_commands_still_die_on_bad_token(self) -> None:
+        """反向守卫：kill / reset / archive 只作用于一个 agent，**必须**当场失败，
+        不能因为群发放宽了就跟着含糊——否则会作用到错的对象上。"""
+        self.register()
+        with self.assertRaises(SystemExit):
+            an.resolve_single_target(self.ctx(), 'no-such-agent-xyz')
+
     def test_all_alive_exits_zero(self) -> None:
         """全都投出去时不能反过来误报失败。"""
         self.register()

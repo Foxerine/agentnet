@@ -1561,14 +1561,20 @@ def letter_filename(sender_id: str) -> str:
     return f"{stamp}-{sender_id[:8]}-{uuid.uuid4().hex[:10]}.md"
 
 
-def resolve_target(ws: Workspace, token: str) -> list[str]:
-    """把 ``<id前缀>`` 或 ``@<主题>`` 解析成一组收件人 id。"""
+def resolve_target(ws: Workspace, token: str) -> tuple[list[str], str | None]:
+    """把 ``<id前缀>`` 或 ``@<主题>`` 解析成一组收件人 id。
+
+    :return: ``(收件人, 失败理由)``。解析不出来时返回 ``([], 理由)`` 而**不是**当场 ``_die``——
+        群发时一个 token 解析失败**不能掐断整批**（实测：一个已归档的收件人让
+        其余 6 个全部没投出去，而回执对他们只字未提）。
+        单目标命令拿到理由后照旧 ``_die``。
+    """
     if token.startswith('@'):
         topic = token[1:]
         found = [aid for aid, meta, _ in iter_agents(ws) if topic in (meta.get('topics') or [])]
         if not found:
-            _die(f"没有 agent 认领主题 `{topic}`。用 `agentnet who` 看看谁在。")
-        return found
+            return [], f"没有 agent 认领主题 `{topic}`。用 `agentnet who` 看看谁在。"
+        return found, None
     matches = [aid for aid, _, _ in iter_agents(ws) if aid == token or aid.startswith(token)]
     if not matches:
         # 归档者要给出**明确**的拒绝理由，而不是笼统的"找不到"——
@@ -1577,12 +1583,26 @@ def resolve_target(ws: Workspace, token: str) -> list[str]:
             archived = [d.name for d in ws.archive_dir.iterdir()
                         if d.is_dir() and (d.name == token or d.name.startswith(token))]
             if archived:
-                _die(f"`{archived[0][:8]}` 已归档，不能投信。"
-                     f"若确需送达，先 `agentnet restore {archived[0][:8]}` 让它回到可收信状态。")
-        _die(f"本 workspace 找不到 agent `{token}`。跨 workspace 不能投信（按 cwd 隔离）。")
+                return [], (f"`{archived[0][:8]}` 已归档，不能投信。"
+                            f"若确需送达，先 `agentnet restore {archived[0][:8]}` "
+                            f"让它回到可收信状态。")
+        return [], f"本 workspace 找不到 agent `{token}`。跨 workspace 不能投信（按 cwd 隔离）。"
     if len(matches) > 1:
-        _die(f"`{token}` 前缀不唯一，匹配到 {len(matches)} 个: {', '.join(m[:12] for m in matches)}")
-    return matches
+        return [], (f"`{token}` 前缀不唯一，匹配到 {len(matches)} 个: "
+                    f"{', '.join(m[:12] for m in matches)}")
+    return matches, None
+
+
+def resolve_single_target(ws: Workspace, token: str) -> str:
+    """单目标命令（kill / reset / archive）的解析：解析不出来就**当场失败**。
+
+    与群发相反——这些命令只作用于一个 agent，没有"部分成功"可言，
+    含糊地继续下去只会作用到错的对象上。
+    """
+    matched, why = resolve_target(ws, token)
+    if why is not None:
+        _die(why)
+    return matched[0]
 
 
 def undeliverable_reason(ws: Workspace, agent_id: str, force: bool) -> str | None:
@@ -1683,8 +1703,15 @@ def cmd_send(args: argparse.Namespace) -> None:
     # 直接点名的则没有。同一个人被多个 token 命中时只投一封（首次匹配为准）。
     recipients: list[str] = []
     topic_of: dict[str, str | None] = {}
+    refused: list[tuple[str, str]] = []
     for token in args.to:
-        matched = resolve_target(ctx, token)
+        matched, why = resolve_target(ctx, token)
+        if why is not None:
+            # 解析失败同样**不掐断整批**——这是与"不可投递"并列的第二个中止点，
+            # 第一次只修了后者，于是一个已归档的收件人照旧让其余全部没投出去。
+            refused.append((token, why))
+            print(f"[跳过] → {token}  {why}")
+            continue
         topic = token[1:] if token.startswith('@') else None
         for rid in matched:
             if rid in topic_of:
@@ -1692,7 +1719,6 @@ def cmd_send(args: argparse.Namespace) -> None:
             topic_of[rid] = topic
             recipients.append(rid)
     delivered: list[str] = []
-    refused: list[tuple[str, str]] = []
     for rid in recipients:
         if rid == ctx.agent_id:
             continue  # 群发时不投给自己
@@ -3101,7 +3127,7 @@ def _args_kill(p: argparse.ArgumentParser) -> None:
 )
 def cmd_kill(args: argparse.Namespace) -> None:
     ctx = Ctx()
-    target = resolve_target(ctx, args.target)[0]
+    target = resolve_single_target(ctx, args.target)
     if target == ctx.agent_id:
         _die("不能 kill 自己。要退出用 `agentnet exit`（会归档你的往来）。")
     meta, _ = read_info(ctx.info_path_of(target))
@@ -3129,7 +3155,7 @@ def _args_reset(p: argparse.ArgumentParser) -> None:
 )
 def cmd_reset(args: argparse.Namespace) -> None:
     ctx = Ctx()
-    target = resolve_target(ctx, args.target)[0]
+    target = resolve_single_target(ctx, args.target)
     if target == ctx.agent_id:
         _die("不能 reset 自己。")
     meta, body = read_info(ctx.info_path_of(target))
@@ -3893,7 +3919,7 @@ def _args_archive(p: argparse.ArgumentParser) -> None:
 )
 def cmd_archive(args: argparse.Namespace) -> None:
     ctx = Ctx()
-    target = resolve_target(ctx, args.target)[0]
+    target = resolve_single_target(ctx, args.target)
     if target == ctx.agent_id:
         _die('不能归档自己。要退出用 `agentnet exit`。')
     meta, _ = read_info(ctx.info_path_of(target))
