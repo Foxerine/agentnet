@@ -976,7 +976,8 @@ def command(name: str, summary: str, usage: str, detail: str = '',
 
 def _args_register(p: argparse.ArgumentParser) -> None:
     p.add_argument('--topics', help='逗号分隔的负责主题（可后续用 charter 更新）')
-    p.add_argument('--name', help='显示名（默认取 harness 提供的会话名）')
+    p.add_argument('--name', help='显示名——**没有默认值**，不给就在花名册里显示为 `-`。'
+                                  '幂等，随时可改')
 
 
 @command(
@@ -1025,6 +1026,16 @@ def cmd_register(args: argparse.Namespace) -> None:
     print(f"  workspace : {ctx.slug}")
     print(f"  cwd       : {ctx.cwd}")
     print(f"  info      : {ctx.info_path}")
+    # **没名字要说出来。** 此前既没有默认值、也没有任何提示，于是人类直接启动的实例
+    # 从注册那一刻起就在花名册里显示为 `-`，而且能一直无名地跑完整个会话
+    # （`b8839ea3` 实测：跑了几十轮、发了十几封信才被用户问"这个实例是谁"才发现）。
+    # 有名字的清一色是 spawn 出来的——因为拉起方替它写了。
+    # 越是长期存活、承担主线工作的实例，越是没有名字，而它们恰恰最该被找到。
+    if not (read_info(ctx.info_path)[0].get('display_name') or ''):
+        print()
+        print("  ⚠ 你还没有显示名，在 `agentnet who` 里只是一串 hash。")
+        print("    起一个：`agentnet register --name <短名>`（幂等，随时可改）。")
+        print("    名字给人看、topics 给机器路由——少一半，另一半的价值也打折。")
 
 
 def _split_topics(raw: str) -> list[str]:
@@ -2063,6 +2074,18 @@ def cmd_poll(args: argparse.Namespace) -> None:
         raise
 
 
+POLLER_STARTUP_GRACE_S = 1.5
+"""判"轮询器未运行"之前的复查等待。
+
+``agentnet poll`` 先起进程、**再**把 ``poller_pid`` 写进登记，实测这段窗口约 **0.16 秒**。
+而 agent 常常挂完就结束回合，Stop 钩子恰好落进窗口里——于是出现"钩子说未运行、
+紧接着 whoami 说运行中"（``b8839ea3`` 报告）。
+
+报告者最初诊断为"两份判活实现漂移"，随后**主动收回**并给出第二种解释（启动竞态）。
+查证结果：两处判据**逐字相同**（``pid_alive(poller_pid)``、同一份 ``info.md``），
+所以不存在漂移，是它的第二种解释成立。10 倍余量足够，代价是极少数情况下多等 1.5 秒。
+"""
+
 UNARMED_BLOCK_LIMIT = 3
 """未挂载轮询器时，Stop 钩子最多连续拦几次。
 
@@ -2105,6 +2128,19 @@ def cmd_drain(args: argparse.Namespace) -> None:
     meta, _ = read_info(ctx.info_path)
     poller = meta.get('poller_pid')
     armed = isinstance(poller, int) and pid_alive(poller)
+    if not armed:
+        # **启动竞态复查**：`agentnet poll` 是先起进程、再把 poller_pid 写进登记，
+        # 实测这段窗口约 0.16 秒（Python 解释器启动 + 读配置）。而 agent 常常是
+        # "挂完立刻结束回合"，Stop 钩子恰好落进这个窗口——于是钩子说未运行、
+        # 紧接着 `whoami` 说运行中（`b8839ea3` 报告）。
+        #
+        # 两处判据其实**完全相同**（都是 pid_alive(poller_pid) 读同一份 info.md），
+        # 所以那不是"两份真相源漂移"，而是**先后两次观测跨越了一次启动**。
+        # 复查一次即可消除；0.16 秒的窗口给 10 倍余量。
+        time.sleep(POLLER_STARTUP_GRACE_S)
+        meta, _ = read_info(ctx.info_path)
+        poller = meta.get('poller_pid')
+        armed = isinstance(poller, int) and pid_alive(poller)
 
     # 掉线是**对整个网络的伤害**（别人投信给我会被当场拒绝），所以每个掉线周期
     # 未挂载就拦住回合，最多 UNARMED_BLOCK_LIMIT 次；挂上后计数清零。
@@ -2131,7 +2167,10 @@ def cmd_drain(args: argparse.Namespace) -> None:
             "让你自己对账；只提醒一次。）")
         merge_info(ctx.info_path, {'unacked_letters': None}, create=False)
     if not armed:
-        chunks.append("[!] 你的 agentnet 轮询器**未运行**。\n"
+        chunks.append("[!] 我这一侧看不到运行中的轮询器。\n"
+                      "    **先复核，再动手**：`agentnet whoami` —— 若它显示「poller: 运行中」，"
+                      "说明已经挂着了，**别重挂**（重挂会顶掉正在跑的那个）。\n"
+                      "    确认确实没挂，再往下做：\n"
                       "    现在还没事——你在干活时信件照常送达（本钩子每回合 drain 一次），"
                       "心跳也随每次 agentnet 调用刷新。\n"
                       f"    **但你一旦转入空闲就叫不醒了**：{dead_after_s() // 60} 分钟后判死、"
@@ -3260,8 +3299,12 @@ def cmd_hook(args: argparse.Namespace) -> None:
         # 没任务的（人类直接启动的）才需要被引导着接入网络。
         lines += [
             '',
+            '**给自己起个名**：`agentnet register --name <短名>`——没有它你在花名册里只是'
+            '一串 hash，别人找不到你（这一条最容易被忽略：spawn 出来的实例由拉起方代取了名，'
+            '而人类直接启动的**没人替你取**）。',
             '用 `agentnet charter --topics "..."` 声明你负责什么；',
             '用 `agentnet log "..."` 记录你在做什么（方案转向加 `--pivot`），让别人看懂你的进展。',
+            '名字给人看、topics 给机器路由——**两半都要有**，缺一半另一半的价值也打折。',
             '',
             '**并在你的首次回复里用一句话告诉用户**：可以运行 `agentnet dashboard --open` '
             '打开管理后台，查看全网 agent、通信与锁的现状。',

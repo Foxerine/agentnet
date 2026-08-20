@@ -1022,6 +1022,103 @@ class TestDeadChildNoticeIsHedged(Base):
         self.assertNotIn('不是退步', self.text())
 
 
+class TestNamelessInstance(Base):
+    """人类直接启动的实例**长期无名**——文档承诺的默认值根本不存在，且静默。
+
+    实测（`b8839ea3`）：它跑了几十轮、发了十几封信，直到用户问"这个实例是谁"才发现
+    自己在花名册里是 `-`。有名字的清一色是 spawn 出来的——因为拉起方替它写了。
+    **越是长期存活、承担主线工作的实例，越是没有名字**，而它们恰恰最该被找到。
+    """
+
+    def register_output(self, name: str | None = None) -> str:
+        import argparse, io, contextlib
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            an.cmd_register(argparse.Namespace(topics=None, name=name))
+        return buffer.getvalue()
+
+    def test_nameless_registration_warns(self) -> None:
+        """默认值取不到时必须**响亮**——不提示就等于把失败伪装成正常。"""
+        text = self.register_output()
+        self.assertIn('还没有显示名', text)
+        self.assertIn('--name', text)
+
+    def test_named_registration_is_quiet(self) -> None:
+        """有名字就别唠叨——告警只在真缺的时候响才有意义。"""
+        self.assertNotIn('还没有显示名', self.register_output('my-name'))
+
+    def test_help_no_longer_promises_a_default(self) -> None:
+        """帮助文本曾写"默认取 harness 提供的会话名"——**那个默认值不存在**。
+
+        承诺一个不存在的默认值，比不承诺更糟：读者据此以为不用管。
+        """
+        import argparse
+        parser = argparse.ArgumentParser()
+        an._args_register(parser)
+        help_text = parser.format_help()
+        self.assertNotIn('默认取 harness', help_text)
+        self.assertIn('没有默认值', help_text)
+
+
+class TestPollerStartupRace(Base):
+    """钩子说"未运行"、紧接着 whoami 说"运行中"——不是判据漂移，是启动竞态。
+
+    报告者先诊断为"两份判活实现漂移"，随后**主动收回**。查证：两处判据逐字相同
+    （`pid_alive(poller_pid)`、同一份 info.md）——它的第二种解释（启动竞态）才成立。
+    实测 `poll` 从 spawn 到写入 `poller_pid` 约 0.16 秒。
+    """
+
+    def test_grace_covers_the_measured_window(self) -> None:
+        """0.16 秒的实测窗口，1.5 秒给了 10 倍余量。"""
+        self.assertGreaterEqual(an.POLLER_STARTUP_GRACE_S, 1.0)
+
+    def test_recheck_sees_a_late_write(self) -> None:
+        """复查必须**重新读盘**，不能沿用第一次读到的 meta。"""
+        import argparse, io, contextlib, json, threading
+        self.register()
+        ctx = self.ctx()
+        an.merge_info(ctx.info_path, {'poller_pid': None})
+
+        def arm_late() -> None:
+            time.sleep(0.3)                       # 在宽限之内、第一次读之后
+            an.merge_info(ctx.info_path, {'poller_pid': os.getpid()})
+
+        writer = threading.Thread(target=arm_late)
+        writer.start()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            an.cmd_drain(argparse.Namespace(hook=True, no_block=False))
+        writer.join()
+        payload = json.loads(buffer.getvalue() or '{}')
+        self.assertNotIn('decision', payload, '复查应看到迟到的写入，不该再拦截')
+
+
+class TestUnarmedNoticeOrdering(Base):
+    """正确做法必须排在错误做法**之前**——多数读者按顺序执行。
+
+    报告者指出：通知开头是命令式「立刻运行 agentnet poll」，末尾才是「先复核」。
+    而它还带三次强制拦截，压力方向全在"快去挂"。**读到开头就照做的实例会踩进去。**
+    """
+
+    def notice(self) -> str:
+        import argparse, io, contextlib, json
+        self.register()
+        an.merge_info(self.ctx().info_path, {'poller_pid': 999999})
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            an.cmd_drain(argparse.Namespace(hook=True, no_block=False))
+        return json.loads(buffer.getvalue())['hookSpecificOutput']['additionalContext']
+
+    def test_verify_comes_before_the_imperative(self) -> None:
+        text = self.notice()
+        verify_at = text.index('whoami')
+        arm_at = text.index('run_in_background')
+        self.assertLess(verify_at, arm_at, '「先复核」必须排在「去挂上」之前')
+
+    def test_warns_against_double_arming(self) -> None:
+        self.assertIn('别重挂', self.notice())
+
+
 class TestProvenance(Base):
     """被拉起的实例必须知道自己是被谁起来的，否则它会推错整条授权链。
 
