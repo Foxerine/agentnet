@@ -3960,6 +3960,22 @@ def process_console_queue(ws: Workspace, actor: str) -> int:
         release_lock(ws, CONSOLE_LOCK, actor)
 
 
+def strip_archive_stamp(name: str) -> str:
+    """``<uuid>-20260819T171531`` → ``<uuid>``；裸 uuid 原样返回。"""
+    return name.split('-20')[0] if name.count('-') > 4 else name
+
+
+def archived_agent_ids(ws: Workspace, prefix: str) -> list[str]:
+    """归档目录里所有**以 prefix 开头的 agent id**（去掉时间戳后缀、去重）。
+
+    同一个 agent 二次归档会落成 ``<id>-<时间戳>``，所以裸数目录名会把
+    "一个 agent 的 15 份历史副本"误当成"15 个不同的 agent"。
+    """
+    ids = {strip_archive_stamp(d.name) for d in ws.archive_dir.iterdir()
+           if d.is_dir() and d.name.startswith(prefix)}
+    return sorted(ids)
+
+
 def _args_restore(p: argparse.ArgumentParser) -> None:
     p.add_argument('target', help='要恢复的 agent id（可用前缀）')
 
@@ -3972,22 +3988,6 @@ def _args_restore(p: argparse.ArgumentParser) -> None:
             '并提醒重新启动轮询器；否则恢复出来的是个收不到信的空壳。'),
     add_args=_args_restore,
 )
-def archived_agent_ids(ws: Workspace, prefix: str) -> list[str]:
-    """归档目录里所有**以 prefix 开头的 agent id**（去掉时间戳后缀、去重）。
-
-    同一个 agent 二次归档会落成 ``<id>-<时间戳>``，所以裸数目录名会把
-    "一个 agent 的 15 份历史副本"误当成"15 个不同的 agent"。
-    """
-    ids = {strip_archive_stamp(d.name) for d in ws.archive_dir.iterdir()
-           if d.is_dir() and d.name.startswith(prefix)}
-    return sorted(ids)
-
-
-def strip_archive_stamp(name: str) -> str:
-    """``<uuid>-20260819T171531`` → ``<uuid>``；裸 uuid 原样返回。"""
-    return name.split('-20')[0] if name.count('-') > 4 else name
-
-
 def cmd_restore(args: argparse.Namespace) -> None:
     ctx = Ctx()
     if not ctx.archive_dir.is_dir():

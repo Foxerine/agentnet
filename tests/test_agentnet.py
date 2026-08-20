@@ -1853,6 +1853,30 @@ class TestMultiRecipientSend(Base):
                         an.guard_text(item, f"参数 --{name.replace('_', '-')}")
 
 
+class TestCommandRegistryWiring(Base):
+    """每条命令注册的处理函数，必须**真的是那条命令的处理函数**。
+
+    2026-08-20 实测：往 `@command(...)` 与 `def cmd_restore` **之间**插了两个模块级
+    helper，装饰器于是把 `archived_agent_ids` 注册成了 restore 的处理函数——
+    `agentnet restore` 一跑就 `TypeError`。171 个测试全绿，因为它们一律直接调
+    `an.cmd_xxx(...)`，**从不经过注册表**：装饰器接错了谁，没有任何用例看得见。
+    """
+
+    def test_every_handler_is_a_cmd_function(self) -> None:
+        for cmd in an.COMMANDS:
+            self.assertEqual(
+                cmd.handler.__name__, f"cmd_{cmd.name}",
+                f"命令 `{cmd.name}` 注册的处理函数是 `{cmd.handler.__name__}`——"
+                f"多半是有东西插进了 @command(...) 与 def 之间")
+
+    def test_every_handler_takes_exactly_args(self) -> None:
+        """处理函数的签名必须是 `(args)`——注册表就是这么调它的。"""
+        import inspect
+        for cmd in an.COMMANDS:
+            params = list(inspect.signature(cmd.handler).parameters)
+            self.assertEqual(params, ['args'], f"`{cmd.name}` 的签名是 {params}")
+
+
 class TestRestoreAfterRepeatedArchiving(Base):
     """被归档过多次的 agent **必须还能恢复**，且旧副本里的信不能被埋掉。
 
