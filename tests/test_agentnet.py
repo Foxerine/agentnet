@@ -526,15 +526,23 @@ class TestRearmNotice(Base):
         self.assertIn('压缩', an.REARM_NOTICE, '要点明 compact 是成因之一')
         self.assertIn('重挂即可', an.REARM_NOTICE)
 
-    def test_tells_you_to_verify_before_rearming(self) -> None:
-        """收到 killed 通知**先查 whoami**——那个词也覆盖"正常退出"和"其实还活着"。
+    def test_tells_you_to_rearm_even_if_whoami_says_running(self) -> None:
+        """收到 killed 通知**就重挂，不看 `whoami`**——它看不到"还被追踪着"。
 
-        实测：连报两次 killed，而 `whoami` 显示轮询器正常运行（pid 369724）。
-        见状就重挂会顶掉正在跑的那个：新的接管、旧的写 `[退位]` 退出、又产生一条
-        新的 killed 通知——**盲目响应会制造它试图修复的那个混乱**。
+        **这条契约在 2026-08-20 被反转。** 旧版是"先查 `whoami`，只有它说未运行才挂"，
+        理由是盲目重挂会顶掉正在跑的那个。推翻它的是**幽灵**：harness 报 killed、
+        两个进程都还活着、`whoami` 照常显示"运行中"，而它**已经唤不醒任何人**
+        （`1d887a51` 独立复现）。`whoami` 只看得到"进程活着"，
+        ⇒ **用它做判据必然漏掉幽灵**。而"顶掉"的代价实测很小：旧的干净退位、无残留。
+
+        ⚠ 唯一例外（也断言）：**每回合必发的死循环**下应当停止重挂——
+        继续挂只会烧回合，而 Stop 钩子每回合 drain 保证不会失联。
         """
-        self.assertIn('whoami', an.REARM_NOTICE)
-        self.assertIn('只有它说未运行才重挂', an.REARM_NOTICE)
+        self.assertIn('即使 `agentnet whoami` 说「运行中」'.replace('agentnet ', ''),
+                      an.REARM_NOTICE)
+        self.assertIn('幽灵', an.REARM_NOTICE)
+        self.assertIn('停止重挂', an.REARM_NOTICE)
+        self.assertNotIn('只有它说未运行才重挂', an.REARM_NOTICE)
 
     def test_states_the_fallback(self) -> None:
         """没有轮询器**仍然收得到信**（Stop 钩子每回合 drain）——
