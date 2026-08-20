@@ -1054,7 +1054,8 @@ class TestLivenessFailsOpen(Base):
         ctx = self.ctx()
         an.merge_info(ctx.info_path, {'poller_pid': os.getpid(), 'pid': 999999,
                                       'last_active': an.now()})
-        an.check_deliverable(ctx, self.agent_id, force=False)   # 不抛即通过
+        self.assertIsNone(an.undeliverable_reason(ctx, self.agent_id, force=False),
+                          '给活人投信又被拒了')
 
 
 class TestDeadChildNoticeIsHedged(Base):
@@ -1876,6 +1877,64 @@ class TestCommandRegistryWiring(Base):
         for cmd in an.COMMANDS:
             params = list(inspect.signature(cmd.handler).parameters)
             self.assertEqual(params, ['args'], f"`{cmd.name}` 的签名是 {params}")
+
+
+class TestPartialDeliveryIsNotSilent(Base):
+    """群发遇到一个不可投的收件人，**不能掐断整批**，也不能读起来像全部成功。
+
+    2026-08-20 实测：7 个收件人里第 6 个已死，`check_deliverable` 的 `_die`
+    掐断了循环——**第 7 个完全可投，却从未被尝试**；而回执只列了成功的 5 个，
+    对后两个只字未提。发信方以为送到了，那两位从不知道有人找过自己。
+
+    这是「多收件人只投最后一个」修好之后**新引入**的同族缺陷：
+    修掉一个静默丢弃，换来另一个静默丢弃。
+    """
+
+    def peer(self, suffix: str, alive: bool) -> str:
+        """造一个同 workspace 的收件人。``alive=False`` 的心跳早已超时且无活进程。"""
+        agent_id = f"bbbbbbbb-0000-0000-0000-00000000{suffix}"
+        d = self.ctx().agents_dir / agent_id
+        (d / 'inbox').mkdir(parents=True, exist_ok=True)
+        last = an.now() if alive else an.now() - timedelta(seconds=an.dead_after_s() + 120)
+        meta: dict = {'id': agent_id, 'status': an.STATUS_ACTIVE, 'last_active': last}
+        if not alive:
+            meta.update({'pid': 999999, 'poller_pid': 999998})
+        an.write_doc(d / 'info.md', meta, '', an.INFO_FIELD_ORDER)
+        return agent_id
+
+    def test_dead_recipient_does_not_block_the_ones_after_it(self) -> None:
+        self.register()
+        dead = self.peer('0001', alive=False)
+        alive = self.peer('0002', alive=True)
+        with self.assertRaises(SystemExit) as caught:       # 有人没投出去 ⇒ 非零退出
+            an.cmd_send(argparse.Namespace(
+                to=[dead, alive], subject='s', body='b', body_file=None,
+                kind='letter', thread=None, force=False))
+        self.assertEqual(caught.exception.code, 1)
+        # **关键断言**：排在死人后面的那个必须真的收到了
+        self.assertEqual(len(an.inbox_letters(self.ctx(), alive)), 1,
+                         '死掉的收件人掐断了整批，后面的人一封都没收到')
+        self.assertEqual(len(an.inbox_letters(self.ctx(), dead)), 0)
+
+    def test_all_alive_exits_zero(self) -> None:
+        """全都投出去时不能反过来误报失败。"""
+        self.register()
+        peers = [self.peer('0003', alive=True), self.peer('0004', alive=True)]
+        an.cmd_send(argparse.Namespace(
+            to=peers, subject='s', body='b', body_file=None,
+            kind='letter', thread=None, force=False))          # 不抛即通过
+        for p in peers:
+            self.assertEqual(len(an.inbox_letters(self.ctx(), p)), 1)
+
+    def test_force_delivers_to_everyone(self) -> None:
+        self.register()
+        dead = self.peer('0005', alive=False)
+        alive = self.peer('0006', alive=True)
+        an.cmd_send(argparse.Namespace(
+            to=[dead, alive], subject='s', body='b', body_file=None,
+            kind='letter', thread=None, force=True))
+        for p in (dead, alive):
+            self.assertEqual(len(an.inbox_letters(self.ctx(), p)), 1)
 
 
 class TestRestoreAfterRepeatedArchiving(Base):

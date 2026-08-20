@@ -1585,14 +1585,20 @@ def resolve_target(ws: Workspace, token: str) -> list[str]:
     return matches
 
 
-def check_deliverable(ws: Workspace, agent_id: str, force: bool) -> None:
-    """投递前的存活判定。死信必须**当场拒绝**，不能静默成功。"""
+def undeliverable_reason(ws: Workspace, agent_id: str, force: bool) -> str | None:
+    """投不出去的**理由**；投得出去则 None。
+
+    返回理由而不是直接 ``_die``，是因为**群发不能因为一个收件人不可投就中止整批**——
+    2026-08-20 实测：7 个收件人里第 6 个已死，`_die` 掐断了循环，
+    **第 7 个（完全可投）从未被尝试**，而回执只列了成功的 5 个、对后两个只字未提。
+    单收件人的 ``reply`` 拿到理由后照旧 ``_die``（见调用点）。
+    """
     meta, _ = read_info(ws.info_path_of(agent_id))
     # verify_pid：投递值得多花一次系统调用——它在这里只会**救**收件人
     # （心跳超时但进程还在 ⇒ 照投），不会多杀一个。
     status = effective_status(meta, verify_pid=True)
     if status == STATUS_ACTIVE or force:
-        return
+        return None
     stale = stale_seconds(meta)
     stale_txt = '时间未知' if stale == float('inf') else f"已静默 {int(stale // 60)} 分钟"
     # 把**依据**说出来，而不是只丢一个状态词。旧版会印出"presumed-dead（已静默 3 分钟）"
@@ -1601,8 +1607,8 @@ def check_deliverable(ws: Workspace, agent_id: str, force: bool) -> None:
         why = f"{stale_txt}，超过 {dead_after_s() // 60} 分钟阈值，且查不到还活着的进程"
     else:
         why = f"状态是 {status}（显式终态）"
-    _die(f"`{agent_id[:8]}` 判为 {status}：{why}——投了也没人读。\n"
-         f"  确认要投递请加 --force；或先 `agentnet who` 找一个 active 的收件人。")
+    return (f"判为 {status}：{why}——投了也没人读。"
+            f"确认要投递请加 --force；或先 `agentnet who` 找一个 active 的收件人。")
 
 
 def write_letter(
@@ -1686,17 +1692,31 @@ def cmd_send(args: argparse.Namespace) -> None:
             topic_of[rid] = topic
             recipients.append(rid)
     delivered: list[str] = []
+    refused: list[tuple[str, str]] = []
     for rid in recipients:
         if rid == ctx.agent_id:
             continue  # 群发时不投给自己
-        check_deliverable(ctx, rid, args.force)
+        # **不能在这里 _die**：一个收件人不可投就掐断循环的话，排在它后面的
+        # （可能完全可投的）收件人从未被尝试，而回执只列成功的那几个——
+        # 发信方以为送到了，后面那些人从不知道有人找过自己。实测 7 投 5 中。
+        reason = undeliverable_reason(ctx, rid, args.force)
+        if reason is not None:
+            refused.append((rid, reason))
+            print(f"[跳过] → {rid[:8]}  {reason}")
+            continue
         path = write_letter(ctx, ctx.agent_id, rid, args.subject, body,
                             args.kind, args.thread, None, topic_of[rid])
         delivered.append(rid)
         print(f"[OK] → {rid[:8]}  {path.name}")
-    if not delivered:
+    if not delivered and not refused:
         _die("没有实际收件人（群发时只匹配到你自己？）")
-    print(f"[OK] 已投递 {len(delivered)} 封，kind={args.kind}")
+    print(f"[OK] 已投递 {len(delivered)}/{len(delivered) + len(refused)} 封，kind={args.kind}")
+    if refused:
+        # 响亮收尾：**部分成功不能读起来像全部成功**。非零退出码让脚本调用方也看得见。
+        print(f"[!] 有 {len(refused)} 个收件人没投出去："
+              f"{', '.join(r[:8] for r, _ in refused)}")
+        print(f"    要强行投给他们：把上面这条命令的 --to 换成这几个并加 --force。")
+        sys.exit(1)
 
 
 def _args_reply(p: argparse.ArgumentParser) -> None:
@@ -1737,7 +1757,10 @@ def cmd_reply(args: argparse.Namespace) -> None:
     subject = args.subject or f"Re: {original.get('subject', '')}"
     kind = args.kind or ('review-reply' if original.get('kind') == 'review-request' else 'letter')
 
-    check_deliverable(ctx, recipient, args.force)
+    # reply 只有一个收件人，投不出去就没有"部分成功"可言 —— 照旧当场失败。
+    reason = undeliverable_reason(ctx, recipient, args.force)
+    if reason is not None:
+        _die(f"`{recipient[:8]}` {reason}")
     path = write_letter(ctx, ctx.agent_id, recipient, subject, body, kind,
                         str(original.get('thread') or ''), str(original.get('id') or ''), None)
     print(f"[OK] 已回复 {recipient[:8]}  thread={original.get('thread')}  {path.name}")
