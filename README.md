@@ -158,7 +158,7 @@ README 由本脚本的命令注册表与常量**生成**，不手写。它是 ag
 投信给同 workspace 的 agent（或按主题群发）
 
 ```
-agentnet send --to <id|@topic> --subject "..." (--body-file x.md | --body "...") [--kind letter|review-request|review-reply|errand|control] [--thread t] [--force]
+agentnet send --to <id|@topic> [--to <另一个> ...] --subject "..." (--body-file x.md | --body "...") [--kind letter|review-request|review-reply|errand|control] [--thread t] [--force]
 ```
 
 评审就是投信——`--kind review-request` 加 `--thread`，不需要单独的评审子系统。收件人若已死或已归档会**当场拒绝**，不会静默成功。
