@@ -808,34 +808,21 @@ def merge_info(
     return meta
 
 
-PROCESS_EVIDENCE_GRACE_S = 60
-"""心跳新到这个程度时，**不再查进程证据**——它已经证明自己活着了。
+def process_evidence_of_life(meta: dict[str, Any]) -> bool:
+    """有没有一个**还活着的进程**可以证明这份登记的主体仍在。
 
-只有活着的进程写得动 ``last_active``。让可能陈旧的 ``pid`` 去推翻一个一分钟内发生的
-事实，方向是反的（实测：有实例带着"已静默 0 分钟"被判死、于是收不到信）。
+    **只回答"活着"这一侧。** 返回 ``False`` 的含义是"**没有证据**"，
+    **不是**"已经死了"——本函数的结果永远不该被用来判死。
+    为什么不能，见 :func:`effective_status` 中 ``verify_pid`` 的说明。
 
-取 60 秒而不是更长：``verify_pid`` 本来要抓的是"SessionStart 注册成功、主体随后崩溃"
-的空壳，而那种壳的心跳**停在注册那一刻**，一分钟后就出了宽限、照样被 pid 判死——
-比等满 5 分钟的心跳超时仍然快得多。宽限越长，抓壳越慢；越短，越容易误伤正在
-干活但没挂轮询器的实例。一分钟是这两者的分界。
-"""
-
-
-def any_process_alive(meta: dict[str, Any]) -> bool:
-    """这份登记背后**还有没有活着的进程**——``poller_pid`` 与 ``pid`` 取并集。
-
-    有**没有**记录到 pid（两个字段都缺）时返回 ``True``：没有证据不等于死亡证据，
-    该由心跳去判。这也是 fail-open 的一部分。
-
-    ``poller_pid`` 排在前面是因为它更可靠：轮询器是长驻进程，由它自己写入并维护；
-    而 ``pid`` 可能是某次短命 CLI 调用的父进程（见 :func:`effective_status` 的说明）。
+    ``poller_pid`` 排在前面只是因为命中率高（长驻进程），两者地位相同：
+    **任一活着**就够了，活进程不可能属于一个已经消失的主体。
     """
     for field in ('poller_pid', 'pid'):
         value = meta.get(field)
         if isinstance(value, int) and value > 0 and pid_alive(value):
             return True
-    recorded = [meta.get(f) for f in ('poller_pid', 'pid')]
-    return not any(isinstance(v, int) and v > 0 for v in recorded)
+    return False
 
 
 def effective_status(meta: dict[str, Any], at: datetime | None = None,
@@ -845,35 +832,41 @@ def effective_status(meta: dict[str, Any], at: datetime | None = None,
     与锁的租约同理——懒判定，不需要任何进程跑时钟。``exited`` / ``archived`` 是显式终态，
     不再按心跳推算。
 
-    :param verify_pid: 额外用**进程证据**判死。默认关闭是为了让本函数保持纯粹
-        （测试与批量计算不必碰系统调用）；花名册、投递前检查、看板这些**面向决策**的
-        地方应当打开。
+    :param verify_pid: 允许用**进程证据延长**判定为活着的时长。默认关闭是为了让本函数
+        保持纯粹（测试与批量计算不必碰系统调用）；花名册、投递前检查、看板这些
+        **面向决策**的地方应当打开。
 
-        为什么需要它：SessionStart 钩子先注册成功、主体进程随后崩溃时，
-        心跳是新鲜的、``status`` 是 ``active``，花名册于是显示一个**根本不存在的 agent**
-        （17948ac6 实测：ccrg 拉起即崩，壳却留在了名册上）。
-        要等 5 分钟心跳超时才发现太慢，而进程就在手边——直接查，一次刷新就打回原形。
+        **进程证据只用来证明"活着"，永不用来证明"死了"。** 这是 2026-08-20 连续三次
+        误判之后定下的不变式——那天我为"用进程证据判死"打了两次补丁，每次都还剩一张面孔，
+        第三次才看清：**方向本身就是错的**。
 
-        **但绝不能只看 ``pid`` 字段**（2026-08-20 事故）：它由每次 agentnet 调用写入，
-        而 :func:`resolve_pid` 在拿不到 ``CLAUDE_PID`` 时回退到 ``os.getppid()``——
-        那是**那个短命 CLI 进程的父进程**，随手就死。实测同一时刻有 4 个实例
-        ``pid`` 已死、而轮询器活着且心跳新鲜：它们全被判成 ``presumed-dead``，
-        于是 **`check_deliverable` 拒收了投给活人的信**——全网静默通信中断。
+        逐个信号看，谁能证明什么：
 
-        所以证据取**两个 pid 的并集**：``poller_pid``（长驻进程，最可靠）或 ``pid``，
-        **任一存活即视为活着**；两个都死才允许降级。
-        方向上刻意 **fail-open**——误判"死了"会让人丢上下文、白开实例，**不可逆**；
-        误判"活着"最多多等一轮，**可逆**。代价不对称时，判据就该偏向可逆的那侧。
+        =========================  ==================  ====================================
+        信号                        能证明"活"吗         能证明"死"吗
+        =========================  ==================  ====================================
+        ``pid`` 存活                能                  --
+        ``pid`` 已死                --                  **不能**：:func:`resolve_pid` 拿不到
+                                                       ``CLAUDE_PID`` 时回退 ``os.getppid()``，
+                                                       那是短命 CLI 进程的父进程，随手就死
+        ``poller_pid`` 存活         能                  --
+        ``poller_pid`` 已死         --                  **不能**：harness 在**回合边界**
+                                                       SIGTERM 掉所有被追踪的后台任务，
+                                                       活着的 agent 每回合都会短暂没有轮询器
+        ``last_active`` 新鲜        能（最强，只有活着   --
+                                   的进程写得动它）
+        ``last_active`` 超过阈值    --                  **按定义**如此（不是推断）
+        =========================  ==================  ====================================
 
-        **而在两个 pid 之上还有一条更强的证据：新鲜的心跳。**（同日第二处修正）
-        只有活着的进程写得动 ``last_active``——所以心跳在 :data:`PROCESS_EVIDENCE_GRACE_S`
-        以内时**直接判活、根本不查 pid**。第一版漏了这条，于是仍有实例带着"已静默 0 分钟"
-        被判死：它正在干活、每条命令都在刷心跳，只是**没挂轮询器**且 ``pid`` 恰好陈旧。
-        让两个不可靠的字段去推翻一个刚刚发生的事实，方向就是反的。
+        ⇒ **三个信号都能可靠证明"活"，没有一个能可靠证明"死"。** 唯一的判死依据只有
+        心跳超时，而那是定义。于是进程证据的正确用法是**反过来的**：心跳已经陈旧、
+        但仍有活进程时**判它活着**——一个 agent 可能正忙一件十分钟的活、期间不调 agentnet，
+        它的心跳早就陈旧，可轮询器还在跑。旧写法会把它判死，新写法留着它。
 
-        这条不削弱 ``verify_pid`` 的本意（抓"注册成功后主体崩了"的壳）：那种壳的
-        ``last_active`` **停在注册那一刻不再更新**，一分钟后就出了宽限，照样被 pid 判死——
-        比等满 5 分钟心跳超时仍快得多。
+        代价：注册成功后立刻崩掉的空壳（17948ac6 实测的 ccrg 拉起即崩）从"一分钟暴露"
+        变成"五分钟暴露"。**这个代价可逆，而误判死不可逆**——后者让人丢上下文、
+        白开实例，还会让 :func:`check_deliverable` 拒收投给活人的信（那天实测全网
+        有 4 个实例中招，通信静默中断）。代价不对称时，判据偏向可逆的那侧。
     """
     stored = str(meta.get('status', STATUS_ACTIVE))
     if stored in TERMINAL_STATUSES:
@@ -885,16 +878,16 @@ def effective_status(meta: dict[str, Any], at: datetime | None = None,
     if last.tzinfo is None:
         last = last.replace(tzinfo=reference.tzinfo)
     silent = reference - last
-    # 心跳刚刚刷新过 ⇒ **只有活着的进程写得动它** ⇒ 直接判活，不必也不该再查 pid。
-    # 顺序很关键：先看这条，再看进程证据。反过来就会让两个不可靠的 pid 字段
-    # 推翻一个刚刚发生的事实（实测：带着"已静默 0 分钟"被判死）。
-    if silent <= timedelta(seconds=PROCESS_EVIDENCE_GRACE_S):
+    # 心跳还在阈值内 ⇒ 判活，连系统调用都省了。
+    # （曾经这里还有一道 60 秒的"进程证据宽限"，用来挡住 pid 判死；判死取消之后
+    #   它就没有要挡的东西了，已删——见 §12 删除优先。）
+    if silent <= timedelta(seconds=dead_after_s()):
         return STATUS_ACTIVE
-    if verify_pid and not any_process_alive(meta):
-        return STATUS_PRESUMED_DEAD
-    if silent > timedelta(seconds=dead_after_s()):
-        return STATUS_PRESUMED_DEAD
-    return STATUS_ACTIVE
+    # 心跳已经超时。**唯一**能救它的是"还有活进程"这条正面证据——
+    # 注意这里是**延长生命**，不是加速判死：没有活进程只说明没有证据，不构成死亡证明。
+    if verify_pid and process_evidence_of_life(meta):
+        return STATUS_ACTIVE
+    return STATUS_PRESUMED_DEAD
 
 
 def stale_seconds(meta: dict[str, Any], at: datetime | None = None) -> float:
@@ -1587,14 +1580,20 @@ def resolve_target(ws: Workspace, token: str) -> list[str]:
 def check_deliverable(ws: Workspace, agent_id: str, force: bool) -> None:
     """投递前的存活判定。死信必须**当场拒绝**，不能静默成功。"""
     meta, _ = read_info(ws.info_path_of(agent_id))
-    # verify_pid：投递是**要有人读**才有意义的动作，宁可多一次系统调用，
-    # 也不要把信投给一个进程已经不存在、只是心跳还没过期的空壳。
+    # verify_pid：投递值得多花一次系统调用——它在这里只会**救**收件人
+    # （心跳超时但进程还在 ⇒ 照投），不会多杀一个。
     status = effective_status(meta, verify_pid=True)
     if status == STATUS_ACTIVE or force:
         return
     stale = stale_seconds(meta)
-    stale_txt = '未知' if stale == float('inf') else f"{int(stale // 60)} 分钟"
-    _die(f"`{agent_id[:8]}` 状态为 {status}（已静默 {stale_txt}），投了也没人读。\n"
+    stale_txt = '时间未知' if stale == float('inf') else f"已静默 {int(stale // 60)} 分钟"
+    # 把**依据**说出来，而不是只丢一个状态词。旧版会印出"presumed-dead（已静默 3 分钟）"
+    # 这种自相矛盾的话（阈值是 5 分钟），读的人无从判断该不该信它。
+    if status == STATUS_PRESUMED_DEAD:
+        why = f"{stale_txt}，超过 {dead_after_s() // 60} 分钟阈值，且查不到还活着的进程"
+    else:
+        why = f"状态是 {status}（显式终态）"
+    _die(f"`{agent_id[:8]}` 判为 {status}：{why}——投了也没人读。\n"
          f"  确认要投递请加 --force；或先 `agentnet who` 找一个 active 的收件人。")
 
 
@@ -1635,7 +1634,9 @@ def write_letter(
 
 
 def _args_send(p: argparse.ArgumentParser) -> None:
-    p.add_argument('--to', required=True, help='收件人 agent id（可用前缀）或 @主题（群发给认领者）')
+    p.add_argument('--to', required=True, action='append', metavar='<id|@topic>',
+                   help='收件人 agent id（可用前缀）或 @主题（群发给认领者）。'
+                        '**可重复**给多个：`--to a --to b --to @topic`，重复的收件人只投一封')
     p.add_argument('--subject', required=True, help='主题行')
     p.add_argument('--body-file', help='正文 .md 文件')
     p.add_argument('--body', help='正文（**仅限短的纯文本**）。含反引号 / $ / 引号时**必须**改用 --body-file：shell 会先做命令替换，反引号那段会被**静默换成命令输出或空串**，agentnet 收到时已无痕迹、无从告警')
@@ -1647,7 +1648,8 @@ def _args_send(p: argparse.ArgumentParser) -> None:
 @command(
     'send',
     '投信给同 workspace 的 agent（或按主题群发）',
-    'agentnet send --to <id|@topic> --subject "..." (--body-file x.md | --body "...") '
+    'agentnet send --to <id|@topic> [--to <另一个> ...] --subject "..." '
+    '(--body-file x.md | --body "...") '
     '[--kind letter|review-request|review-reply|errand|control] [--thread t] [--force]',
     detail=('评审就是投信——`--kind review-request` 加 `--thread`，不需要单独的评审子系统。'
             '收件人若已死或已归档会**当场拒绝**，不会静默成功。'),
@@ -1663,15 +1665,25 @@ def cmd_send(args: argparse.Namespace) -> None:
     if args.body_file and not Path(args.body_file).exists():
         _die(f"--body-file 不存在: {args.body_file}")
 
-    recipients = resolve_target(ctx, args.to)
-    to_topic = args.to[1:] if args.to.startswith('@') else None
+    # 每个收件人记住**它是被哪个 token 匹配上的**：来自 @topic 的要在信里留下主题，
+    # 直接点名的则没有。同一个人被多个 token 命中时只投一封（首次匹配为准）。
+    recipients: list[str] = []
+    topic_of: dict[str, str | None] = {}
+    for token in args.to:
+        matched = resolve_target(ctx, token)
+        topic = token[1:] if token.startswith('@') else None
+        for rid in matched:
+            if rid in topic_of:
+                continue
+            topic_of[rid] = topic
+            recipients.append(rid)
     delivered: list[str] = []
     for rid in recipients:
         if rid == ctx.agent_id:
             continue  # 群发时不投给自己
         check_deliverable(ctx, rid, args.force)
         path = write_letter(ctx, ctx.agent_id, rid, args.subject, body,
-                            args.kind, args.thread, None, to_topic)
+                            args.kind, args.thread, None, topic_of[rid])
         delivered.append(rid)
         print(f"[OK] → {rid[:8]}  {path.name}")
     if not delivered:
@@ -1907,8 +1919,13 @@ def dead_among(ctx: 'Ctx', watched: dict[str, str]) -> dict[str, str]:
     **只读这几个的 ``info.md``，不全表扫描**——全扫是 N 个 agent × M 个轮询器 × 每次检查，
     而被盯的通常只有一两个。
 
-    ``verify_pid=True``：进程没了就立刻算死，不等心跳超时。author 在等回信，
-    "还要不要继续等"这个判断经不起 5 分钟延迟。
+    判死只有三条依据，**都不是"进程没了"**：目录已搬进 ``archive/``、登记读不出来、
+    心跳超过阈值。``verify_pid=True`` 在这里的作用是**反过来的**——心跳虽已超时、
+    但还有活进程时把它留下（见 :func:`effective_status`）。
+
+    代价是子实例真死时要等满心跳阈值才报给 author，比"进程没了就算死"慢。
+    这是刻意的：误报"你等的实例死了"会让 author 扔掉一个正在写评审的 reviewer，
+    **不可逆**；晚几分钟知道，**可逆**。实测旧写法三次里两次是误报。
     """
     dead: dict[str, str] = {}
     for agent_id, name in watched.items():
@@ -5098,12 +5115,44 @@ def cmd_dashboard(args: argparse.Namespace) -> None:
 # 入口
 # ══════════════════════════════════════════════════════════════════════════
 
-def main() -> None:
-    # Windows 控制台默认 GBK，打印中文会 UnicodeEncodeError；强制 UTF-8。
-    for stream in (sys.stdout, sys.stderr):
-        if isinstance(stream, io.TextIOWrapper):
-            stream.reconfigure(encoding='utf-8')
+SEEN_DESTS_ATTR = '_seen_option_dests'
+"""解析期记账用的命名空间字段，下划线开头 ⇒ 不会被入口体检和各命令看见。"""
 
+
+class StoreOnce(argparse.Action):
+    """替换 argparse 默认的 ``store``：同一个选项给两次就**当场报错**。
+
+    argparse 的默认行为是**静默取最后一个**。于是 ``send --to a --to b --to c``
+    只投给 ``c``，回执还写着"已投递 1 封"——每个字都真，唯独不提另外两个去哪了。
+    2026-08-20 实测：一次 4 收件人的群发，3 个收件人被悄悄丢弃，
+    发信方以为送到了，收信方从不知道有人找过自己。**静默丢弃比报错危险得多。**
+
+    这与 :data:`VARIADIC_FLAGS` 那条（``<tools...>`` 会吞掉其后的位置参数）是镜像：
+    一个吞掉后面的、一个丢掉前面的，**共同点是都不出声**。
+
+    真需要多值的选项显式写 ``action='append'``（如 ``send --to``）；
+    其余一律在这里拒绝。装在**建子解析器的那一个循环**里，
+    所以当前和将来的每个选项都自动受保护，不必逐个记得。
+    """
+
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace,
+                 values: Any, option_string: str | None = None) -> None:
+        seen = getattr(namespace, SEEN_DESTS_ATTR, None)
+        if seen is None:
+            # 记在 namespace 上而不是 self 上：Action 对象在同一进程里跨多次
+            # parse_args 复用（测试就是这么跑的），记在 self 上会串味。
+            seen = set()
+            setattr(namespace, SEEN_DESTS_ATTR, seen)
+        if self.dest in seen:
+            parser.error(f"{option_string} 给了不止一次，但它**只接受一个值**——"
+                         f"重复传入不会合并，早先的会被丢掉，所以这里直接拒绝。")
+        seen.add(self.dest)
+        setattr(namespace, self.dest, values)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """装配整棵命令树。**独立于 :func:`main`** 是为了可测——
+    ``StoreOnce`` 这类守卫只有真的走一遍 ``parse_args`` 才算验证过。"""
     parser = argparse.ArgumentParser(
         prog='agentnet',
         description='agent 之间的文件系统网络（零守护进程、零第三方依赖）',
@@ -5115,16 +5164,32 @@ def main() -> None:
         p = sub.add_parser(cmd.name, help=cmd.summary, description=cmd.summary + (
             '\n\n' + cmd.detail if cmd.detail else ''),
                            formatter_class=argparse.RawDescriptionHelpFormatter)
+        # 必须在 add_args 之前：注册表是 add_argument 当场查的。
+        for key in ('store', None):
+            p.register('action', key, StoreOnce)
         if cmd.add_args:
             cmd.add_args(p)
         p.set_defaults(_handler=cmd.handler)
+    return parser
 
-    args = parser.parse_args()
+
+def main() -> None:
+    # Windows 控制台默认 GBK，打印中文会 UnicodeEncodeError；强制 UTF-8。
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(encoding='utf-8')
+
+    args = build_parser().parse_args()
     # 在**任何**参数被用到之前统一体检：损坏的文本一旦写进信件/日志就再也救不回来，
     # 所以拦在入口，而不是让每个命令各自小心。
     for name, value in vars(args).items():
-        if isinstance(value, str) and not name.startswith('_'):
-            guard_text(value, f"参数 --{name.replace('_', '-')}")
+        if name.startswith('_'):
+            continue
+        # append 类选项拿到的是 list[str]——**别让它从体检里溜过去**。
+        # 把 --to 改成可重复时差点漏掉这里：那样收件人 token 就绕过了乱码守卫。
+        for item in (value if isinstance(value, list) else [value]):
+            if isinstance(item, str):
+                guard_text(item, f"参数 --{name.replace('_', '-')}")
 
     # 任何一次 agentnet 调用本身就证明该 agent 活着 —— 顺手刷新心跳。
     # 未注册时静默跳过（不隐式入网）；register 随后会写自己的权威值。

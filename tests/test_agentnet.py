@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import os
 import sys
@@ -54,7 +55,6 @@ class Base(unittest.TestCase):
         return an.Ctx()
 
     def register(self, topics: str | None = None, name: str | None = None) -> None:
-        import argparse
         an.cmd_register(argparse.Namespace(topics=topics, name=name))
 
 
@@ -221,22 +221,23 @@ class TestStatus(Base):
             meta = {'status': terminal, 'last_active': an.now()}
             self.assertEqual(an.effective_status(meta), terminal)
 
-    def test_dead_pid_detected_before_heartbeat_expires(self) -> None:
-        """假活：钩子先注册成功、主体进程随后崩溃 —— 心跳还新鲜，但那个 agent 不存在了。
+    def test_dead_pid_alone_never_downgrades(self) -> None:
+        """死掉的 `pid` **不**构成死亡证据——这条契约在 2026-08-20 被反转过。
 
-        实测来源：ccrg 角色拉起即崩，SessionStart 已写好注册，花名册于是显示 active
-        （17948ac6 报告）。等 5 分钟心跳超时太慢，pid 就在手边，直接查。
+        原契约是"pid 没了就提前判死"，为的是快点抓住"注册成功后崩掉的壳"
+        （17948ac6 报告的 ccrg 拉起即崩）。但同一个判据连续三次误杀活着的实例：
+        `resolve_pid` 拿不到 `CLAUDE_PID` 时回退 `os.getppid()`，那是短命 CLI 进程的
+        父进程，**天生随手就死**。用一个天生不可靠的信号做不可逆的判定，方向就是错的。
 
-        **心跳取宽限之外的时刻**：崩掉的壳其 last_active 停在注册那一刻不再更新，
-        所以现实中它必然会走出宽限。此处曾用 `now()`，那等于断言"pid 可以推翻
-        刚刚发生的心跳"——那个契约已被证伪（实测让活着的实例收不到信）。
+        壳仍然会被抓到，改由心跳超时兜底（见
+        `TestLivenessFailsOpen.test_crashed_shell_is_caught_by_heartbeat_not_by_pid`）。
         """
-        stale = an.now() - timedelta(seconds=an.PROCESS_EVIDENCE_GRACE_S + 5)
+        stale = an.now() - timedelta(seconds=an.dead_after_s() - 30)
         meta = {'status': an.STATUS_ACTIVE, 'last_active': stale, 'pid': 999999999}
         self.assertEqual(an.effective_status(meta), an.STATUS_ACTIVE,
                          '默认不查 pid，保持函数纯粹')
-        self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_PRESUMED_DEAD,
-                         'pid 已不存在却仍判为存活')
+        self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_ACTIVE,
+                         '死 pid 单独不足以判死——心跳还在阈值内')
 
     def test_live_pid_stays_active(self) -> None:
         meta = {'status': an.STATUS_ACTIVE, 'last_active': an.now(), 'pid': os.getpid()}
@@ -927,12 +928,18 @@ class TestOrphanedWait(Base):
 
 
 class TestLivenessFailsOpen(Base):
-    """判活取**两个 pid 的并集**，且方向 fail-open。
+    """**进程证据只用来证明"活着"，永不用来证明"死了"。**
 
-    实测事故（2026-08-20，`b8839ea3` 报告）：`pid` 字段由每次 agentnet 调用写入，
-    而 `resolve_pid` 拿不到 `CLAUDE_PID` 时回退到 `os.getppid()`——那是短命 CLI 进程的
-    父进程，随手就死。同一时刻有 4 个实例 `pid` 已死、轮询器活着、心跳新鲜，
-    却全被判成 presumed-dead ⇒ **`check_deliverable` 拒收了投给活人的信**。
+    2026-08-20 一天之内三次误判，我为"用进程证据判死"打了两次补丁，每次都还剩一张面孔：
+
+    1. `pid` 已死 + 轮询器活着 + 心跳新鲜 → 判死（4 个实例中招，**投给活人的信被拒**）
+    2. 心跳"已静默 0 分钟"仍被两个陈旧 pid 推翻 → 判死
+    3. `7c5fad3b`：**从未挂过轮询器**，唯一的 `pid` 是 `os.getppid()` 兜底、已死，
+       心跳静默 3 分钟（阈值 5 分钟）→ 判死。而它当时正把信读进 `read/`，明明活着。
+
+    第三次才看清方向本身是错的：**没有任何进程信号能可靠证明"死"**——
+    `pid` 死可能是兜底指错了人，`poller_pid` 死是 harness 在回合边界杀后台任务的常态。
+    唯一的判死依据只有心跳超时，而那是**定义**。
     """
 
     def fresh(self, **over: object) -> dict:
@@ -949,23 +956,47 @@ class TestLivenessFailsOpen(Base):
         meta = self.fresh(pid=os.getpid(), poller_pid=999999)
         self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_ACTIVE)
 
-    def test_both_dead_downgrades(self) -> None:
-        """两个都死才允许判死——保留原本要抓的"注册成功但主体崩了"那种壳。
+    def test_both_dead_does_not_kill_within_threshold(self) -> None:
+        """两个 pid 都死也**不判死**——心跳还在阈值内就还活着。
 
-        心跳取宽限之外：宽限内的新鲜心跳本身就是活着的证明，进程证据不该推翻它。
+        这条契约与旧版相反。旧版拿"两个都死"当死亡证据，于是 `7c5fad3b`
+        （没挂轮询器、`pid` 是陈旧兜底、静默 3 分钟）被判死、收不到信。
         """
-        stale = an.now() - timedelta(seconds=an.PROCESS_EVIDENCE_GRACE_S + 5)
+        stale = an.now() - timedelta(seconds=an.dead_after_s() - 30)
         meta = self.fresh(pid=999999, poller_pid=999998, last_active=stale)
-        self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_PRESUMED_DEAD)
+        self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_ACTIVE)
+
+    def test_never_polled_agent_is_not_killed_by_stale_pid(self) -> None:
+        """**事故三的直接回归**：从未挂过轮询器的实例，只有一个不可信的 `pid`。
+
+        `7c5fad3b` 实测：`poller_pid` 字段从未写入过，`pid` 已死，静默 3 分钟——
+        被判 presumed-dead 而拒收投递，可它当时正把上一封信读进 `read/`。
+        """
+        silent = an.now() - timedelta(seconds=180)
+        meta = {'status': an.STATUS_ACTIVE, 'last_active': silent, 'pid': 999999}
+        self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_ACTIVE)
 
     def test_no_pid_recorded_is_not_evidence_of_death(self) -> None:
-        """没有证据 ≠ 死亡证据。该由心跳判，不该由缺失判。"""
-        self.assertTrue(an.any_process_alive({'status': an.STATUS_ACTIVE}))
+        """没有活进程 = **没有证据**，不是死亡证据——判死交给心跳。"""
+        self.assertFalse(an.process_evidence_of_life({'status': an.STATUS_ACTIVE}))
+        fresh = self.fresh()
+        self.assertEqual(an.effective_status(fresh, verify_pid=True), an.STATUS_ACTIVE)
 
-    def test_stale_heartbeat_still_wins(self) -> None:
-        """fail-open 只针对进程证据；心跳真过期了照样判死。"""
+    def test_live_process_rescues_an_expired_heartbeat(self) -> None:
+        """**方向倒过来之后新增的能力**：心跳超时，但还有活进程 ⇒ 判它活着。
+
+        典型场景：一个实例正忙一件十分钟的活，期间根本不调 agentnet，心跳早就陈旧，
+        可它的轮询器还在跑。旧写法把这种实例判死（于是别人投信被拒），新写法留着它。
+        """
         old = an.now() - timedelta(seconds=an.dead_after_s() + 60)
         meta = {'status': an.STATUS_ACTIVE, 'last_active': old, 'poller_pid': os.getpid()}
+        self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_ACTIVE)
+
+    def test_expired_heartbeat_with_no_live_process_is_dead(self) -> None:
+        """判死仍然存在，只是**唯一**入口是心跳超时且拿不出活进程。"""
+        old = an.now() - timedelta(seconds=an.dead_after_s() + 60)
+        meta = {'status': an.STATUS_ACTIVE, 'last_active': old,
+                'pid': 999999, 'poller_pid': 999998}
         self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_PRESUMED_DEAD)
 
     def test_fresh_heartbeat_beats_dead_pids(self) -> None:
@@ -979,16 +1010,42 @@ class TestLivenessFailsOpen(Base):
                 'pid': 999999, 'poller_pid': 999998}
         self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_ACTIVE)
 
-    def test_crashed_shell_still_caught_after_grace(self) -> None:
-        """宽限不能削弱本意：注册成功后崩掉的壳，心跳停在注册那一刻，出了宽限照样判死。"""
-        stale = an.now() - timedelta(seconds=an.PROCESS_EVIDENCE_GRACE_S + 5)
-        meta = {'status': an.STATUS_ACTIVE, 'last_active': stale,
-                'pid': 999999, 'poller_pid': 999998}
-        self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_PRESUMED_DEAD)
+    def test_crashed_shell_is_caught_by_heartbeat_not_by_pid(self) -> None:
+        """注册成功后崩掉的壳仍然会被抓到——**但靠心跳超时，不靠 pid**。
 
-    def test_grace_is_far_shorter_than_death_threshold(self) -> None:
-        """宽限只是"别推翻刚发生的事"，不是第二个判死阈值。"""
-        self.assertLess(an.PROCESS_EVIDENCE_GRACE_S, an.dead_after_s())
+        代价明说：从"一分钟暴露"变成"五分钟暴露"。这个代价**可逆**（壳多留一会儿，
+        顶多有人投一封没人读的信）；而误判死**不可逆**（让人丢上下文、白开实例、
+        拒收投给活人的信）。代价不对称时，判据偏向可逆的那侧。
+        """
+        registered_at = an.now() - timedelta(seconds=an.dead_after_s() + 5)
+        shell = {'status': an.STATUS_ACTIVE, 'last_active': registered_at,
+                 'pid': 999999, 'poller_pid': 999998}
+        self.assertEqual(an.effective_status(shell, verify_pid=True), an.STATUS_PRESUMED_DEAD)
+        # 而在阈值之内，同一个壳被当作活的——这正是上面说的那份代价，写出来而不是含糊过去。
+        young = dict(shell, last_active=an.now() - timedelta(seconds=90))
+        self.assertEqual(an.effective_status(young, verify_pid=True), an.STATUS_ACTIVE)
+
+    def test_process_evidence_never_makes_things_deader(self) -> None:
+        """**不变式**：打开 `verify_pid` 只可能让判定更"活"，绝不可能更"死"。
+
+        这条守着方向本身。任何未来的改动若让进程证据重新参与判死，这里立刻红。
+        """
+        cases = [
+            {'pid': 999999, 'poller_pid': 999998},
+            {'pid': os.getpid()},
+            {'poller_pid': os.getpid()},
+            {},
+        ]
+        offsets = [0, 90, an.dead_after_s() - 30, an.dead_after_s() + 60]
+        for pids in cases:
+            for offset in offsets:
+                meta = {'status': an.STATUS_ACTIVE,
+                        'last_active': an.now() - timedelta(seconds=offset), **pids}
+                without = an.effective_status(meta, verify_pid=False)
+                with_pid = an.effective_status(meta, verify_pid=True)
+                if without == an.STATUS_ACTIVE:
+                    self.assertEqual(with_pid, an.STATUS_ACTIVE,
+                                     f"verify_pid 把活的判成了死的: {pids} offset={offset}")
 
     def test_deliverable_to_a_live_agent_with_stale_pid(self) -> None:
         """端到端：这正是被拒收的那条路径。"""
@@ -1701,6 +1758,99 @@ class TestHollowShell(Base):
 
         self.assertEqual(an.absorb_shell(shell, destination), (0, shell))
         self.assertTrue(shell.exists(), '还有数据没搬走时不得删除空壳')
+
+
+class TestRepeatedOptionIsRejected(Base):
+    """重复给同一个具名选项 ⇒ **当场报错**，绝不静默取最后一个。
+
+    2026-08-20 实测：`send --to a --to b --to c --to d` 只投给了 `d`，
+    回执写着"已投递 1 封"——每个字都真，唯独不提另外三个去哪了。发信方以为送到了，
+    另外三个收信方从不知道有人找过自己。**静默丢弃比报错危险得多。**
+    """
+
+    def parse(self, argv: list[str]) -> argparse.Namespace:
+        return an.build_parser().parse_args(argv)
+
+    def test_repeating_a_single_valued_option_errors(self) -> None:
+        with self.assertRaises(SystemExit):
+            self.parse(['register', '--name', '甲', '--name', '乙'])
+
+    def test_single_value_still_works(self) -> None:
+        args = self.parse(['register', '--name', '甲'])
+        self.assertEqual(args.name, '甲')
+
+    def test_guard_covers_every_subcommand(self) -> None:
+        """守卫装在**建子解析器的那个循环**里，所以每条命令都受保护。
+
+        逐个 subcommand 找一个具名选项试重复——将来新增命令也自动被覆盖，
+        不依赖谁记得给它加。
+        """
+        checked = 0
+        for cmd in an.COMMANDS:
+            parser = an.build_parser()
+            target = self._first_repeatable_flag(cmd)
+            if target is None:
+                continue
+            flag, value = target
+            with self.assertRaises(SystemExit, msg=f"{cmd.name} {flag} 重复未被拒绝"):
+                parser.parse_args([cmd.name, flag, value, flag, value])
+            checked += 1
+        self.assertGreater(checked, 5, '样本太少，等于没测')
+
+    def _first_repeatable_flag(self, cmd: object) -> tuple[str, str] | None:
+        """挑一个"接受值、且不是 append"的选项。没有则跳过该命令。"""
+        probe = argparse.ArgumentParser()
+        for key in ('store', None):
+            probe.register('action', key, an.StoreOnce)
+        add_args = getattr(cmd, 'add_args', None)
+        if add_args is None:
+            return None
+        add_args(probe)
+        for action in probe._actions:                    # noqa: SLF001
+            if not action.option_strings or action.nargs == 0:
+                continue
+            if not isinstance(action, an.StoreOnce):
+                continue                                  # append / store_true 不适用
+            if action.choices:
+                return action.option_strings[0], str(list(action.choices)[0])
+            if action.type is int:
+                return action.option_strings[0], '1'
+            return action.option_strings[0], 'x'
+        return None
+
+
+class TestMultiRecipientSend(Base):
+    """`--to` 是**显式**可重复的那一个——多收件人是真需求，所以给它 append。"""
+
+    def test_repeated_to_reaches_everyone(self) -> None:
+        args = an.build_parser().parse_args(
+            ['send', '--to', 'aaa', '--to', 'bbb', '--to', '@topic',
+             '--subject', 's', '--body', 'b'])
+        self.assertEqual(args.to, ['aaa', 'bbb', '@topic'])
+
+    def test_single_to_is_still_a_list(self) -> None:
+        args = an.build_parser().parse_args(
+            ['send', '--to', 'aaa', '--subject', 's', '--body', 'b'])
+        self.assertEqual(args.to, ['aaa'])
+
+    def test_list_valued_args_are_still_text_guarded(self) -> None:
+        """append 选项拿到的是 `list[str]`——**别让它从入口体检里溜过去**。
+
+        把 `--to` 改成可重复时差点漏掉这里：体检只认 `isinstance(value, str)`，
+        改成 list 之后收件人 token 就绕过了乱码守卫，损坏的 id 会直接写进信件。
+        """
+        broken = '娴嬭瘯'                       # UTF-8 被按 GBK 解出来的典型残骸
+        with self.assertRaises(SystemExit):
+            an.guard_text(broken, '参数 --to')
+        args = an.build_parser().parse_args(
+            ['send', '--to', 'aaa', '--to', broken, '--subject', 's', '--body', 'b'])
+        with self.assertRaises(SystemExit, msg='list 里的坏 token 必须被体检拦下'):
+            for name, value in vars(args).items():
+                if name.startswith('_'):
+                    continue
+                for item in (value if isinstance(value, list) else [value]):
+                    if isinstance(item, str):
+                        an.guard_text(item, f"参数 --{name.replace('_', '-')}")
 
 
 if __name__ == '__main__':
