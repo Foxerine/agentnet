@@ -808,6 +808,23 @@ def merge_info(
     return meta
 
 
+def any_process_alive(meta: dict[str, Any]) -> bool:
+    """这份登记背后**还有没有活着的进程**——``poller_pid`` 与 ``pid`` 取并集。
+
+    有**没有**记录到 pid（两个字段都缺）时返回 ``True``：没有证据不等于死亡证据，
+    该由心跳去判。这也是 fail-open 的一部分。
+
+    ``poller_pid`` 排在前面是因为它更可靠：轮询器是长驻进程，由它自己写入并维护；
+    而 ``pid`` 可能是某次短命 CLI 调用的父进程（见 :func:`effective_status` 的说明）。
+    """
+    for field in ('poller_pid', 'pid'):
+        value = meta.get(field)
+        if isinstance(value, int) and value > 0 and pid_alive(value):
+            return True
+    recorded = [meta.get(f) for f in ('poller_pid', 'pid')]
+    return not any(isinstance(v, int) and v > 0 for v in recorded)
+
+
 def effective_status(meta: dict[str, Any], at: datetime | None = None,
                      verify_pid: bool = False) -> str:
     """**读取时**推算存活状态，而不是信任存过的 ``status``。
@@ -815,22 +832,31 @@ def effective_status(meta: dict[str, Any], at: datetime | None = None,
     与锁的租约同理——懒判定，不需要任何进程跑时钟。``exited`` / ``archived`` 是显式终态，
     不再按心跳推算。
 
-    :param verify_pid: 额外查一下登记的进程还在不在。默认关闭是为了让本函数保持纯粹
+    :param verify_pid: 额外用**进程证据**判死。默认关闭是为了让本函数保持纯粹
         （测试与批量计算不必碰系统调用）；花名册、投递前检查、看板这些**面向决策**的
         地方应当打开。
 
         为什么需要它：SessionStart 钩子先注册成功、主体进程随后崩溃时，
         心跳是新鲜的、``status`` 是 ``active``，花名册于是显示一个**根本不存在的 agent**
         （17948ac6 实测：ccrg 拉起即崩，壳却留在了名册上）。
-        要等 5 分钟心跳超时才发现太慢，而 pid 就在手边——直接查它，一次刷新就打回原形。
+        要等 5 分钟心跳超时才发现太慢，而进程就在手边——直接查，一次刷新就打回原形。
+
+        **但绝不能只看 ``pid`` 字段**（2026-08-20 事故）：它由每次 agentnet 调用写入，
+        而 :func:`resolve_pid` 在拿不到 ``CLAUDE_PID`` 时回退到 ``os.getppid()``——
+        那是**那个短命 CLI 进程的父进程**，随手就死。实测同一时刻有 4 个实例
+        ``pid`` 已死、而轮询器活着且心跳新鲜：它们全被判成 ``presumed-dead``，
+        于是 **`check_deliverable` 拒收了投给活人的信**——全网静默通信中断。
+
+        所以证据取**两个 pid 的并集**：``poller_pid``（长驻进程，最可靠）或 ``pid``，
+        **任一存活即视为活着**；两个都死才允许降级。
+        方向上刻意 **fail-open**——误判"死了"会让人丢上下文、白开实例，**不可逆**；
+        误判"活着"最多多等一轮，**可逆**。代价不对称时，判据就该偏向可逆的那侧。
     """
     stored = str(meta.get('status', STATUS_ACTIVE))
     if stored in TERMINAL_STATUSES:
         return stored
-    if verify_pid:
-        pid = meta.get('pid')
-        if isinstance(pid, int) and pid > 0 and not pid_alive(pid):
-            return STATUS_PRESUMED_DEAD
+    if verify_pid and not any_process_alive(meta):
+        return STATUS_PRESUMED_DEAD
     last = meta.get('last_active')
     if not isinstance(last, datetime):
         return STATUS_PRESUMED_DEAD
@@ -1861,22 +1887,35 @@ def dead_among(ctx: 'Ctx', watched: dict[str, str]) -> dict[str, str]:
 
 
 def render_dead_children(dead: dict[str, str]) -> str:
-    """告诉 author："你等的那个已经不在了"。
+    """告诉 author："你等的那个可能已经不在了"。
 
     这是**唯一**能终止无限等待的信号。此前没有它：author 拉起 reviewer 后阻塞在 poll
     等回信，reviewer 崩了 / 被 sweep 归档 / 被杀，那封回信**永远不会来**，
     而 poll 没有超时（标准流程强制无超时，因为对方一轮可能耗时数小时）——
     于是 author 永远等下去，**且不知道自己在等一个死人**。
+
+    **措辞必须与置信度匹配**（``b8839ea3`` 报告，2026-08-20）：初版把一个**推断**
+    写成了**断言**（"已经不在了""回信**不会再来**"），紧跟"重新 spawn 一个"，
+    诱导性极强。而误报的代价**不可逆**——那个 reviewer 刚写完一轮评审、正在读答复，
+    重开等于把它这轮工作扔掉、让新实例从零重建理解。
+
+    初版还给自己写了句免责话术：「评审协议本就要求每轮终审换新实例，所以重开不是退步」
+    ——**那条规则说的是终审门换人，不是对拍中途换人**。这句话让误报显得无害，实际不是。
+    已删。
+
+    现在：标题降为「可能已退出」，正文第一条就是"先 `agentnet who` 确认，仍 active
+    就别重开"，把行动建议放在确认之后。
     """
-    lines = ['[子实例已死] 你拉起的以下实例已经不在了，它们的回信**不会再来**：']
+    lines = ['[可能已退出] 我这一侧观察不到下面这些你拉起的实例了：']
     for agent_id, name in sorted(dead.items(), key=lambda kv: kv[1]):
         lines.append(f"      - {agent_id[:8]}  {name or '(未命名)'}")
     lines += [
         '',
-        '    若你正等它的产出：**重新 `agentnet spawn` 一个**。评审协议本就要求'
-        '每轮终审换新实例，所以重开不是退步。',
-        '    想看它死前留下什么：`agentnet last --full`（它可能已发过部分回信），'
-        '或翻 `archive/<id>/` 里的 sent/。',
+        '    ⚠ **这是推断，可能误报。先确认再动手**：',
+        '       `agentnet who` —— 若它仍显示 active 且静默时间短，**它还活着，别重开**。',
+        '',
+        '    确认真的没了、而你在等它的产出 ⇒ 重新 `agentnet spawn` 一个。',
+        '    想看它留下过什么：`agentnet last --full`，或翻 `archive/<id>/` 里的 sent/。',
         '    **本轮询器已退出**，处理完后照常重新后台运行 `agentnet poll`。',
     ]
     return '\n'.join(lines)

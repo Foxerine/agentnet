@@ -905,17 +905,90 @@ class TestOrphanedWait(Base):
         self.assertEqual(an.dead_among(self.ctx(), watched), {})
 
     def test_notice_is_actionable(self) -> None:
-        """光说"死了"不够——要说清回信不会来了、以及下一步做什么。"""
+        """要点名是谁、并给出下一步——但**先确认再动手**，见 TestDeadChildNoticeIsHedged。
+
+        此处曾断言正文含"回信不会再来"。那句话是过度自信的措辞（把推断说成断言），
+        已删；用例跟着改，否则它会把一个已知有害的契约钉死在这里。
+        """
         text = an.render_dead_children({'cccc0000-1111': 'gate9-reviewer'})
         self.assertIn('cccc0000', text)
         self.assertIn('gate9-reviewer', text)
-        self.assertIn('不会再来', text)
         self.assertIn('spawn', text)
 
     def test_watch_interval_is_between_loop_and_heartbeat(self) -> None:
         """比主循环稀（省 I/O）、比心跳密（author 在等，不能拖 5 分钟）。"""
         self.assertGreater(an.CHILD_WATCH_INTERVAL_S, 2)
         self.assertLess(an.CHILD_WATCH_INTERVAL_S, an.heartbeat_interval_s())
+
+
+class TestLivenessFailsOpen(Base):
+    """判活取**两个 pid 的并集**，且方向 fail-open。
+
+    实测事故（2026-08-20，`b8839ea3` 报告）：`pid` 字段由每次 agentnet 调用写入，
+    而 `resolve_pid` 拿不到 `CLAUDE_PID` 时回退到 `os.getppid()`——那是短命 CLI 进程的
+    父进程，随手就死。同一时刻有 4 个实例 `pid` 已死、轮询器活着、心跳新鲜，
+    却全被判成 presumed-dead ⇒ **`check_deliverable` 拒收了投给活人的信**。
+    """
+
+    def fresh(self, **over: object) -> dict:
+        meta = {'status': an.STATUS_ACTIVE, 'last_active': an.now()}
+        meta.update(over)
+        return meta
+
+    def test_live_poller_outweighs_dead_pid(self) -> None:
+        """**这条是事故的直接回归**：轮询器活着就是活着，别被陈旧的 pid 拖下水。"""
+        meta = self.fresh(poller_pid=os.getpid(), pid=999999)
+        self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_ACTIVE)
+
+    def test_live_pid_alone_is_enough(self) -> None:
+        meta = self.fresh(pid=os.getpid(), poller_pid=999999)
+        self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_ACTIVE)
+
+    def test_both_dead_downgrades(self) -> None:
+        """两个都死才允许判死——保留原本要抓的"注册成功但主体崩了"那种壳。"""
+        meta = self.fresh(pid=999999, poller_pid=999998)
+        self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_PRESUMED_DEAD)
+
+    def test_no_pid_recorded_is_not_evidence_of_death(self) -> None:
+        """没有证据 ≠ 死亡证据。该由心跳判，不该由缺失判。"""
+        self.assertTrue(an.any_process_alive({'status': an.STATUS_ACTIVE}))
+
+    def test_stale_heartbeat_still_wins(self) -> None:
+        """fail-open 只针对进程证据；心跳真过期了照样判死。"""
+        old = an.now() - timedelta(seconds=an.dead_after_s() + 60)
+        meta = {'status': an.STATUS_ACTIVE, 'last_active': old, 'poller_pid': os.getpid()}
+        self.assertEqual(an.effective_status(meta, verify_pid=True), an.STATUS_PRESUMED_DEAD)
+
+    def test_deliverable_to_a_live_agent_with_stale_pid(self) -> None:
+        """端到端：这正是被拒收的那条路径。"""
+        self.register()
+        ctx = self.ctx()
+        an.merge_info(ctx.info_path, {'poller_pid': os.getpid(), 'pid': 999999,
+                                      'last_active': an.now()})
+        an.check_deliverable(ctx, self.agent_id, force=False)   # 不抛即通过
+
+
+class TestDeadChildNoticeIsHedged(Base):
+    """措辞必须与置信度匹配：把推断说成断言，会诱导对方扔掉正在进行的工作。"""
+
+    def text(self) -> str:
+        return an.render_dead_children({'aaaa1111-2222': 'final21-reviewer'})
+
+    def test_titled_as_an_inference(self) -> None:
+        self.assertIn('可能已退出', self.text())
+        self.assertNotIn('已经不在了', self.text())
+
+    def test_tells_you_to_verify_first(self) -> None:
+        text = self.text()
+        self.assertIn('agentnet who', text)
+        self.assertIn('别重开', text)
+
+    def test_drops_the_bogus_justification(self) -> None:
+        """初版写「协议本就要求每轮换新实例，所以重开不是退步」——
+
+        那条规则说的是**终审门**换人，不是**对拍中途**换人。它让误报显得无害，实际不是。
+        """
+        self.assertNotIn('不是退步', self.text())
 
 
 class TestProvenance(Base):
