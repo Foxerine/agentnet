@@ -3630,20 +3630,43 @@ def cmd_lock(args: argparse.Namespace) -> None:
 # 归档、恢复与 sweep
 # ══════════════════════════════════════════════════════════════════════════
 
+def archived_at_of(copy: Path) -> datetime:
+    """一份归档副本的归档时刻。读不出来时退回目录 mtime。
+
+    **不能按目录名排序**：裸 ``<id>`` 通常是第一次归档（最老），
+    但一旦被 restore 移走、该名字就空出来了，下次归档又会占用它——
+    于是裸名可能比带时间戳的更**新**。名字不是可靠的时间序，``archived_at`` 才是。
+    """
+    try:
+        meta, _ = read_info(copy / 'info.md')
+        stamp = meta.get('archived_at')
+        if isinstance(stamp, datetime):
+            return stamp if stamp.tzinfo else stamp.replace(tzinfo=now().tzinfo)
+    except SystemExit:
+        pass
+    try:
+        return datetime.fromtimestamp(copy.stat().st_mtime, tz=now().tzinfo)
+    except OSError:
+        return datetime.min.replace(tzinfo=now().tzinfo)
+
+
 def archived_copy(ws: Workspace, agent_id: str) -> Path | None:
-    """该 agent 在 ``archive/`` 下的目录；没有则 None。
+    """该 agent 在 ``archive/`` 下**最新的**那份副本；没有则 None。
 
     **不能只看 ``archive/<id>``**：同一个 id 二次归档时会落成
     ``<id>-<时间戳>``（见 :func:`archive_agent`——第一次归档的那份还在，不能覆盖）。
     只匹配裸 id 的判断会对"归档过两次"的 agent 说"没归档过"。
+
+    **取最新而不是取裸名**（2026-08-20 实测）：裸名优先曾让 ``restore`` 复活两天前的
+    旧快照、把 ``display_name`` 弄丢——对"判断存在"而言两者等价，对"恢复状态"不是。
     """
     if not ws.archive_dir.is_dir():
         return None
-    exact = ws.archive_dir / agent_id
-    if exact.is_dir():
-        return exact
-    stamped = sorted(d for d in ws.archive_dir.glob(f"{agent_id}-*") if d.is_dir())
-    return stamped[-1] if stamped else None
+    copies = [d for d in ws.archive_dir.glob(f"{agent_id}*")
+              if d.is_dir() and strip_archive_stamp(d.name) == agent_id]
+    if not copies:
+        return None
+    return max(copies, key=archived_at_of)
 
 
 def displace_hollow_shell(destination: Path, agent_id: str) -> Path | None:

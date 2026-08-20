@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -1919,6 +1920,42 @@ class TestRestoreAfterRepeatedArchiving(Base):
         self.archive_copy(self.agent_id, '20260819T120143', letters=3)
         an.cmd_restore(argparse.Namespace(target=self.agent_id))
         self.assertEqual(len(an.inbox_letters(self.ctx(), self.agent_id)), 5)
+
+    def snapshot(self, dir_name: str, display_name: str, days_ago: int) -> None:
+        """在 archive/ 下摆一份指定归档时刻的副本。"""
+        d = self.ctx().archive_dir / dir_name
+        (d / 'inbox').mkdir(parents=True, exist_ok=True)
+        an.write_doc(d / 'info.md',
+                     {'id': self.agent_id, 'display_name': display_name,
+                      'status': an.STATUS_ARCHIVED,
+                      'archived_at': an.now() - timedelta(days=days_ago)},
+                     '', an.INFO_FIELD_ORDER)
+
+    def test_restores_the_newest_snapshot_regardless_of_directory_name(self) -> None:
+        """恢复的必须是 **`archived_at` 最新**的那份，与目录叫什么无关。
+
+        实测：裸名优先让 restore 复活了两天前的旧快照、`display_name` 丢失。
+        而裸名**两种情况都可能**——它通常是第一次归档（最老），但被 restore 移走后
+        名字空出来，下次归档又会占用它。所以任何基于名字的启发式都是错的，
+        这里把**两种排列都测**，让名字排序无处藏身。
+        """
+        stamp = '20260818T134552'
+        for bare_days, stamped_days, winner in ((2, 0, '带时间戳的'), (0, 2, '裸名的')):
+            with self.subTest(bare_days=bare_days):
+                self.setUp_fresh_archive()
+                self.snapshot(self.agent_id, '裸名的', bare_days)
+                self.snapshot(f"{self.agent_id}-{stamp}", '带时间戳的', stamped_days)
+                an.cmd_restore(argparse.Namespace(target=self.agent_id))
+                meta, _ = an.read_info(self.ctx().info_path_of(self.agent_id))
+                self.assertEqual(meta.get('display_name'), winner,
+                                 '恢复的不是 archived_at 最新的那份')
+
+    def setUp_fresh_archive(self) -> None:
+        """清掉上一轮 subTest 留下的目录，让两种排列互不干扰。"""
+        for path in (self.ctx().agents_dir, self.ctx().archive_dir):
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+        self.ctx().archive_dir.mkdir(parents=True, exist_ok=True)
 
     def test_two_different_agents_still_ambiguous(self) -> None:
         """归并到 agent 之后仍然可能真的有歧义——那时才该拒绝。"""
