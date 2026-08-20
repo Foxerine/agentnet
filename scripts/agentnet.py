@@ -3767,9 +3767,17 @@ def cmd_sweep(args: argparse.Namespace) -> None:
     at = now()
     threshold = archive_after_s()
     victims: list[tuple[str, dict[str, Any], float, int, list[str]]] = []
+    spared: list[str] = []
     for agent_id, meta, _ in iter_agents(ctx):
         stale = stale_seconds(meta, at)
         if stale <= threshold:
+            continue
+        # 静默 ≠ 死亡。有活进程就放过——**归档比判死更狠**：它把 agent 从花名册上摘掉、
+        # 把未读信件一起埋进 archive/，而投给它的信从此被当场拒绝。
+        # 实测（2026-08-20）：`17948ac6` 三天内被归档 15 次、`defe499a` 10 次——
+        # 它们都在干活，只是埋头十分钟没调过 agentnet。
+        if process_evidence_of_life(meta):
+            spared.append(f"{agent_id[:8]}（静默 {int(stale // 60)} 分钟，但进程还活着）")
             continue
         unread = len(inbox_letters(ctx, agent_id))
         victims.append((agent_id, meta, stale, unread, held_locks(ctx, agent_id)))
@@ -3777,10 +3785,17 @@ def cmd_sweep(args: argparse.Namespace) -> None:
     if not victims:
         if not args.quiet:
             print(f"[OK] 无需归档——没有静默超过 {threshold // 60} 分钟的实例。")
+            if spared:
+                print(f"  （放过 {len(spared)} 个：{'；'.join(spared)}）")
         return
 
     lines = [f"# sweep 报告 — {at.isoformat()}", '',
              f"阈值：静默 > {threshold // 60} 分钟即归档。本次命中 {len(victims)} 个。", '']
+    if spared:
+        # 放过了谁必须写进报告：否则"命中 N 个"读起来像是全部超时者，
+        # 而实际上有一批被进程证据救下来了。
+        lines += [f"另有 {len(spared)} 个超时但**有活进程**，已放过："] + \
+                 [f"- {s}" for s in spared] + ['']
     for agent_id, meta, stale, unread, locks in victims:
         lines.append(f"## `{agent_id[:8]}` {meta.get('display_name') or ''}")
         lines.append(f"- 静默：{int(stale // 60)} 分钟（last_active={meta.get('last_active')}）")
@@ -3957,18 +3972,40 @@ def _args_restore(p: argparse.ArgumentParser) -> None:
             '并提醒重新启动轮询器；否则恢复出来的是个收不到信的空壳。'),
     add_args=_args_restore,
 )
+def archived_agent_ids(ws: Workspace, prefix: str) -> list[str]:
+    """归档目录里所有**以 prefix 开头的 agent id**（去掉时间戳后缀、去重）。
+
+    同一个 agent 二次归档会落成 ``<id>-<时间戳>``，所以裸数目录名会把
+    "一个 agent 的 15 份历史副本"误当成"15 个不同的 agent"。
+    """
+    ids = {strip_archive_stamp(d.name) for d in ws.archive_dir.iterdir()
+           if d.is_dir() and d.name.startswith(prefix)}
+    return sorted(ids)
+
+
+def strip_archive_stamp(name: str) -> str:
+    """``<uuid>-20260819T171531`` → ``<uuid>``；裸 uuid 原样返回。"""
+    return name.split('-20')[0] if name.count('-') > 4 else name
+
+
 def cmd_restore(args: argparse.Namespace) -> None:
     ctx = Ctx()
     if not ctx.archive_dir.is_dir():
         _die('本 workspace 没有归档目录')
-    candidates = [d for d in ctx.archive_dir.iterdir()
-                  if d.is_dir() and d.name.startswith(args.target)]
-    if not candidates:
+    # 先按 **agent** 归并，再谈唯一性。旧写法直接数目录，于是被归档过两次的 agent
+    # 永远"前缀不唯一"——连给出完整 uuid 都救不了它，而报错还把同一个截断串
+    # 印上十几遍，读的人拿不到任何可用于区分的信息。实测 6 个 agent 因此无法恢复，
+    # 它们旧副本里的未读信件被**永久掩埋**（重新注册只会拿到一个新的空目录）。
+    matched = archived_agent_ids(ctx, args.target)
+    if not matched:
         _die(f"归档里找不到 `{args.target}`")
-    if len(candidates) > 1:
-        _die(f"`{args.target}` 前缀不唯一：{', '.join(d.name[:12] for d in candidates)}")
-    source = candidates[0]
-    agent_id = source.name.split('-20')[0] if source.name.count('-') > 4 else source.name
+    if len(matched) > 1:
+        _die(f"`{args.target}` 匹配到 {len(matched)} 个不同的 agent："
+             f"{', '.join(m[:12] for m in matched)}。给一个更长的前缀。")
+    agent_id = matched[0]
+    source = archived_copy(ctx, agent_id)
+    if source is None:                      # archived_agent_ids 命中了就一定有
+        _die(f"归档里找不到 `{agent_id}`")
     destination = ctx.agents_dir / agent_id
     try:
         shell = displace_hollow_shell(destination, agent_id)
@@ -3980,6 +4017,17 @@ def cmd_restore(args: argparse.Namespace) -> None:
     for sub in ('inbox', 'read', 'sent'):
         (destination / sub).mkdir(parents=True, exist_ok=True)
     rescued, stuck = absorb_shell(shell, destination) if shell else (0, None)
+    # 把**其余历史副本**里的未读信也并回来。只恢复最新那份等于把更早副本里的信
+    # 永久埋掉——它们从未被读过，而 agent 重新注册只会拿到一个新的空目录。
+    from_older = 0
+    older_left: list[str] = []
+    for other in sorted(ctx.archive_dir.glob(f"{agent_id}*")):
+        if not other.is_dir() or strip_archive_stamp(other.name) != agent_id:
+            continue
+        moved, leftover = absorb_shell(other, destination)
+        from_older += moved
+        if leftover is not None:
+            older_left.append(leftover.name)
     merge_info(destination / 'info.md', {
         'status': STATUS_ACTIVE,
         'last_active': now(),
@@ -3994,6 +4042,13 @@ def cmd_restore(args: argparse.Namespace) -> None:
         fate = f"已留在 `{stuck.name}` 待人工确认" if stuck else '已删除'
         print(f"  路上挡着一个空壳目录（归档后仍在跑的轮询器写回来的）：{fate}"
               f"，救回其中 {rescued} 封信")
+    if from_older:
+        print(f"  从更早的历史副本里并回 {from_older} 封未读信"
+              f"（这些信曾被埋在旧归档里，永远送不到）")
+    if older_left:
+        # 不静默：搬不走的副本必须说出来，否则"已恢复"会盖住"还有东西没救回来"。
+        print(f"  [WARN] 这些历史副本里仍有搬不走的内容，请人工确认："
+              f"{', '.join(older_left)}")
     print(f"  未读信件 {unread} 封（归档期间投递会被拒绝，所以这些是归档前留下的）")
     print(f"  **它必须重新后台运行 `agentnet poll`** 才算真正回到可收信状态。")
 

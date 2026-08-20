@@ -1853,5 +1853,79 @@ class TestMultiRecipientSend(Base):
                         an.guard_text(item, f"参数 --{name.replace('_', '-')}")
 
 
+class TestRestoreAfterRepeatedArchiving(Base):
+    """被归档过多次的 agent **必须还能恢复**，且旧副本里的信不能被埋掉。
+
+    2026-08-20 实测：`cmd_restore` 自己重写了一遍前缀匹配（正确的解析早就在
+    `archived_copy` 里），于是二次归档产生的 `<id>-<时间戳>` 副本让它永远
+    "前缀不唯一"——**连完整 uuid 都救不了**。全网 6 个 agent 中招，
+    `17948ac6` 有 15 份副本。它们重新注册只会拿到一个新的空目录，
+    旧副本里的未读信件**永久掩埋**。
+    """
+
+    def archive_copy(self, agent_id: str, stamp: str, letters: int = 0) -> Path:
+        d = self.ctx().archive_dir / f"{agent_id}-{stamp}"
+        (d / 'inbox').mkdir(parents=True)
+        for i in range(letters):
+            (d / 'inbox' / f"2026{stamp}-sender-{i:04d}.md").write_text(
+                '+++\nfrom = "sender"\n+++\n正文', encoding='utf-8')
+        return d
+
+    def test_full_uuid_resolves_despite_many_copies(self) -> None:
+        self.register()
+        agent_id = self.agent_id
+        an.archive_agent(self.ctx(), agent_id, 'test', 'first')
+        for stamp in ('20260818T134552', '20260819T120143'):
+            self.archive_copy(agent_id, stamp)
+        an.cmd_restore(argparse.Namespace(target=agent_id))
+        self.assertTrue((self.ctx().agents_dir / agent_id / 'info.md').exists())
+
+    def test_prefix_still_resolves(self) -> None:
+        self.register()
+        an.archive_agent(self.ctx(), self.agent_id, 'test', 'first')
+        self.archive_copy(self.agent_id, '20260818T134552')
+        an.cmd_restore(argparse.Namespace(target=self.agent_id[:8]))
+        self.assertTrue((self.ctx().agents_dir / self.agent_id / 'info.md').exists())
+
+    def test_letters_in_older_copies_are_recovered(self) -> None:
+        """**这条是"永久掩埋"的直接回归**：旧副本里的信必须跟着回来。"""
+        self.register()
+        an.archive_agent(self.ctx(), self.agent_id, 'test', 'first')
+        self.archive_copy(self.agent_id, '20260818T134552', letters=2)
+        self.archive_copy(self.agent_id, '20260819T120143', letters=3)
+        an.cmd_restore(argparse.Namespace(target=self.agent_id))
+        self.assertEqual(len(an.inbox_letters(self.ctx(), self.agent_id)), 5)
+
+    def test_two_different_agents_still_ambiguous(self) -> None:
+        """归并到 agent 之后仍然可能真的有歧义——那时才该拒绝。"""
+        self.register()
+        an.archive_agent(self.ctx(), self.agent_id, 'test', 'first')
+        other = self.ctx().archive_dir / (self.agent_id[:8] + '-ffff-0000-0000-000000000000')
+        (other / 'inbox').mkdir(parents=True)
+        with self.assertRaises(SystemExit):
+            an.cmd_restore(argparse.Namespace(target=self.agent_id[:8]))
+
+
+class TestSweepSparesLiveProcesses(Base):
+    """静默超时但**进程还活着** ⇒ 不归档。归档比判死更狠，同一条不变式更该适用。"""
+
+    def stale_agent(self, **over: object) -> None:
+        self.register()
+        an.merge_info(self.ctx().info_path,
+                      {'last_active': an.now() - timedelta(seconds=an.archive_after_s() + 60),
+                       **over})
+
+    def test_live_poller_is_spared(self) -> None:
+        self.stale_agent(poller_pid=os.getpid())
+        an.cmd_sweep(argparse.Namespace(dry_run=False, quiet=True))
+        self.assertTrue(self.ctx().info_path.exists(), '有活进程却被归档了')
+
+    def test_truly_gone_is_still_archived(self) -> None:
+        """放过活的，不等于放过死的——归档本身必须还有效。"""
+        self.stale_agent(poller_pid=999998, pid=999999)
+        an.cmd_sweep(argparse.Namespace(dry_run=False, quiet=True))
+        self.assertFalse(self.ctx().info_path.exists(), '真的没进程了却没归档')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
