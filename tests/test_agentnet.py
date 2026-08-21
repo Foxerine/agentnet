@@ -1925,6 +1925,47 @@ class TestCommandRegistryWiring(Base):
             self.assertEqual(params, ['args'], f"`{cmd.name}` 的签名是 {params}")
 
 
+class TestUnackedRecordedBeforeConsume(Base):
+    """**durable 意图必须先于不可逆的状态推进**（设计哲学 §13）。
+
+    原顺序是 `consume()` → `record_unacked()`：consume 已把信 move 进 `read/`（不可逆），
+    而兜底登记还没写。此刻被 SIGTERM ⇒ 信件**状态已推进、显示已丢失、
+    无人知道它存在过**。窗口只有两条语句，但**轮询器每个回合边界都会被 kill**。
+
+    实测两例（2026-08-21，`7613dfbc` 自身 + `ae95fcde` 独立样本）：
+    信躺在 `read/` 里、对应那次后台任务输出 0 字节、agent 从未见过它。
+    三条观测全部吻合（在 read/ ✓ / 没进过回合 ✓ / mtime 保留查不出时刻 ✓）。
+    """
+
+    def test_source_records_unacked_before_consuming(self) -> None:
+        """读源码断言两个调用的**先后**——顺序本身就是契约，只能这么守。"""
+        src = Path(an.__file__).read_text(encoding='utf-8')
+        block = src.split('pending = inbox_letters(ctx, ctx.agent_id)')[1].split('moment =')[0]
+        # ⚠ 必须匹配**真实调用**而不是注释里的提及：第一版用 `record_unacked(` 搜，
+        # 命中了本块注释里的「原顺序是 consume() -> record_unacked()」——那句永远排在
+        # 最前面，于是断言恒真、变异不红。带上 `ctx,` 才只匹配调用点。
+        i_record = block.find('record_unacked(ctx,')
+        i_consume = block.find('consume(ctx, pending)')
+        self.assertGreater(i_record, -1, '投递块里找不到 record_unacked 的调用')
+        self.assertGreater(i_consume, -1, '投递块里找不到 consume 的调用')
+        self.assertLess(i_record, i_consume,
+                        'record_unacked 必须在 consume **之前**——'
+                        '否则 consume 与登记之间被 kill 会永久丢信')
+
+    def test_peek_does_not_move_letters(self) -> None:
+        """`peek_letters` 的全部价值在于**不移动**；一旦它开始移动就等于没修。"""
+        self.register()
+        ctx = self.ctx()
+        letter = ctx.home / 'inbox' / '20260821T000000-sender-abc.md'
+        letter.parent.mkdir(parents=True, exist_ok=True)
+        an.write_doc(letter, {'id': 'x', 'from': 'sender', 'subject': '主题'}, '正文',
+                     an.LETTER_FIELD_ORDER)
+        peeked = an.peek_letters([letter])
+        self.assertEqual(len(peeked), 1)
+        self.assertTrue(letter.exists(), 'peek 把信移走了——那就不是 peek')
+        self.assertEqual(peeked[0][0].get('subject'), '主题')
+
+
 class TestPartialDeliveryIsNotSilent(Base):
     """群发遇到一个不可投的收件人，**不能掐断整批**，也不能读起来像全部成功。
 

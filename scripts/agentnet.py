@@ -1902,6 +1902,24 @@ def consume(ctx: Ctx, paths: list[Path]) -> list[tuple[dict[str, Any], str, Path
     return out
 
 
+def peek_letters(paths: list[Path]) -> list[tuple[dict[str, Any], str, Path]]:
+    """解析信件但**不移动**它们 —— 供 :func:`record_unacked` 在 consume **之前**登记。
+
+    与 :func:`consume` 的唯一区别就是不 move。存在的理由是顺序：
+    **durable 意图必须先于不可逆的状态推进**（设计哲学 §13）。
+
+    解析失败的跳过——那种信 consume 也会跳过，登记它只会制造无法对账的条目。
+    """
+    out: list[tuple[dict[str, Any], str, Path]] = []
+    for path in paths:
+        try:
+            meta, body = parse_doc(path)
+        except SystemExit:
+            continue
+        out.append((meta, body, path))
+    return out
+
+
 def record_unacked(ctx: Ctx, items: list[tuple[dict[str, Any], str, Path]]) -> None:
     """把刚投递的信登记为**未确认**，交给 Stop 钩子兜底。
 
@@ -2175,11 +2193,21 @@ def cmd_poll(args: argparse.Namespace) -> None:
 
             pending = inbox_letters(ctx, ctx.agent_id)
             if pending:
+                # **先落 durable 意图，再推进状态**（设计哲学 §13）。
+                # 原顺序是 consume() -> record_unacked()，两者之间有一个丢失窗口：
+                # consume 已把信 move 进 read/（不可逆），而兜底登记还没写——
+                # 此刻被 SIGTERM，信件**状态已推进、显示已丢失、无人知道它存在过**。
+                #
+                # 窗口只有两条语句，但**轮询器每个回合边界都会被 kill**，小窗口必被打中。
+                # 实测两例（`7613dfbc` 自身 + `ae95fcde`）：信躺在 read/ 里、
+                # 对应那次后台任务输出 0 字节、agent 从未见过它。
+                #
+                # 反过来记的代价是**可能多记**（登记了却没来得及 consume）——
+                # 那种情况下信还在 inbox，下一轮照常 drain，登记项被正常清掉。
+                # **重复显示安全，丢失不安全。**
+                record_unacked(ctx, peek_letters(pending))
                 items = consume(ctx, pending)
                 if items:
-                    # 登记为未确认：poll 的输出是**可跳过的**（实测被整批跳过两次），
-                    # 真正的送达保证由 Stop 钩子在回合末兜底。
-                    record_unacked(ctx, items)
                     # 刷新心跳后再退出：给 agent 留出处理时间，别让它在处理途中被判死
                     merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': None},
                                expect=mine, create=False)
