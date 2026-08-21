@@ -1925,6 +1925,47 @@ class TestCommandRegistryWiring(Base):
             self.assertEqual(params, ['args'], f"`{cmd.name}` 的签名是 {params}")
 
 
+class TestWatchIsPollWithoutTheExit(Base):
+    """`watch` 与 `poll` 的**唯一**差别是投递后退不退出——用参数控制，不复制函数。
+
+    2026-08-21 实测定案：`poll` 用的 `run_in_background` 是为「一次通知」设计的原语，
+    收信却是「每次发生都通知、无限期」。对照数据：
+    `Monitor(persistent=true)` **27 分钟 / 约 55 个回合边界 / 零被杀**，
+    同期 `poll` **每个边界必被杀**。
+    """
+
+    def test_both_commands_share_one_loop(self) -> None:
+        """两个处理函数都必须落到 `poll_loop`——复制出来的两份必然漂移。"""
+        src = Path(an.__file__).read_text(encoding='utf-8')
+        for name, flag in (('cmd_poll', 'stream=False'), ('cmd_watch', 'stream=True')):
+            body = src.split(f"def {name}(args: argparse.Namespace) -> None:")[1][:200]
+            self.assertIn('poll_loop(args,', body, f"{name} 没有复用 poll_loop")
+            self.assertIn(flag, body, f"{name} 没传 {flag}")
+
+    def test_watch_flushes_every_event(self) -> None:
+        """**flush 必须显式**：stdout 被管道接走时是块缓冲的，不 flush 事件会滞留缓冲区。
+
+        Monitor 文档专门警告过这点——而"事件卡在缓冲区"的症状与"监视器死了"
+        **完全一样**（都是没有事件），是会伪装成另一种故障的那类缺陷。
+        """
+        src = Path(an.__file__).read_text(encoding='utf-8')
+        loop = src.split('def poll_loop(')[1].split('\n@command')[0]
+        stream_prints = [ln for ln in loop.splitlines()
+                         if 'print(' in ln and 'render_' in ln]
+        self.assertTrue(stream_prints, '没找到任何投递输出')
+        flushed = [ln for ln in stream_prints if 'flush=True' in ln]
+        self.assertGreaterEqual(len(flushed), 2,
+                                'stream 模式的每处事件输出都要 flush=True')
+
+    def test_watch_is_registered_and_documented(self) -> None:
+        names = [c.name for c in an.COMMANDS]
+        self.assertIn('watch', names)
+        watch = next(c for c in an.COMMANDS if c.name == 'watch')
+        self.assertIn('不退出', watch.detail or '', 'detail 没说清与 poll 的差别')
+        self.assertIn('自己 drain', watch.detail or '',
+                      'detail 必须写明 watch 自己 drain——否则会与 Stop 钩子抢事件')
+
+
 class TestUnackedRecordedBeforeConsume(Base):
     """**durable 意图必须先于不可逆的状态推进**（设计哲学 §13）。
 

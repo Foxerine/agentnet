@@ -2132,17 +2132,17 @@ def render_dead_children(dead: dict[str, str]) -> str:
     return '\n'.join(lines)
 
 
-@command(
-    'poll',
-    '后台长轮询：收到信即打印全文并退出（从而唤醒你）；兼任心跳',
-    'agentnet poll [--interval 2]',
-    detail=('**用 run_in_background 跑它。** 命中即退出，harness 因进程退出唤醒你，信件全文已在上下文里。\n'
-            '它同时是你的心跳来源——每 5 分钟写一次 last_active。心跳停 ⟺ 轮询器停 ⟺ 收不到信 ⟺ 事实上已死，\n'
-            '三者同生共死，所以不存在"心跳还在但收不到信"的假活状态。\n'
-            '**每次被唤醒后都要重新跑一遍**（见退出时的提示）。'),
-    add_args=_args_poll,
-)
-def cmd_poll(args: argparse.Namespace) -> None:
+def poll_loop(args: argparse.Namespace, *, stream: bool) -> None:
+    """收信主循环。``stream`` 决定**投递之后退不退出**——两种唤醒原语的唯一差别。
+
+    ``stream=False``（``agentnet poll``）：投递即退出，靠 harness"后台任务结束"的
+    通知唤醒 agent，因此**每收一次信就得重挂一次**。
+    ``stream=True``（``agentnet watch``）：投递即输出一行事件、**进程继续跑**，
+    靠 harness 的流式事件通知唤醒，**挂一次就够**。
+
+    **为什么不复制成两个函数**：差别只有几处 return，复制出来的两份必然漂移
+    （今天已经为"同一条指引散落三处、只改一处"付过两次代价）。行为模式用参数。
+    """
     ctx = Ctx()
     if not ctx.info_path.exists():
         # 已归档 ≠ 出错。`agentnet exit` 之后再挂轮询器是**多余但无害**的，
@@ -2208,12 +2208,22 @@ def cmd_poll(args: argparse.Namespace) -> None:
                 record_unacked(ctx, peek_letters(pending))
                 items = consume(ctx, pending)
                 if items:
-                    # 刷新心跳后再退出：给 agent 留出处理时间，别让它在处理途中被判死
-                    merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': None},
-                               expect=mine, create=False)
-                    print(render_letters(items))
-                    print(REARM_NOTICE)
-                    return
+                    if stream:
+                        # watch：出一次事件就够了，**进程继续跑** ⇒ 不清 poller_pid、
+                        # 不提示重挂（本就不需要重挂，那正是这个模式的全部意义）。
+                        # **flush 必须显式**：stdout 被管道接走时是块缓冲的，
+                        # 不 flush 事件会滞留在缓冲区里——Monitor 文档专门警告过这点。
+                        merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': me},
+                                   expect=mine, create=False)
+                        print(render_letters(items), flush=True)
+                        last_beat = time.monotonic()
+                    else:
+                        # 刷新心跳后再退出：给 agent 留出处理时间，别让它在处理途中被判死
+                        merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': None},
+                                   expect=mine, create=False)
+                        print(render_letters(items))
+                        print(REARM_NOTICE)
+                        return
             moment = time.monotonic()
             # 等一个已经死掉的实例，是这套协议里唯一会**永远卡住**的状态：
             # poll 刻意无超时（对方一轮可能耗时数小时），所以没有任何东西会打破它。
@@ -2221,10 +2231,17 @@ def cmd_poll(args: argparse.Namespace) -> None:
                 last_child_check = moment
                 gone = dead_among(ctx, watched_children)
                 if gone:
-                    merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': None},
-                               expect=mine, create=False)
-                    print(render_dead_children(gone))
-                    return
+                    if stream:
+                        print(render_dead_children(gone), flush=True)
+                        # 报过一次就从盯梢名单里摘掉——否则每个检查周期重复报同一批，
+                        # 而 watch 不退出，那会变成无限刷屏。
+                        watched_children = {aid: name for aid, name in watched_children.items()
+                                            if aid not in gone}
+                    else:
+                        merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': None},
+                                   expect=mine, create=False)
+                        print(render_dead_children(gone))
+                        return
 
             if moment - last_beat >= heartbeat_interval_s():
                 merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': me},
@@ -2242,8 +2259,12 @@ def cmd_poll(args: argparse.Namespace) -> None:
             if Path(__file__).stat().st_mtime != script_stamp:
                 merge_info(ctx.info_path, {'last_active': now(), 'poller_pid': None},
                            expect=mine, create=False)
-                print('[RELOAD] agentnet 脚本已更新，本轮询器跑的是旧代码，现在退出。\n'
-                      '         **立刻重新后台运行 `agentnet poll`** 以载入新版本。')
+                # RELOAD 两种模式都必须退出（旧代码不该继续跑），只是重启方式不同。
+                restart = ('**立刻重新挂上 Monitor 跑 `agentnet watch`**'
+                           if stream else
+                           '**立刻重新后台运行 `agentnet poll`**')
+                print(f'[RELOAD] agentnet 脚本已更新，本进程跑的是旧代码，现在退出。\n'
+                      f'         {restart} 以载入新版本。', flush=True)
                 return
             if deadline is not None and moment >= deadline:
                 merge_info(ctx.info_path, {'poller_pid': None}, expect=mine, create=False)
@@ -2253,6 +2274,44 @@ def cmd_poll(args: argparse.Namespace) -> None:
     except KeyboardInterrupt:
         merge_info(ctx.info_path, {'poller_pid': None}, expect=mine, create=False)
         raise
+
+
+@command(
+    'poll',
+    '后台长轮询：收到信即打印全文并退出（从而唤醒你）；兼任心跳',
+    'agentnet poll [--interval 2]',
+    detail=('⚠ **若你的 harness 有流式监视器（Claude Code 的 Monitor），优先用 `agentnet watch`**——\n'
+            'poll 命中即退出，所以**每收一次信就得重挂一次**，而重挂那一下常撞上回合边界的清理。\n'
+            'poll 保留给**没有**流式原语的 harness。\n'
+            '**用 run_in_background 跑它。** 命中即退出，harness 因进程退出唤醒你，信件全文已在上下文里。\n'
+            '它同时是你的心跳来源——每 5 分钟写一次 last_active。\n'
+            '**每次被唤醒后都要重新跑一遍**（见退出时的提示）。'),
+    add_args=_args_poll,
+)
+def cmd_poll(args: argparse.Namespace) -> None:
+    poll_loop(args, stream=False)
+
+
+@command(
+    'watch',
+    '流式收信：每封信输出一行事件，**进程继续跑**（挂一次就够）；兼任心跳',
+    'agentnet watch [--interval 2]',
+    detail=('**用 harness 的流式监视器跑它**（Claude Code 是 `Monitor(persistent=true)`）。\n'
+            '与 `poll` 的唯一差别是**投递之后不退出** —— 于是**不需要重挂**。\n'
+            '\n'
+            '为什么要有它（2026-08-21 实测）：`poll` 用的 `run_in_background` 是为\n'
+            '「**一次通知**」设计的原语，收信却是「**每次发生都通知、无限期**」——选型不匹配。\n'
+            '后果是每投递一次就退出、必须重挂，而 harness 在会话结束 / compact / 贴近上下文\n'
+            '上限时会 SIGTERM 掉被追踪的后台任务，于是变成「被杀→唤醒→重挂→再被杀」烧回合。\n'
+            '实测对照：`Monitor(persistent=true)` **27 分钟、约 55 个回合边界、零被杀**，\n'
+            '而同期 `poll` 每个边界必被杀。\n'
+            '\n'
+            '⚠ **它自己 drain**。别让 Stop 钩子和它同时消费收件箱——钩子会抢走事件\n'
+            '（实测钩子赢过竞态）。钩子的 drain 是 watch **没在跑时**的兜底。'),
+    add_args=_args_poll,
+)
+def cmd_watch(args: argparse.Namespace) -> None:
+    poll_loop(args, stream=True)
 
 
 POLLER_STARTUP_GRACE_S = 1.5
