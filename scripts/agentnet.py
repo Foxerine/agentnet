@@ -855,8 +855,13 @@ def unarmed_chunk(blocked_so_far: int) -> str:
             "    那多半是会话贴着上下文上限、harness 每回合都走清理路径。"
             "等 compact 之后或新会话再挂回来。\n"
             "    以上两种例外都不适用时，往下做：\n"
-            "    立刻用**你的 harness 的后台机制**运行 `agentnet poll`"
-            "（Claude Code 是 Bash 工具的 run_in_background）——\n"
+            "    ⭐ **首选流式监视器**（Claude Code）：`Monitor(command='agentnet watch', "
+            "persistent=true)`\n"
+            "       —— 挂一次就够，投递后进程继续跑，**不必每收一封信就重挂**。\n"
+            "    没有流式原语的 harness 才回退到 `agentnet poll`"
+            "（用后台任务机制跑，命中即退出、需重挂）。\n"
+            "    ⚠ **已经在跑 `watch` 就别再挂 `poll`** —— 后者会顶掉前者，"
+            "把你送回「被杀→重挂」的循环。\n"
             "    自己用 `&` / `nohup` 挂**不算**：那种进程 harness 追踪不到，"
             "它退出时唤不醒你。\n"
             "    挂完用 `agentnet whoami` 确认显示「poller: 运行中」——"
@@ -866,8 +871,11 @@ def unarmed_chunk(blocked_so_far: int) -> str:
 def whoami_unarmed_text() -> str:
     """``whoami`` 里"轮询器未运行"那几行。**独立成函数是为了可测**——
     测试读到的必须是生产真正打印的那份，不是副本。"""
-    return ("poller     : **未运行** —— 空闲时收不到信，须后台跑 `agentnet poll`\n"
-            f"             ⚠ 但{LOOP_EXCEPTION_LINE}")
+    return ("poller     : **未运行** —— 空闲时收不到信。首选 "
+            "`Monitor(command='agentnet watch', persistent=true)`（挂一次就够）；\n"
+            "             没有流式原语的 harness 才回退 `agentnet poll`。"
+            "**已在跑 watch 就别挂 poll**——会顶掉它。\n"
+            f"             ⚠ 另外，{LOOP_EXCEPTION_LINE}")
 
 
 def process_evidence_of_life(meta: dict[str, Any]) -> bool:
@@ -1190,6 +1198,62 @@ def cmd_whoami(args: argparse.Namespace) -> None:
         print(whoami_unarmed_text())
 
 
+STALLED_UNREAD_MIN = 30
+"""未读信要多老才**开始**参与"疑似卡死"判定（分钟）。
+
+取 30 而不是更小：**一个回合本来就可能很长**。实测（2026-08-21 全网 28 实例）
+`d4bbb87f` 未读 **64 分钟**而心跳只静默 **1 分钟**——那是正常长回合，绝不能标。
+所以未读时长单独**永远不构成**判据，它只是两个必要条件之一。
+"""
+
+
+def stalled_hint(meta: dict[str, Any], unread_age_min: float | None, at: datetime) -> str:
+    """"疑似卡死"标注。**两个信号必须同时成立**，否则返回空。
+
+    ``未读信很老`` 测的**不是死活**，而是"自这封信送达以来**有没有跨过回合边界**"
+    ——Stop 钩子每回合 drain 一次，``watch`` 更是随时 drain。所以：
+
+    ==================  ==============  ==========================================
+    未读信              心跳            含义
+    ==================  ==============  ==========================================
+    很老                **新鲜**        **长回合中** —— 活着，只是暂时不可达
+    很老                **陈旧**        **疑似卡死** ← 只有这一格值得标
+    无                  任意            正常 / 空闲
+    ==================  ==============  ==========================================
+
+    实测支撑（2026-08-21）：`b85dfcfb` 未读 150 分钟 + 静默 152 分钟 + CPU 0.6 s/min
+    （正常干活约 4 s/min），三信号一致；其拉起方据此 kill 重开，确认卡死。
+    同期 `d4bbb87f` 未读 64 分钟但心跳 1 分钟 —— 正常长回合，本函数不标它。
+
+    ⛔ **刻意不叫 "dead"、也刻意不给出动作建议**：写着 dead 的列会让人直接 kill，
+    而 kill 一个正在跑 40 分钟测试的实例代价远大于多等十分钟（`6570c62b` 的告诫）。
+    **判死仍然需要人看一眼**，这里只负责把"值得看一眼的那几个"挑出来。
+    """
+    if unread_age_min is None or unread_age_min < STALLED_UNREAD_MIN:
+        return ''
+    if stale_seconds(meta, at) < dead_after_s():
+        return ''          # 心跳新鲜 ⇒ 长回合，不是卡死
+    return '疑似卡死'
+
+
+def oldest_unread_min(ws: Workspace, agent_id: str, at: datetime) -> float | None:
+    """收件箱里**最老**那封未读信的年龄（分钟）；没有未读则 None。"""
+    oldest: float | None = None
+    for path in inbox_letters(ws, agent_id):
+        try:
+            meta, _ = parse_doc(path)
+        except SystemExit:
+            continue
+        created = meta.get('created_at')
+        if not isinstance(created, datetime):
+            continue
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=at.tzinfo)
+        age = (at - created).total_seconds() / 60
+        oldest = age if oldest is None else max(oldest, age)
+    return oldest
+
+
 def _args_who(p: argparse.ArgumentParser) -> None:
     p.add_argument('--topic', help='只列认领该主题的成员')
     p.add_argument('--alive', action='store_true', help='只列 active 成员')
@@ -1209,8 +1273,9 @@ def cmd_who(args: argparse.Namespace) -> None:
     # 查别人的 workspace 时用纯目录视图，绝不在对方目录里解析/落地自己的身份
     target: Workspace = ctx if not args.workspace or args.workspace == ctx.slug else Workspace(args.workspace)
     my_id = ctx.agent_id if target is ctx else None
-    rows: list[tuple[str, str, str, str, str]] = []
+    rows: list[tuple[str, str, str, str, str, str]] = []
     at = now()
+    flagged = 0
     for agent_id, meta, _ in iter_agents(target, include_archived=args.include_archived):
         status = effective_status(meta, at, verify_pid=True)
         if args.alive and status != STATUS_ACTIVE:
@@ -1220,11 +1285,14 @@ def cmd_who(args: argparse.Namespace) -> None:
             continue
         stale = stale_seconds(meta, at)
         stale_txt = '-' if stale == float('inf') else f"{int(stale // 60)}m"
+        hint = stalled_hint(meta, oldest_unread_min(target, agent_id, at), at)
+        flagged += 1 if hint else 0
         me = ' *' if agent_id == my_id else ''
         rows.append((
             agent_id[:8] + me,
             status,
             stale_txt,
+            hint or '',
             str(meta.get('display_name') or '-'),
             ', '.join(topics) if topics else '-',
         ))
@@ -1232,13 +1300,27 @@ def cmd_who(args: argparse.Namespace) -> None:
     if not rows:
         print(f"（workspace {target.slug} 下没有匹配的成员）")
         return
-    headers = ('AGENT', 'STATUS', '静默', '名称', '主题')
+    headers = ('AGENT', 'STATUS', '静默', '', '名称', '主题')
     widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
     print(f"workspace: {target.slug}   （* = 你自己）")
     print('  '.join(h.ljust(widths[i]) for i, h in enumerate(headers)))
     print('  '.join('-' * widths[i] for i in range(len(headers))))
     for row in rows:
-        print('  '.join(row[i].ljust(widths[i]) for i in range(len(headers))))
+        print('  '.join(row[i].ljust(widths[i]) for i in range(len(headers))).rstrip())
+    if flagged:
+        # **同期对照是判据的一部分，不是展示优化**（`ae95fcde` 的两次误判都源于"只看它一个"：
+        # 静默 733 分钟那次全网都在静默 ⇒ 环境现象；静默 86 分钟那次多数实例 0–8 分钟 ⇒ 个体故障。
+        # 同样量级、含义相反）。所以把同期中位数一并印出来，让读的人自己看得见基线。
+        median = sorted(stale_seconds(m, at) for _, m, _ in
+                        iter_agents(target, include_archived=args.include_archived))
+        mid = median[len(median) // 2] / 60 if median else 0
+        print()
+        print(f"[i] {flagged} 个标为「疑似卡死」：**未读信 > {STALLED_UNREAD_MIN} 分钟"
+              f"且心跳超过 {dead_after_s() // 60} 分钟阈值**——两条同时成立才标。")
+        print(f"    同期全网静默中位数 {mid:.0f}m。⚠ **同期对照是判据的一部分**："
+              f"若这个中位数本身很高，那多半是环境现象（如用户离线），不是个体故障。")
+        print(f"    ⛔ 这不是死亡判定。它只是「值得你看一眼」——"
+              f"确认请查 CPU 增量（干活约 4s/min，卡死约 0.3s/min）。")
 
 
 @command(

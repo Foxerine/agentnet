@@ -1215,10 +1215,30 @@ class TestUnarmedNoticeOrdering(Base):
         return json.loads(buffer.getvalue())['hookSpecificOutput']['additionalContext']
 
     def test_verify_comes_before_the_imperative(self) -> None:
+        """⚠ 锚点用「立刻」这个**行动指令的语义标记**，不用某条具体命令的名字。
+
+        原锚点是字面量 `run_in_background`；2026-08-21 把行动指令改成
+        「首选 Monitor(agentnet watch)、回退 poll」时那个字面量消失了，
+        测试直接 ValueError。**守的契约没变（先复核、再动手），碎的只是锚点。**
+        ⇒ 锚在**语义**上，命令名换了也不会误报。
+        """
         text = self.notice()
         verify_at = text.index('whoami')
-        arm_at = text.index('run_in_background')
+        arm_at = text.index('往下做')      # 行动指令段的固定开头
         self.assertLess(verify_at, arm_at, '「先复核」必须排在「去挂上」之前')
+
+    def test_recommends_watch_over_poll(self) -> None:
+        """⛔ 未挂载提示**不能**把人劝回 `poll`——那会顶掉正在跑的 `watch`。
+
+        `ae95fcde` 2026-08-21 报告：切到 watch 后仍被钩子劝去跑 poll。
+        它因为先读过通知才没照做；**没有那个上下文的实例会照做**，
+        于是被送回「被杀 → 重挂」的循环——即刚修好的那个问题。
+        """
+        text = self.notice()
+        self.assertIn('agentnet watch', text, '未挂载提示没提 watch')
+        self.assertLess(text.index('agentnet watch'), text.index('agentnet poll'),
+                        'watch 必须排在 poll 之前——它才是首选')
+        self.assertIn('顶掉', text, '没警告「已在跑 watch 时挂 poll 会顶掉它」')
 
     def test_warns_against_double_arming(self) -> None:
         self.assertIn('别重挂', self.notice())
@@ -1923,6 +1943,56 @@ class TestCommandRegistryWiring(Base):
         for cmd in an.COMMANDS:
             params = list(inspect.signature(cmd.handler).parameters)
             self.assertEqual(params, ['args'], f"`{cmd.name}` 的签名是 {params}")
+
+
+class TestStalledHint(Base):
+    """「疑似卡死」必须**两个信号同时成立**——用例直接取自 2026-08-21 的真实数据。
+
+    「未读信很老」测的**不是死活**，而是"自这封信送达以来有没有跨过回合边界"
+    （Stop 钩子每回合 drain，`watch` 更是随时 drain）。所以它单独永远不构成判据。
+    """
+
+    def meta(self, silent_min: float) -> dict:
+        return {'status': an.STATUS_ACTIVE,
+                'last_active': an.now() - timedelta(minutes=silent_min)}
+
+    def test_long_turn_is_not_flagged(self) -> None:
+        """**真实实例 `d4bbb87f`：未读 64 分钟、心跳只静默 1 分钟 —— 正常长回合。**
+
+        这条是本判据最重要的负例。回合内可以反复调 agentnet（刷心跳），
+        但不跨回合边界就不会 drain。⛔ 标它 = 建议 kill 一个正在干活的实例。
+        """
+        self.assertEqual(
+            an.stalled_hint(self.meta(silent_min=1), unread_age_min=64, at=an.now()), '')
+
+    def test_stalled_is_flagged(self) -> None:
+        """**真实实例 `b85dfcfb`：未读 150 分钟 + 静默 152 分钟。**
+
+        其拉起方据此核 CPU（0.6 s/min vs 干活约 4 s/min）后 kill 重开，确认卡死。
+        """
+        self.assertEqual(
+            an.stalled_hint(self.meta(silent_min=152), unread_age_min=150, at=an.now()),
+            '疑似卡死')
+
+    def test_stale_heartbeat_alone_is_not_enough(self) -> None:
+        """光心跳陈旧不标——那只是空闲，全网夜间大批实例都这样。"""
+        self.assertEqual(
+            an.stalled_hint(self.meta(silent_min=999), unread_age_min=None, at=an.now()), '')
+
+    def test_fresh_unread_is_not_enough(self) -> None:
+        """信刚到、还没到回合边界，属正常。"""
+        self.assertEqual(
+            an.stalled_hint(self.meta(silent_min=999), unread_age_min=2, at=an.now()), '')
+
+    def test_hint_never_says_dead_and_never_suggests_kill(self) -> None:
+        """⛔ 措辞红线：写着 dead 的列会让人**直接 kill**。
+
+        `6570c62b` 的告诫：kill 一个正在跑 40 分钟测试的实例，代价远大于多等十分钟。
+        ⇒ 标注只负责挑出"值得看一眼的"，**判死仍然需要人看一眼**。
+        """
+        hint = an.stalled_hint(self.meta(silent_min=200), unread_age_min=200, at=an.now())
+        for banned in ('dead', 'DEAD', '已死', 'kill', '重开'):
+            self.assertNotIn(banned, hint, f'标注里不该出现「{banned}」')
 
 
 class TestWatchIsPollWithoutTheExit(Base):
