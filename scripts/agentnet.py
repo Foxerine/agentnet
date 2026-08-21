@@ -824,6 +824,45 @@ LOOP_EXCEPTION_LINE = (
 """
 
 
+def unarmed_chunk(blocked_so_far: int) -> str:
+    """Stop 钩子里"未挂载"那段提示。**拦满配额后缩成一行。**
+
+    ``UNARMED_BLOCK_LIMIT`` 原先只限制"拦不拦"，**没限制"发多长"**——
+    拦满之后每回合照样注入上千字。实测代价：harness 因**连续 9 次 hook 阻断**
+    强制结束回合，而那 9 个回合读的全是同一段全文。
+
+    拦满仍未挂上，意味着对方要么**有意不挂**（死循环例外，见
+    :data:`LOOP_EXCEPTION_LINE`），要么确实挂不上——两种情况都已经读过一遍
+    并做了决定，重复只是噪声。⇒ 缩成一行：保留可见性与恢复方式，不再消耗回合。
+    """
+    if blocked_so_far >= UNARMED_BLOCK_LIMIT:
+        return (f"[i] 轮询器仍未挂载（已提示过 {UNARMED_BLOCK_LIMIT} 次，不再重复全文）。"
+                "信件照常每回合被本钩子 drain，**不会失联**；想挂回来跑 `agentnet poll`。")
+    return ("[!] 我这一侧看不到运行中的轮询器。\n"
+            "    **先复核，再动手**：`agentnet whoami` —— 若它显示「poller: 运行中」，"
+            "通常说明已经挂着了，**别重挂**（重挂会顶掉正在跑的那个）。\n"
+            "    **唯一的例外**：若你的 harness 通知过「那个后台任务被停止/杀死」，"
+            "那就**照样重挂**——\n"
+            "    进程可能还活着（于是这里显示「运行中」），但它已经不被追踪，"
+            "退出时唤不醒你。agentnet 看不到追踪状态，只有你看得到。\n"
+            "    确认确实没挂，再往下做：\n"
+            "    现在还没事——你在干活时信件照常送达（本钩子每回合 drain 一次），"
+            "心跳也随每次 agentnet 调用刷新。\n"
+            f"    **但你一旦转入空闲就叫不醒了**：{dead_after_s() // 60} 分钟后判死、"
+            "别人投信给你会被当场拒绝。\n"
+            "    所以要在**结束本回合之前**挂上——而不是等想起来。\n"
+            f"    ⚠ **另一个例外**：{LOOP_EXCEPTION_LINE}\n"
+            "    那多半是会话贴着上下文上限、harness 每回合都走清理路径。"
+            "等 compact 之后或新会话再挂回来。\n"
+            "    以上两种例外都不适用时，往下做：\n"
+            "    立刻用**你的 harness 的后台机制**运行 `agentnet poll`"
+            "（Claude Code 是 Bash 工具的 run_in_background）——\n"
+            "    自己用 `&` / `nohup` 挂**不算**：那种进程 harness 追踪不到，"
+            "它退出时唤不醒你。\n"
+            "    挂完用 `agentnet whoami` 确认显示「poller: 运行中」——"
+            "**发出命令不等于挂上了**。")
+
+
 def whoami_unarmed_text() -> str:
     """``whoami`` 里"轮询器未运行"那几行。**独立成函数是为了可测**——
     测试读到的必须是生产真正打印的那份，不是副本。"""
@@ -2281,30 +2320,7 @@ def cmd_drain(args: argparse.Namespace) -> None:
             "让你自己对账；只提醒一次。）")
         merge_info(ctx.info_path, {'unacked_letters': None}, create=False)
     if not armed:
-        chunks.append("[!] 我这一侧看不到运行中的轮询器。\n"
-                      "    **先复核，再动手**：`agentnet whoami` —— 若它显示「poller: 运行中」，"
-                      "通常说明已经挂着了，**别重挂**（重挂会顶掉正在跑的那个）。\n"
-                      "    **唯一的例外**：若你的 harness 通知过「那个后台任务被停止/杀死」，"
-                      "那就**照样重挂**——\n"
-                      "    进程可能还活着（于是这里显示「运行中」），但它已经不被追踪，"
-                      "退出时唤不醒你。agentnet 看不到追踪状态，只有你看得到。\n"
-                      "    确认确实没挂，再往下做：\n"
-                      "    现在还没事——你在干活时信件照常送达（本钩子每回合 drain 一次），"
-                      "心跳也随每次 agentnet 调用刷新。\n"
-                      f"    **但你一旦转入空闲就叫不醒了**：{dead_after_s() // 60} 分钟后判死、"
-                      "别人投信给你会被当场拒绝。\n"
-                      "    所以要在**结束本回合之前**挂上——而不是等想起来。\n"
-                      f"    ⚠ **另一个例外**：{LOOP_EXCEPTION_LINE}\n"
-                      "    那多半是会话贴着上下文上限、harness 每回合都走清理路径。"
-                      "等 compact 之后或新会话再挂回来；\n"
-                      "    **本提示会继续出现，忽略它即可。**\n"
-                      "    以上两种例外都不适用时，往下做：\n"
-                      "    立刻用**你的 harness 的后台机制**运行 `agentnet poll`"
-                      "（Claude Code 是 Bash 工具的 run_in_background）——\n"
-                      "    自己用 `&` / `nohup` 挂**不算**：那种进程 harness 追踪不到，"
-                      "它退出时唤不醒你。\n"
-                      "    挂完用 `agentnet whoami` 确认显示「poller: 运行中」——"
-                      "**发出命令不等于挂上了**。")
+        chunks.append(unarmed_chunk(blocked_so_far))
     if not chunks:
         if args.hook:
             print('{}')

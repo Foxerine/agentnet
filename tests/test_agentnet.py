@@ -544,6 +544,23 @@ class TestRearmNotice(Base):
         self.assertIn(an.LOOP_EXCEPTION_LINE, an.REARM_NOTICE, '死循环例外缺失')
         self.assertNotIn('只有它说未运行才重挂', an.REARM_NOTICE)
 
+    def test_full_notice_stops_repeating_after_the_block_budget(self) -> None:
+        """拦满配额后**不再重发全文**——只留一行。
+
+        `UNARMED_BLOCK_LIMIT` 原先只限制"拦不拦"，**没限制"发多长"**：
+        拦满之后每回合照样注入上千字。实测代价：harness 因连续 9 次 hook 阻断
+        强制结束回合，**那 9 个回合全在读同一段全文**。
+
+        拦满仍未挂上，意味着对方要么**有意不挂**（死循环例外），要么确实挂不上——
+        两种情况都已经读过一遍并做了决定，重复只是噪声。
+        """
+        long_notice = an.unarmed_chunk(0)
+        brief = an.unarmed_chunk(an.UNARMED_BLOCK_LIMIT)
+        self.assertGreater(len(long_notice), 400, '首次提示应当是完整版')
+        self.assertLess(len(brief), 200, '拦满后仍在重发全文')
+        self.assertIn('agentnet poll', brief, '缩短版丢了恢复方式')
+        self.assertIn('不会失联', brief, '缩短版丢了"不挂也收得到信"这条关键事实')
+
     def test_every_rearm_prompt_carries_the_loop_exception(self) -> None:
         """**给重挂指引的每一处都必须带死循环例外**——只补一处等于没补。
 
