@@ -1203,13 +1203,51 @@ def cmd_whoami(args: argparse.Namespace) -> None:
         print(whoami_unarmed_text())
 
 
-STALLED_UNREAD_MIN = 30
+STALLED_UNREAD_MIN = 120
 """未读信要多老才**开始**参与"疑似卡死"判定（分钟）。
 
-取 30 而不是更小：**一个回合本来就可能很长**。实测（2026-08-21 全网 28 实例）
-`d4bbb87f` 未读 **64 分钟**而心跳只静默 **1 分钟**——那是正常长回合，绝不能标。
-所以未读时长单独**永远不构成**判据，它只是两个必要条件之一。
+**未读时长单独永远不构成判据**，它只是两个必要条件之一（另一个是心跳超阈）。
+
+**为什么是 120 而不是最初猜的 30**（2026-08-22 按数据调整）：
+`81cfd2ac` 指出一类系统性误标——**长回合内完全不调 agentnet 的实例**，
+心跳照样超阈、未读照样积压，两条同时成立却是健康的。
+⚠ 它说得对：这两个指标合起来测的其实是**"多久没调用过 agentnet"**，
+不是"是否卡死"。（我最初的反例 `d4bbb87f` 之所以没被误标，
+只是因为它**在回合内调过** agentnet——挡不住完全不调的那类。）
+
+⇒ 于是去看真实分布，得到一个**双峰、中间空档**的结果（2026-08-22 全网）：
+
+    1572 / 1462 / 1428 / 1294 / 1284 分钟   ← 全部 21 小时以上
+       2 分钟                                ← 唯一的另一端
+
+**长回合产生不了 20 小时的未读。** 阈值取 30 / 60 / 120 / 180 在这批数据上
+标注结果**完全相同**，所以提高阈值**零代价**，却能消掉它描述的那整类误标。
+
+⛔ 30 是我猜的，120 是数据给的。**猜出来的阈值即使当时没出错，也只是运气。**
 """
+
+
+def reachability(meta: dict[str, Any]) -> str:
+    """**投信之后会不会有人来看** —— 与 ``status``（进程在不在动）是**两件事**。
+
+    🔴 **它们此前被折成了一个信号**，代价是 9 小时的静默损失
+    （``3a95ee25`` 2026-08-22 实测报告）：一个 reviewer 的轮询器早已死亡，
+    而 ``who`` 一直显示 ``active`` 且静默仅 2 分钟 —— 投信方据此以为它在审稿，
+    实际它**根本不知道有新信到**。
+
+    ⚠ **推翻了一条被广泛依赖的认知**：「心跳唯一来源是后台 poll」。
+    实测证否 —— 心跳由**任何一次 agentnet 调用**刷新，
+    包括 Stop 钩子每回合那次。⇒ **轮询器死了，心跳照常推进。**
+
+    ⇒ 所以判据只能是 ``poller_pid`` 的**实际存活探测**，
+    ⛔ 不是 ``status``、不是静默时长、也不是 info.md 里记着的那个数值本身。
+
+    :return: ``'可达'`` / ``'✗不可达'`` / ``''``（本 agent 从未挂过，无从判断）
+    """
+    poller = meta.get('poller_pid')
+    if not isinstance(poller, int) or poller <= 0:
+        return ''
+    return '可达' if pid_alive(poller) else '✗不可达'
 
 
 def stalled_hint(meta: dict[str, Any], unread_age_min: float | None, at: datetime) -> str:
@@ -1233,6 +1271,12 @@ def stalled_hint(meta: dict[str, Any], unread_age_min: float | None, at: datetim
     ⛔ **刻意不叫 "dead"、也刻意不给出动作建议**：写着 dead 的列会让人直接 kill，
     而 kill 一个正在跑 40 分钟测试的实例代价远大于多等十分钟（`6570c62b` 的告诫）。
     **判死仍然需要人看一眼**，这里只负责把"值得看一眼的那几个"挑出来。
+
+    ⚠ **已知局限（`81cfd2ac` 2026-08-22 指出，我认同）**：这两个指标合起来，
+    严格说测的是**「这个 agent 多久没调用过 agentnet」**，而不是「它是否卡死」。
+    一个**长回合内完全不调 agentnet** 的健康实例会同时满足两条。
+    ⇒ 缓解靠阈值（见 :data:`STALLED_UNREAD_MIN` 的分布数据），**不是消除**。
+    ⇒ 挂了 ``watch`` 的实例不受影响——轮询器本身就是心跳来源，心跳不会超阈。
     """
     if unread_age_min is None or unread_age_min < STALLED_UNREAD_MIN:
         return ''
@@ -1278,9 +1322,10 @@ def cmd_who(args: argparse.Namespace) -> None:
     # 查别人的 workspace 时用纯目录视图，绝不在对方目录里解析/落地自己的身份
     target: Workspace = ctx if not args.workspace or args.workspace == ctx.slug else Workspace(args.workspace)
     my_id = ctx.agent_id if target is ctx else None
-    rows: list[tuple[str, str, str, str, str, str]] = []
+    rows: list[tuple[str, str, str, str, str, str, str]] = []
     at = now()
     flagged = 0
+    unreachable = 0
     for agent_id, meta, _ in iter_agents(target, include_archived=args.include_archived):
         status = effective_status(meta, at, verify_pid=True)
         if args.alive and status != STATUS_ACTIVE:
@@ -1292,10 +1337,13 @@ def cmd_who(args: argparse.Namespace) -> None:
         stale_txt = '-' if stale == float('inf') else f"{int(stale // 60)}m"
         hint = stalled_hint(meta, oldest_unread_min(target, agent_id, at), at)
         flagged += 1 if hint else 0
+        reach = reachability(meta)
+        unreachable += 1 if reach.startswith('✗') else 0
         me = ' *' if agent_id == my_id else ''
         rows.append((
             agent_id[:8] + me,
             status,
+            reach,
             stale_txt,
             hint or '',
             str(meta.get('display_name') or '-'),
@@ -1305,13 +1353,22 @@ def cmd_who(args: argparse.Namespace) -> None:
     if not rows:
         print(f"（workspace {target.slug} 下没有匹配的成员）")
         return
-    headers = ('AGENT', 'STATUS', '静默', '', '名称', '主题')
+    headers = ('AGENT', 'STATUS', '收信', '静默', '', '名称', '主题')
     widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
     print(f"workspace: {target.slug}   （* = 你自己）")
     print('  '.join(h.ljust(widths[i]) for i, h in enumerate(headers)))
     print('  '.join('-' * widths[i] for i in range(len(headers))))
     for row in rows:
         print('  '.join(row[i].ljust(widths[i]) for i in range(len(headers))).rstrip())
+    if unreachable:
+        # **「进程在动」与「投信有人接」是两件事**，此前被折成一个 `active`。
+        # 实测代价 9 小时（3a95ee25）：poller 早死、心跳照跳、投信方一直以为它在审稿。
+        print()
+        print(f"[!] {unreachable} 个标为「✗不可达」：**登记里那个轮询器 pid 已经不在了**。")
+        print(f"    信投过去会落盘，但**没有任何进程会去唤醒它** —— 它不知道有新信。")
+        print(f"    ⛔ 这与 STATUS 无关：心跳由**任何一次 agentnet 调用**刷新"
+              f"（含每回合的 Stop 钩子），所以**轮询器死了心跳照样在跳**。")
+        print(f"    要它恢复：让它自己重新挂 `agentnet watch`（或 `poll`）。")
     if flagged:
         # **同期对照是判据的一部分，不是展示优化**（`ae95fcde` 的两次误判都源于"只看它一个"：
         # 静默 733 分钟那次全网都在静默 ⇒ 环境现象；静默 86 分钟那次多数实例 0–8 分钟 ⇒ 个体故障。
@@ -1900,6 +1957,14 @@ def cmd_send(args: argparse.Namespace) -> None:
                             args.kind, args.thread, None, topic_of[rid])
         delivered.append(rid)
         print(f"[OK] → {rid[:8]}  {path.name}")
+        # **落盘成功 ≠ 对方会看见。** 轮询器死了的收件人照样收下这封信，
+        # 但没有任何进程会去唤醒它 —— 而它的 status 仍是 active、心跳仍在跳
+        # （心跳由任何 agentnet 调用刷新，与轮询器无关）。
+        # 不阻止投递（落盘仍有价值：它下个回合的 Stop 钩子会 drain 到），
+        # 但**必须让投信方知道"现在没人会看见"**。实测代价 9 小时（3a95ee25）。
+        if reachability(read_info(ctx.info_path_of(rid))[0]).startswith('✗'):
+            print(f"       ⚠ 但 {rid[:8]} 的轮询器**已不在**——信已落盘，"
+                  f"但它现在不会被唤醒；要等它下一个回合的 Stop 钩子才会读到。")
     if not delivered and not refused:
         _die("没有实际收件人（群发时只匹配到你自己？）")
     print(f"[OK] 已投递 {len(delivered)}/{len(delivered) + len(refused)} 封，kind={args.kind}")
@@ -2184,7 +2249,7 @@ def dead_among(ctx: 'Ctx', watched: dict[str, str]) -> dict[str, str]:
     return dead
 
 
-def render_dead_children(dead: dict[str, str]) -> str:
+def render_dead_children(dead: dict[str, str], *, stream: bool = False) -> str:
     """告诉 author："你等的那个可能已经不在了"。
 
     这是**唯一**能终止无限等待的信号。此前没有它：author 拉起 reviewer 后阻塞在 poll
@@ -2214,7 +2279,13 @@ def render_dead_children(dead: dict[str, str]) -> str:
         '',
         '    确认真的没了、而你在等它的产出 ⇒ 重新 `agentnet spawn` 一个。',
         '    想看它留下过什么：`agentnet last --full`，或翻 `archive/<id>/` 里的 sent/。',
-        '    **本轮询器已退出**，处理完后照常重新后台运行 `agentnet poll`。',
+        # ⚠ 这一行**必须随模式变**：`watch` 打印完是**继续跑**的，
+        # 而旧文案写着「本轮询器已退出…重新运行 agentnet poll」——
+        # 读到的实例照做重挂 ⇒ 新的接管、旧的退位 ⇒ **效果等同于它真的退出了**。
+        # 实测（`0de75e6c` 2026-08-22 报告）：watch 投递此事件后"自行退出"，
+        # 根因不是代码退出，是**文案把它说死了**。
+        ('    （本进程继续运行，**无需重挂**。）' if stream else
+         '    **本轮询器已退出**，处理完后照常重新后台运行 `agentnet poll`。'),
     ]
     return '\n'.join(lines)
 
@@ -2319,7 +2390,7 @@ def poll_loop(args: argparse.Namespace, *, stream: bool) -> None:
                 gone = dead_among(ctx, watched_children)
                 if gone:
                     if stream:
-                        print(render_dead_children(gone), flush=True)
+                        print(render_dead_children(gone, stream=True), flush=True)
                         # 报过一次就从盯梢名单里摘掉——否则每个检查周期重复报同一批，
                         # 而 watch 不退出，那会变成无限刷屏。
                         watched_children = {aid: name for aid, name in watched_children.items()

@@ -1945,6 +1945,47 @@ class TestCommandRegistryWiring(Base):
             self.assertEqual(params, ['args'], f"`{cmd.name}` 的签名是 {params}")
 
 
+class TestReachabilityIsNotStatus(Base):
+    """**「进程在动」与「投信有人接」是两件事** —— 此前被折成一个 `active`。
+
+    实测代价 9 小时（`3a95ee25` 2026-08-22）：reviewer `66fe8442` 的轮询器早已死亡，
+    而 `who` 一直显示 active、静默仅 2 分钟 ⇒ 投信方以为它在审稿，
+    实际它**根本不知道有新信到**。
+
+    ⚠ 这**证否了一条被广泛依赖的认知**：「心跳唯一来源是后台 poll」。
+    心跳由**任何一次 agentnet 调用**刷新（含每回合的 Stop 钩子）
+    ⇒ **轮询器死了，心跳照常推进**。
+    """
+
+    def test_fresh_heartbeat_does_not_imply_reachable(self) -> None:
+        """**这条是那 9 小时的直接回归**：心跳新鲜 + 轮询器已死 ⇒ 不可达。"""
+        meta = {'status': an.STATUS_ACTIVE, 'last_active': an.now(), 'poller_pid': 999999}
+        self.assertEqual(an.effective_status(meta), an.STATUS_ACTIVE, '前提：它看起来是活的')
+        self.assertTrue(an.reachability(meta).startswith('✗'),
+                        '心跳新鲜被当成了"收得到信"——正是那 9 小时的成因')
+
+    def test_live_poller_is_reachable(self) -> None:
+        meta = {'status': an.STATUS_ACTIVE, 'last_active': an.now(), 'poller_pid': os.getpid()}
+        self.assertEqual(an.reachability(meta), '可达')
+
+    def test_never_armed_is_unknown_not_unreachable(self) -> None:
+        """从未挂过 ⇒ **无从判断**，不能报"不可达"。
+
+        ⛔ 报"不可达"会让投信方以为出了故障；实际只是这个 agent 没用过轮询器。
+        """
+        self.assertEqual(an.reachability({'status': an.STATUS_ACTIVE}), '')
+
+    def test_reachability_ignores_status_and_silence(self) -> None:
+        """判据只能是 pid 探测——**不是 status、不是静默时长**。"""
+        stale = an.now() - timedelta(hours=20)
+        for meta in (
+            {'status': an.STATUS_ACTIVE, 'last_active': an.now(), 'poller_pid': os.getpid()},
+            {'status': an.STATUS_PRESUMED_DEAD, 'last_active': stale, 'poller_pid': os.getpid()},
+        ):
+            self.assertEqual(an.reachability(meta), '可达',
+                             'reachability 被 status / 静默时长影响了')
+
+
 class TestStalledHint(Base):
     """「疑似卡死」必须**两个信号同时成立**——用例直接取自 2026-08-21 的真实数据。
 
