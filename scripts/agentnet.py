@@ -863,8 +863,15 @@ def unarmed_chunk(blocked_so_far: int) -> str:
             "       （实测两次 `exit 127 / command not found`、输出文件 0 字节，"
             "看起来与「正常挂上」毫无区别）。\n"
             "       裸命令名解析不到时，改用绝对路径：`python <agentnet_home>/scripts/agentnet.py watch`。\n"
-            "    没有流式原语的 harness 才回退到 `agentnet poll`"
-            "（用后台任务机制跑，命中即退出、需重挂）。\n"
+            "    ⚠ **工具列表里看不到 Monitor ≠ 没有它**：它在有些 harness 里是**延迟加载**的，\n"
+            "       先 `ToolSearch(select:Monitor)` 载入再用。"
+            "**别因为「没看到」就退回 poll**（2026-08-22 实测有实例这么误判）。\n"
+            "    **确认确实没有流式监视器，才回退 `agentnet poll`**"
+            "（后台任务机制跑，命中即退出、需重挂）。\n"
+            "    ⛔ **千万别拿普通后台任务去跑 `watch`** —— 它**不退出**，而 harness 靠"
+            "「进程退出」唤醒你，\n"
+            "       ⇒ 你**永远不会被叫醒**；且它还会 drain 收件箱，"
+            "**连 Stop 钩子的兜底也一起扑空**。**比不挂更糟。**\n"
             "    ⚠ **已经在跑 `watch` 就别再挂 `poll`** —— 后者会顶掉前者，"
             "把你送回「被杀→重挂」的循环。\n"
             "    自己用 `&` / `nohup` 挂**不算**：那种进程 harness 追踪不到，"
@@ -2465,10 +2472,28 @@ def cmd_poll(args: argparse.Namespace) -> None:
             '而同期 `poll` 每个边界必被杀。\n'
             '\n'
             '⚠ **它自己 drain**。别让 Stop 钩子和它同时消费收件箱——钩子会抢走事件\n'
-            '（实测钩子赢过竞态）。钩子的 drain 是 watch **没在跑时**的兜底。'),
+            '（实测钩子赢过竞态）。钩子的 drain 是 watch **没在跑时**的兜底。\n'
+            '\n'
+            '⛔ **必须用流式监视器跑，不能用普通后台任务。** 它**不退出**，\n'
+            '而后台任务机制靠「进程退出」唤醒你 ⇒ 那样挂上**永远叫不醒你**；\n'
+            '且它照样 drain 收件箱 ⇒ **连 Stop 钩子的兜底也一起扑空**。**比不挂更糟。**\n'
+            '没有流式原语的 harness 请用 `agentnet poll`。'),
     add_args=_args_poll,
 )
 def cmd_watch(args: argparse.Namespace) -> None:
+    # ⛔ **用普通后台任务跑 watch = 永远不会被唤醒。**
+    # harness 靠「被追踪进程**退出**」唤醒 agent，而 watch 的设计就是不退出。
+    # 更糟的是它**会 drain 收件箱** ⇒ Stop 钩子每回合的兜底也扑空（信已不在 inbox）。
+    # ⇒ 比不挂还差。没有流式原语时正确的回退是 `agentnet poll`。
+    #
+    # 检测不了自己是否跑在流式上下文里（两种情形 stdout 都是管道），
+    # 所以只能把话说在最前面——这一行会落进输出文件，读的人一眼就看得到。
+    # （2026-08-22：一个没有 Monitor 的 reviewer 正是"按无 Monitor 回退路径挂持久 watch"，
+    #   而那恰恰是最坏的选择。文案此前只说了"回退 poll"，没说"别这样跑 watch"。）
+    print('[watch] 流式收信已启动。\n'
+          '        ⛔ **若你不是用「流式监视器」跑的我**（Claude Code 是 `Monitor`），\n'
+          '           你**永远不会被唤醒**——我不退出，而 harness 靠进程退出叫你。\n'
+          '           此时请 Ctrl-C 掉我，改用 `agentnet poll`。', flush=True)
     poll_loop(args, stream=True)
 
 

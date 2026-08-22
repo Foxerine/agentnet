@@ -2049,7 +2049,10 @@ class TestWatchIsPollWithoutTheExit(Base):
         """两个处理函数都必须落到 `poll_loop`——复制出来的两份必然漂移。"""
         src = Path(an.__file__).read_text(encoding='utf-8')
         for name, flag in (('cmd_poll', 'stream=False'), ('cmd_watch', 'stream=True')):
-            body = src.split(f"def {name}(args: argparse.Namespace) -> None:")[1][:200]
+            # 取到下一个顶层定义为止，而不是固定字符数——2026-08-22 给 cmd_watch 加了
+            # 一段启动告警后，函数体被推出 200 字符窗口，测试直接失败。
+            # **锚在结构上（函数边界），不锚在长度上。**
+            body = src.split(f"def {name}(args: argparse.Namespace) -> None:")[1].split('\n@')[0]
             self.assertIn('poll_loop(args,', body, f"{name} 没有复用 poll_loop")
             self.assertIn(flag, body, f"{name} 没传 {flag}")
 
