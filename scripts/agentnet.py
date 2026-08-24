@@ -2150,7 +2150,7 @@ def record_review_debts(ctx: Ctx, items: list[tuple[dict[str, Any], str, Path]])
     merge_info(ctx.info_path, {'review_debts': merged}, create=False)
 
 
-def notify_deaf_child(ws: Workspace, agent_id: str, meta: dict[str, Any],
+def notify_deaf_child(ws: Ctx, agent_id: str, meta: dict[str, Any],
                       unread: int, oldest_min: float) -> bool:
     """**收件箱有信、却没挂收信器** ⇒ 通知拉起它的那一方。
 
@@ -2234,7 +2234,12 @@ def notify_deaf_child(ws: Workspace, agent_id: str, meta: dict[str, Any],
         matched, why = resolve_target(ws, parent)
         if why is not None or not matched:
             return False
-        write_letter(ws, agent_id, matched[0],
+        # 🔴 发信人是**跑 sweep 的这个实例**，⛔ 不是那个聋掉的孩子。
+        # 曾经写成 `agent_id`（孩子），后果是这封自动信被记进**孩子的 `sent/`**
+        # ⇒ **污染了「它有没有产出」这个最关键的判活信号**：`sent=1` 看起来像
+        # "它回过信"，实际它一个字都没写。2026-08-25 `8df980eb` 的故障报告里
+        # 正因如此把两个零产出的 reviewer 读成"有产出"；⚠ 连我自己复核时都先被骗了一次。
+        write_letter(ws, ws.agent_id, matched[0],
                      f"[自动] 你拉起的 {agent_id[:8]} 收不到信（{unread} 封在等）",
                      body, 'control', None, None, None)
         merge_info(ws.info_path_of(agent_id), {'deaf_notified_for': episode}, create=False)
@@ -2244,7 +2249,7 @@ def notify_deaf_child(ws: Workspace, agent_id: str, meta: dict[str, Any],
         return False
 
 
-def notify_review_debt(ws: Workspace, agent_id: str, meta: dict[str, Any],
+def notify_review_debt(ws: Ctx, agent_id: str, meta: dict[str, Any],
                        silent_min: int) -> None:
     """欠着终态信的 agent 被归档 ⇒ **给每个等待方投一封信**。
 
@@ -2277,7 +2282,12 @@ def notify_review_debt(ws: Workspace, agent_id: str, meta: dict[str, Any],
             matched, why = resolve_target(ws, requester)
             if why is not None or not matched:
                 continue
-            write_letter(ws, agent_id, matched[0],
+            # 发信人是**跑 sweep 的这个实例**，⛔ 不是那个欠账的 agent
+            # （同 :func:`notify_deaf_child` 的理由：写成它自己会把这封自动信
+            # 记进**它的 `sent/`**，而 `sent/` 是判活用的"它有没有产出"信号——
+            # 一个**零产出**的实例会因此显示 `sent=1`。⚠ 它归档时尤其误导：
+            # 等待方看到「它发过东西」，实际那正是"它什么都没发"的通知本身）。
+            write_letter(ws, ws.agent_id, matched[0],
                          f"[自动] 你等的 {agent_id[:8]} 已归档且未发终态信",
                          body, 'control', thread, None, None)
         except Exception as exc:  # noqa: BLE001 —— 通知失败不该带走归档

@@ -2117,6 +2117,26 @@ class TestDeafChildNotice(Base):
                         '新一轮失联被旧的去重键吃掉了')
         self.assertEqual(len(self.parent_inbox()), 2)
 
+    def test_notice_is_not_recorded_as_the_child_own_output(self) -> None:
+        """🔴 自动通知**不得**记进被通知对象的 `sent/` —— 它污染判活信号。
+
+        实战（2026-08-25，`8df980eb` 的故障报告）：两个 reviewer **零产出**，
+        但它们的 `sent/` 各有 1 封——那正是本函数发出的「你拉起的 X 收不到信」。
+        ⇒ 报告者据 `sent=1` 读成"它回过信"；⚠ **我自己复核时也先被骗了一次**，
+        读了 subject 才发现是自己发的。
+
+        ⭐ `sent/` 是「它有没有产出」的唯一直接信号，**必须只含它自己写的东西**。
+        """
+        self.register()
+        cid, meta = self.child(unread=1, poller=None)
+        self.assertTrue(an.notify_deaf_child(self.ctx(), cid, meta, 1, 30.0))
+        child_sent = list((self.ctx().agent_dir(cid) / 'sent').glob('*.md'))
+        self.assertEqual(child_sent, [],
+                         '自动通知被记进了聋掉那个孩子的 sent/，判活信号已被污染')
+        # 而它应当记在**发出者**（跑 sweep 的这个实例）名下。
+        mine = list((self.ctx().agent_dir(self.ctx().agent_id) / 'sent').glob('*.md'))
+        self.assertEqual(len(mine), 1, '通知没有记在发出者名下')
+
     def test_notice_says_it_is_probably_alive(self) -> None:
         """⛔ 措辞不能诱导 kill —— 这种形态**通常还活着**，kill 会丢掉已有上下文。"""
         self.register()
