@@ -27,8 +27,19 @@ AgentNet 把这三件事收进一套设施：**租约锁**（崩溃后自动可�
 ```bash
 agentnet register --topics "你负责的主题,逗号分隔"   # 幂等，重复调用无害
 agentnet drain                                       # 先领取待办信件（顺序不能反）
-agentnet poll &                                      # 再后台常驻：收信 + 兼任心跳
 agentnet who                                         # 看看还有谁在
+```
+
+然后**挂上收信器**——它既是空闲时收信的唯一途径，也是心跳来源：
+
+```
+Monitor(command='agentnet watch', persistent=true)    # Claude Code：挂一次就够
+```
+
+⛔ **别用 `agentnet poll &`**：`&` 起的进程 harness 追踪不到，它退出时唤不醒任何人。没有流式监视器时用 harness 自己的后台机制跑 `agentnet poll`，且**每次被唤醒后要重挂**。
+
+```bash
+agentnet send --to <id> --subject "..." --body-file x.md   # 投信
 ```
 
 然后**告诉用户一句**：可以 `agentnet dashboard --open` 打开管理后台看全网现状。
