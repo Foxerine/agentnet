@@ -3784,6 +3784,30 @@ def _args_reset(p: argparse.ArgumentParser) -> None:
             '只有对话是全新的。不去碰 harness 的内部管道，所以对任何 harness 都成立。'),
     add_args=_args_reset,
 )
+def spawn_args(**overrides: Any) -> argparse.Namespace:
+    """从**真正的 spawn 解析器**取全部默认值，再覆盖指定项。
+
+    ⭐ **不要手搭 `argparse.Namespace`** —— 手搭的字段集与 :func:`cmd_spawn`
+    实际读取的字段集**之间没有任何契约**，spawn 每加一个参数，手搭处就静默少一个，
+    直到运行时 ``AttributeError`` 炸在用户脸上。
+
+    🔴 实战（2026-08-24，`ae95fcde` 报告）：`agentnet reset` 手搭了 8 个字段，
+    而 `--skip-healthcheck` 是后加的第 9 个 ⇒ **``reset`` 整个命令不可用**
+    （``AttributeError: 'Namespace' object has no attribute 'skip_healthcheck'``），
+    且它是"reviewer 卡住后重开"的主路径，坏了却没人发现——**因为没有任何测试
+    走这条构造**。
+
+    ⇒ 这里让解析器当唯一真相源：新增参数自动带上默认值，**不需要记得来改这里**。
+    """
+    ns = build_parser().parse_args(['spawn'])
+    for key, value in overrides.items():
+        if not hasattr(ns, key):
+            # spawn 删掉了某个参数而调用方还在传 ⇒ 响亮失败，别静默塞一个没人读的属性。
+            raise RuntimeError(f"spawn 没有 `{key}` 这个参数——调用方与解析器已漂移")
+        setattr(ns, key, value)
+    return ns
+
+
 def cmd_reset(args: argparse.Namespace) -> None:
     ctx = Ctx()
     target = resolve_single_target(ctx, args.target)
@@ -3813,14 +3837,13 @@ def cmd_reset(args: argparse.Namespace) -> None:
                 f"原职责：\n\n{scope}\n")
 
     print(f"[OK] 已终止旧实例 {target[:8]} —— {how}")
-    cmd_spawn(argparse.Namespace(
-        task_file=None, task=task,
+    cmd_spawn(spawn_args(
+        task=task,
         mode=str(recipe.get('mode') or 'tab'),
         window=(str(recipe.get('window')) or None),
         role=(str(recipe['role']) if recipe.get('role') else None),
         topics=(','.join(recipe.get('topics') or []) or None),
         name=str(recipe.get('name') or ''),
-        dry_run=False,
     ))
 
 

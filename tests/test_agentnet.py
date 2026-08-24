@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import inspect
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -2123,6 +2125,52 @@ class TestDeafChildNotice(Base):
         text = self.parent_inbox()[0].read_text(encoding='utf-8')
         self.assertIn('多半不是死了', text)
         self.assertIn('确认新实例挂上了', text, '没提醒重开后要亲自确认')
+
+
+class TestSpawnArgsCoverAllReads(Base):
+    """`reset` 转交给 `spawn` 的 Namespace **必须含 spawn 实际读的每个属性**。
+
+    🔴 实战（2026-08-24，`ae95fcde` 一手报告）：`cmd_reset` 手搭了 8 个字段，
+    而 `--skip-healthcheck` 是后加的第 9 个 ⇒ `agentnet reset` **整个命令崩掉**
+    （`AttributeError: 'Namespace' object has no attribute 'skip_healthcheck'`）。
+
+    ⛔ **补上那一个字段不算修好** —— 手搭 Namespace 与 `cmd_spawn` 的读取集
+    之间没有契约，下一个新参数会再犯一次。⇒ 真修法是让**解析器**当真相源，
+    而这条用例**反射出 spawn 实际读了什么**来钉住它：新增 `args.X` 却没进解析器，
+    它会红。
+    """
+
+    def spawn_reads(self) -> set[str]:
+        """从 `cmd_spawn` 的源码里反射出它读的全部 ``args.X``。
+
+        ⭐ 反射而不是手抄清单：手抄的清单与代码之间又是一份没有契约的镜像
+        （正是本 bug 的形状）。
+        """
+        src = inspect.getsource(an.cmd_spawn)
+        return set(re.findall(r'\bargs\.([a-z_]+)', src))
+
+    def test_reset_namespace_has_every_attribute_spawn_reads(self) -> None:
+        ns = an.spawn_args()
+        reads = self.spawn_reads()
+        self.assertIn('skip_healthcheck', reads, '前提：反射得能看到那个出事的字段')
+        missing = sorted(r for r in reads if not hasattr(ns, r))
+        self.assertEqual(missing, [], f'spawn 读了这些属性但 spawn_args() 给不出：{missing}')
+
+    def test_overrides_are_checked_against_the_parser(self) -> None:
+        """传一个解析器没有的键 ⇒ **响亮失败**，别静默塞个没人读的属性。
+
+        静默接受会让"调用方与解析器漂移"这件事**在出错时毫无线索**——
+        属性在那儿、值也对，只是 spawn 从来不读它。
+        """
+        with self.assertRaises(RuntimeError):
+            an.spawn_args(no_such_option='x')
+
+    def test_overrides_actually_apply(self) -> None:
+        """⚠ 防恒真：确认覆盖真的生效，而不是永远返回默认值。"""
+        ns = an.spawn_args(task='hello', role='reviewer')
+        self.assertEqual(ns.task, 'hello')
+        self.assertEqual(ns.role, 'reviewer')
+        self.assertFalse(ns.skip_healthcheck, '未覆盖项应保留解析器默认值')
 
 
 class TestReviewDebt(Base):
