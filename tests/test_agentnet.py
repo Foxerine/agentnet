@@ -1670,9 +1670,26 @@ class TestSpawnArgv(Base):
         an.BOOTSTRAP_PROMPT.encode('ascii')   # 非 ASCII 会当场 UnicodeEncodeError
 
     def test_bootstrap_prompt_has_no_cmd_metacharacters(self) -> None:
-        """它要穿过 cmd.exe（.cmd 类启动器），元字符会被当成命令分隔。"""
-        for char in ';&|<>^%"':
+        """它要穿过 cmd.exe（.cmd 类启动器），元字符会被当成命令分隔。
+
+        ⚠ **括号也是**（2026-08-24 补）：我给这句加"挂 Monitor"的提示时顺手写成了
+        `Monitor(command="agentnet watch", ...)`，一次带进 `(` `)` 和 `"` 三种元字符。
+        双引号被这条守住了，**括号当时不在清单里** —— 差一点就放行。
+        """
+        for char in ';&|<>^%"()':
             self.assertNotIn(char, an.BOOTSTRAP_PROMPT, f'{char!r} 会被 cmd.exe 解释')
+
+    def test_bootstrap_prompt_tells_it_to_arm_a_watcher(self) -> None:
+        """**它是那个实例收到的唯一一条用户消息**，必须提到挂收信器。
+
+        🔴 2026-08-24 实测：**被 spawn 拉起的实例静默中位数 332 分钟，
+        自己启动的只有 1 分钟——差 330 倍**（按 `spawned_by` 客观分组，n=28 vs 18）。
+        根因是 reviewer 的生命周期完全由"收到信"驱动：回完一封就没事做，
+        若挂的是 `poll`（投递即退出）⇒ **回完第一封就再也醒不来**，而它自己察觉不到。
+        """
+        p = an.BOOTSTRAP_PROMPT.lower()
+        self.assertIn('watch', p, '第一推动里没提收信器——spawn 出来的实例回完一封就聋了')
+        self.assertIn('monitor', p, '没说清要用流式监视器挂')
 
     def test_bootstrap_prompt_names_the_real_goal(self) -> None:
         """**它是那个实例收到的唯一一条用户消息**，必须自己说清终点在哪。

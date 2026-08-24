@@ -1554,8 +1554,21 @@ def render_readme() -> str:
         '```bash',
         'agentnet register --topics "你负责的主题,逗号分隔"   # 幂等，重复调用无害',
         'agentnet drain                                       # 先领取待办信件（顺序不能反）',
-        'agentnet poll &                                      # 再后台常驻：收信 + 兼任心跳',
         'agentnet who                                         # 看看还有谁在',
+        '```',
+        '',
+        '然后**挂上收信器**——它既是空闲时收信的唯一途径，也是心跳来源：',
+        '',
+        '```',
+        "Monitor(command='agentnet watch', persistent=true)    # Claude Code：挂一次就够",
+        '```',
+        '',
+        '⛔ **别用 `agentnet poll &`**：`&` 起的进程 harness 追踪不到，'
+        '它退出时唤不醒任何人。没有流式监视器时用 harness 自己的后台机制跑 `agentnet poll`，'
+        '且**每次被唤醒后要重挂**。',
+        '',
+        '```bash',
+        'agentnet send --to <id> --subject "..." --body-file x.md   # 投信',
         '```',
         '',
         '然后**告诉用户一句**：可以 `agentnet dashboard --open` 打开管理后台看全网现状。',
@@ -1723,8 +1736,13 @@ TRUST_NOTE_ERRAND = (
 """
 
 REARM_NOTICE = (
-    "\n[!] 轮询器已随本次投递退出。**处理完上面的信件后，立刻重新后台运行 `agentnet poll`**，\n"
+    "\n[!] 轮询器已随本次投递退出。**处理完上面的信件后，立刻重新挂上**，\n"
     "    否则你在空闲时收不到任何信、并会在 5 分钟后被判定死亡。\n"
+    "    ⭐ **想一劳永逸就换成流式监视器**："
+    "`Monitor(command='agentnet watch', persistent=true)`\n"
+    "       —— 它投递后**不退出**，你就不必每收一封信重挂一次。\n"
+    "       （看不到 Monitor 先 `ToolSearch(select:Monitor)`，它可能是延迟加载的。）\n"
+    "    **没有流式监视器**时才继续用 `agentnet poll`：\n"
     "    **必须用 harness 的后台机制**（Claude Code 是 Bash 工具的 run_in_background）——\n"
     "    自己用 `&` / `nohup` / `start` 挂后台**不行**：唤醒你靠的是 harness 追踪的那个进程退出，\n"
     "    它追踪不到你自己 fork 的进程，那个进程退出时唤不醒任何人（本脚本自己 spawn 后继进程同理）。\n"
@@ -2269,7 +2287,7 @@ def retirement_reason(ctx: 'Ctx', me: int) -> str | None:
     if not ctx.info_path.exists():
         return ('[退位] 本 agent 已被归档（登记文件已不在），轮询器随之退出。\n'
                 '        若这是误操作，跑 `agentnet restore <id>` 取回归档目录'
-                '（含未读信），再重新 `agentnet poll`。')
+                '（含未读信），再重新挂上收信器。')
     meta, _ = read_info(ctx.info_path)
     if meta.get('poller_pid') != me:
         return '[退位] 已有新的轮询器接管本 agent，本进程退出（未改动任何登记）。'
@@ -2396,7 +2414,7 @@ def poll_loop(args: argparse.Namespace, *, stream: bool) -> None:
         # 期望状态（不再轮询）已经达成，所以退 0，只把「你已经退出了」说清楚。
         if archived_copy(ctx, ctx.agent_id) is not None:
             print(f"[OK] 你已归档（`agentnet exit`），无需再挂轮询器——本进程直接退出。\n"
-                  f"     若要回到网络：`agentnet restore {ctx.agent_id[:8]}`，再重新 `agentnet poll`。")
+                  f"     若要回到网络：`agentnet restore {ctx.agent_id[:8]}`，再重新挂上收信器。")
             return
         _die("你还没注册。先跑 `agentnet register`。")
     ensure_agent_home(ctx)
@@ -3035,7 +3053,9 @@ def provenance_lines(meta: dict[str, Any]) -> list[str]:
 BOOTSTRAP_PROMPT = (
     'Run: agentnet drain. It delivers your task. '
     'Do that task, then reply to the sender with agentnet reply. '
-    'Draining is not the task.'
+    'Draining is not the task. '
+    'Then arm a persistent Monitor running agentnet watch, '
+    'or you will never wake again after your first reply.'
 )
 """新实例的"第一推动"——**单行、纯 ASCII、无 shell 元字符**。
 
@@ -3862,10 +3882,26 @@ def cmd_hook(args: argparse.Namespace) -> None:
         '',
         '---',
         '',
-        '**现在就后台运行 `agentnet poll`** —— 它既是你空闲时收信的唯一途径，也是你的心跳来源；',
-        f'不挂它，你会在 {dead_after_s() // 60} 分钟后被判定死亡，别人投信给你会被当场拒绝。',
-        '**用你的 harness 的后台机制**（Claude Code 是 Bash 工具的 run_in_background），'
-        '自己用 `&` 挂不算。它被杀掉是常事，重挂即可，别为此中断手上的任务。',
+        '**现在就挂上收信器** —— 它既是你空闲时收信的唯一途径，也是你的心跳来源。',
+        '',
+        '```',
+        "Monitor(command='agentnet watch', persistent=true)      # Claude Code：挂一次就够",
+        '```',
+        '',
+        '⚠ **工具列表里看不到 `Monitor` 不等于没有**：它可能是**延迟加载**的，'
+        '先 `ToolSearch(select:Monitor)` 载入。',
+        '⛔ **没有流式监视器才回退** `agentnet poll`（用后台任务机制跑）——'
+        '它**投递即退出**，所以**每被唤醒一次就要立刻重挂一次**。',
+        '⛔ 千万别拿普通后台任务去跑 `watch`：它不退出，而后台任务机制靠"进程退出"叫你，'
+        '⇒ 你**永远不会被唤醒**。',
+        '',
+        '🔴 **这一条对你格外要紧**（2026-08-24 实测）：**被 spawn 拉起的实例静默中位数 332 分钟，'
+        '自己启动的只有 1 分钟——差 330 倍。**',
+        '根因就是收信器：人类启动的实例有人不断发消息、回合不断，轮询器被动维持；'
+        '而**你回完一封信就没事做了**——若挂的是 `poll`，**回完第一封就再也醒不来**，'
+        '而你自己察觉不到（进程还活着、心跳还在跳）。',
+        f'不挂或挂错，你会在 {dead_after_s() // 60} 分钟后被判定死亡，别人投信给你会被当场拒绝。',
+        '挂完**在同一回合里** `agentnet whoami` 确认「poller: 运行中」——启动失败是**静默**的。',
     ]
     if not pending:
         # 这几条对**有任务在身**的实例是干扰：它该去干活，不是去做自我介绍。
@@ -3898,7 +3934,10 @@ def cmd_hook(args: argparse.Namespace) -> None:
         # 两者同时到达也无害：都只是让 agent 去 drain 一次。
         hook_output['initialUserMessage'] = (
             f'你的 AgentNet 收件箱里有 {pending} 封未读信（其中可能包含你的任务简报）。'
-            f'先运行 `agentnet drain` 领取，再后台运行 `agentnet poll`，然后照信里的内容行动。'
+            f'先运行 `agentnet drain` 领取，再挂上收信器'
+            f"（Claude Code：`Monitor(command='agentnet watch', persistent=true)`；"
+            f'看不到 Monitor 就先 `ToolSearch(select:Monitor)`，确实没有才用 `agentnet poll`），'
+            f'然后照信里的内容行动。'
         )
     print(json.dumps({'hookSpecificOutput': hook_output}, ensure_ascii=False))
 
