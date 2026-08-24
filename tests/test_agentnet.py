@@ -1962,6 +1962,83 @@ class TestCommandRegistryWiring(Base):
             self.assertEqual(params, ['args'], f"`{cmd.name}` 的签名是 {params}")
 
 
+class TestDeafChildNotice(Base):
+    """**收件箱有信、却没挂收信器** ⇒ 通知拉起它的那一方。
+
+    ⭐ 这是唯一一种**当事人自己永远发现不了**的失联：进程活着、工作正常、
+    前几轮都回了信——只是回完之后没重挂，于是下一封永远不进入它的视野。
+    ⛔ 没有任何信号会告诉一个空闲实例「有信在等你」。
+
+    实战首例（2026-08-24）：`80b6bc91` —— `read=6 sent=6`（前六轮正常）、
+    `inbox=1`、`poller_pid` 无、**静默仅 2 分钟**
+    ⇒ 作者 `f81e5265` 的第 7 轮回信躺了十几分钟，双方都不知道。
+    """
+
+    def child(self, *, unread: int, poller: int | None, parent: str = 'p-1') -> tuple[str, dict]:
+        cid = 'cccccccc-0000-0000-0000-000000000001'
+        d = self.ctx().agents_dir / cid
+        (d / 'inbox').mkdir(parents=True, exist_ok=True)
+        for i in range(unread):
+            an.write_doc(d / 'inbox' / f'20260824T19000{i}-p-1-x.md',
+                         {'id': f'x{i}', 'from': parent, 'subject': 's',
+                          'created_at': an.now() - timedelta(minutes=30)},
+                         '正文', an.LETTER_FIELD_ORDER)
+        meta = {'id': cid, 'status': an.STATUS_ACTIVE, 'last_active': an.now(),
+                'spawned_by': parent, 'display_name': 'probe-child'}
+        if poller is not None:
+            meta['poller_pid'] = poller
+        an.write_doc(d / 'info.md', meta, '', an.INFO_FIELD_ORDER)
+        p = self.ctx().agents_dir / parent
+        (p / 'inbox').mkdir(parents=True, exist_ok=True)
+        an.write_doc(p / 'info.md', {'id': parent, 'status': an.STATUS_ACTIVE,
+                                     'last_active': an.now()}, '', an.INFO_FIELD_ORDER)
+        return cid, meta
+
+    def parent_inbox(self, parent: str = 'p-1') -> list:
+        return list((self.ctx().agents_dir / parent / 'inbox').glob('*.md'))
+
+    def test_fresh_heartbeat_still_reported(self) -> None:
+        """🔴 **心跳新鲜也要报** —— 这正是 `80b6bc91` 的形态，也是最易漏的一条。
+
+        它刚回完信、心跳只静默几分钟 ⇒ 任何基于"静默时长"的判据都不会标它，
+        而它**已经聋了**。
+        """
+        self.register()
+        cid, meta = self.child(unread=1, poller=None)
+        self.assertEqual(an.effective_status(meta), an.STATUS_ACTIVE, '前提：它看起来很健康')
+        self.assertTrue(an.notify_deaf_child(self.ctx(), cid, meta, 1, 30.0))
+        self.assertEqual(len(self.parent_inbox()), 1, '没通知拉起方')
+
+    def test_live_poller_not_reported(self) -> None:
+        """挂着收信器的不报——它收得到，不是聋。"""
+        self.register()
+        cid, meta = self.child(unread=1, poller=os.getpid())
+        self.assertFalse(an.notify_deaf_child(self.ctx(), cid, meta, 1, 30.0))
+        self.assertEqual(self.parent_inbox(), [])
+
+    def test_empty_inbox_not_reported(self) -> None:
+        """没挂但也没信 ⇒ 无害，别制造噪声。"""
+        self.register()
+        cid, meta = self.child(unread=0, poller=None)
+        self.assertFalse(an.notify_deaf_child(self.ctx(), cid, meta, 0, 0.0))
+
+    def test_self_started_not_reported(self) -> None:
+        """没有 `spawned_by` ⇒ 不知道该通知谁，且人类启动的实例有人盯着。"""
+        self.register()
+        cid, meta = self.child(unread=1, poller=None)
+        meta.pop('spawned_by')
+        self.assertFalse(an.notify_deaf_child(self.ctx(), cid, meta, 1, 30.0))
+
+    def test_notice_says_it_is_probably_alive(self) -> None:
+        """⛔ 措辞不能诱导 kill —— 这种形态**通常还活着**，kill 会丢掉已有上下文。"""
+        self.register()
+        cid, meta = self.child(unread=1, poller=None)
+        an.notify_deaf_child(self.ctx(), cid, meta, 1, 30.0)
+        text = self.parent_inbox()[0].read_text(encoding='utf-8')
+        self.assertIn('多半不是死了', text)
+        self.assertIn('确认新实例挂上了', text, '没提醒重开后要亲自确认')
+
+
 class TestReviewDebt(Base):
     """终态信欠账：收到评审请求即记账，**只有结构化终态信**能销账。
 

@@ -1741,7 +1741,8 @@ REARM_NOTICE = (
     "    ⭐ **想一劳永逸就换成流式监视器**："
     "`Monitor(command='agentnet watch', persistent=true)`\n"
     "       —— 它投递后**不退出**，你就不必每收一封信重挂一次。\n"
-    "       （看不到 Monitor 先 `ToolSearch(select:Monitor)`，它可能是延迟加载的。）\n"
+    "       ⚠ **没有 `Monitor` 工具就别找了**——经网关路由的会话通常连 `ToolSearch` 都没有\n"
+    "       （2026-08-24 实测确认）。那种情况下 `poll` 就是正解，只是**每次都要重挂**。\n"
     "    **没有流式监视器**时才继续用 `agentnet poll`：\n"
     "    **必须用 harness 的后台机制**（Claude Code 是 Bash 工具的 run_in_background）——\n"
     "    自己用 `&` / `nohup` / `start` 挂后台**不行**：唤醒你靠的是 harness 追踪的那个进程退出，\n"
@@ -2126,6 +2127,65 @@ def record_review_debts(ctx: Ctx, items: list[tuple[dict[str, Any], str, Path]])
     existing = read_info(ctx.info_path)[0].get('review_debts') or []
     merged = list(dict.fromkeys([*existing, *debts]))     # 去重且保序
     merge_info(ctx.info_path, {'review_debts': merged}, create=False)
+
+
+def notify_deaf_child(ws: Workspace, agent_id: str, meta: dict[str, Any],
+                      unread: int, oldest_min: float) -> bool:
+    """**收件箱有信、却没挂收信器** ⇒ 通知拉起它的那一方。
+
+    ⭐ **这是唯一一种"当事人自己永远发现不了"的失联**：它进程活着、工作正常、
+    前几轮都回了信 —— 只是**回完之后没重挂**，于是下一封永远不进入它的视野。
+    ⛔ 而它不会察觉：没有任何信号会告诉一个空闲实例"有信在等你"。
+
+    ⇒ 所以必须由**外部**发现并通知**等待方**（而不是通知聋掉的那个——它收不到）。
+
+    **判据只用现成数据，不碰进程谱系**（2026-08-24 实测教训：
+    祖先链探测跨平台不成立；`ParentProcessId` 是创建时记录的，
+    父进程死后 pid 会被复用 ⇒ 孤儿检测给出 20/20 的假"父进程活着"）：
+
+    ==================  ================================================
+    条件                 含义
+    ==================  ================================================
+    ``inbox`` 非空       有信在等
+    无存活的 poller      **没有任何进程会唤醒它**
+    有 ``spawned_by``    知道该通知谁
+    ==================  ================================================
+
+    实战首例：`80b6bc91` —— `read=6 sent=6`（前六轮都正常）、`inbox=1`、
+    `poller_pid` 无 ⇒ 作者 `f81e5265` 的第 7 轮回信静静躺了十几分钟，双方都不知道。
+
+    :return: 是否真的发出了通知（供调用方计数）。
+    """
+    parent = str(meta.get('spawned_by') or '')
+    if not parent or not unread:
+        return False
+    if reachability(meta) == '可达':
+        return False
+    name = str(meta.get('display_name') or agent_id[:8])
+    body = (f"# ⚠ 你拉起的 `{agent_id[:8]}`（{name}）**收不到信**——有 {unread} 封在它收件箱里躺着\n\n"
+            f"最老的一封已等 **{oldest_min:.0f} 分钟**，而它**没有挂收信器**"
+            f"（`poller_pid` 无 / 已死）。\n\n"
+            f"⭐ **它多半不是死了**：这种形态通常是「前几轮都正常回了、回完之后没重挂」\n"
+            f"⇒ 进程还活着、工作正常，只是**下一封永远不进入它的视野**。\n"
+            f"⛔ 而**它自己永远发现不了** —— 没有任何信号会告诉一个空闲实例「有信在等你」。\n\n"
+            f"## 可做的\n\n"
+            f"1. **等它因任何原因动起来** —— Stop 钩子每回合会无条件 drain 一次收件箱；\n"
+            f"   ⚠ 但它现在空闲，可能永远不动。\n"
+            f"2. **kill 重开**（`agentnet kill {agent_id[:8]}`）——"
+            f"⛔ 代价是丢掉它已建立的上下文。\n\n"
+            f"⚠ **重开后请亲自确认新实例挂上了**：`agentnet who --alive` 里"
+            f"它的「收信」列必须是「可达」。**别只依赖任务书里的引导。**")
+    try:
+        matched, why = resolve_target(ws, parent)
+        if why is not None or not matched:
+            return False
+        write_letter(ws, agent_id, matched[0],
+                     f"[自动] 你拉起的 {agent_id[:8]} 收不到信（{unread} 封在等）",
+                     body, 'control', None, None, None)
+        return True
+    except Exception as exc:  # noqa: BLE001 —— 通知失败不该带走调用方
+        print(f"[warn] 失联通知未发出（{parent[:8]}）：{type(exc).__name__}: {exc}")
+        return False
 
 
 def notify_review_debt(ws: Workspace, agent_id: str, meta: dict[str, Any],
@@ -3884,16 +3944,27 @@ def cmd_hook(args: argparse.Namespace) -> None:
         '',
         '**现在就挂上收信器** —— 它既是你空闲时收信的唯一途径，也是你的心跳来源。',
         '',
+        '**先看你的工具列表里有没有 `Monitor`**（流式监视器），照对应那一支做：',
+        '',
+        '**A. 有 `Monitor`** —— 挂一次就够，投递后进程继续跑，不必重挂：',
+        '',
         '```',
-        "Monitor(command='agentnet watch', persistent=true)      # Claude Code：挂一次就够",
+        "Monitor(command='agentnet watch', persistent=true)",
         '```',
         '',
-        '⚠ **工具列表里看不到 `Monitor` 不等于没有**：它可能是**延迟加载**的，'
-        '先 `ToolSearch(select:Monitor)` 载入。',
-        '⛔ **没有流式监视器才回退** `agentnet poll`（用后台任务机制跑）——'
-        '它**投递即退出**，所以**每被唤醒一次就要立刻重挂一次**。',
-        '⛔ 千万别拿普通后台任务去跑 `watch`：它不退出，而后台任务机制靠"进程退出"叫你，'
-        '⇒ 你**永远不会被唤醒**。',
+        '**B. 没有 `Monitor`**（⚠ 经网关路由的会话通常就没有，2026-08-24 实测确认：'
+        '连 `ToolSearch` 都没有，所以**没法延迟加载**）—— 用后台任务机制跑 `poll`：',
+        '',
+        '```',
+        'agentnet poll        # 用你的 harness 的后台任务机制（Claude Code 是 run_in_background）',
+        '```',
+        '',
+        '🔴 **B 支最要紧的一条**：`poll` **投递即退出** ⇒ **每被唤醒一次就必须立刻重挂一次**。'
+        '漏一次，你就再也收不到信了，而且**你自己察觉不到**（进程还活着、心跳还在跳）。',
+        '',
+        '⛔ **两支都不要拿普通后台任务去跑 `watch`**：它**不退出**，'
+        '而后台任务机制靠「进程退出」叫你 ⇒ 你**永远不会被唤醒**；'
+        '且它照样 drain 收件箱 ⇒ **连 Stop 钩子每回合的兜底也一起扑空**。**比不挂更糟。**',
         '',
         '🔴 **这一条对你格外要紧**（2026-08-24 实测）：**被 spawn 拉起的实例静默中位数 332 分钟，'
         '自己启动的只有 1 分钟——差 330 倍。**',
@@ -3934,10 +4005,10 @@ def cmd_hook(args: argparse.Namespace) -> None:
         # 两者同时到达也无害：都只是让 agent 去 drain 一次。
         hook_output['initialUserMessage'] = (
             f'你的 AgentNet 收件箱里有 {pending} 封未读信（其中可能包含你的任务简报）。'
-            f'先运行 `agentnet drain` 领取，再挂上收信器'
-            f"（Claude Code：`Monitor(command='agentnet watch', persistent=true)`；"
-            f'看不到 Monitor 就先 `ToolSearch(select:Monitor)`，确实没有才用 `agentnet poll`），'
-            f'然后照信里的内容行动。'
+            f'先运行 `agentnet drain` 领取，再挂上收信器：'
+            f"**有 `Monitor` 工具**就用 `Monitor(command='agentnet watch', persistent=true)`；"
+            f'**没有**（经网关路由的会话通常没有）就用后台任务机制跑 `agentnet poll`，'
+            f'并且**每次被唤醒后立刻重挂**。然后照信里的内容行动。'
         )
     print(json.dumps({'hookSpecificOutput': hook_output}, ensure_ascii=False))
 
@@ -4386,7 +4457,17 @@ def cmd_sweep(args: argparse.Namespace) -> None:
     threshold = archive_after_s()
     victims: list[tuple[str, dict[str, Any], float, int, list[str]]] = []
     spared: list[str] = []
+    deaf: list[str] = []
     for agent_id, meta, _ in iter_agents(ctx):
+        # **聋掉的子实例**：收件箱有信、却没有活着的收信器 ⇒ 通知拉起它的那一方。
+        # 这与归档无关，所以在 threshold 判断**之前**做——一个刚回完信、
+        # 心跳还新鲜的实例照样可能已经聋了（实测 `80b6bc91`：read=6 sent=6、
+        # 静默 2 分钟、inbox 躺着第 7 封）。
+        oldest = oldest_unread_min(ctx, agent_id, at)
+        if oldest is not None and notify_deaf_child(
+                ctx, agent_id, meta, len(inbox_letters(ctx, agent_id)), oldest):
+            deaf.append(f"{agent_id[:8]}（{oldest:.0f} 分钟未读，已通知 "
+                        f"{str(meta.get('spawned_by') or '?')[:8]}）")
         stale = stale_seconds(meta, at)
         if stale <= threshold:
             continue
@@ -4400,6 +4481,11 @@ def cmd_sweep(args: argparse.Namespace) -> None:
         unread = len(inbox_letters(ctx, agent_id))
         victims.append((agent_id, meta, stale, unread, held_locks(ctx, agent_id)))
 
+    # 聋掉的子实例**与归档无关**，所以两条出口都要报——否则通知发了却没人知道发过。
+    if deaf and not args.quiet:
+        print(f"[!] {len(deaf)} 个子实例**收件箱有信却没挂收信器**，已通知其拉起方：")
+        for d in deaf:
+            print(f"    - {d}")
     if not victims:
         if not args.quiet:
             print(f"[OK] 无需归档——没有静默超过 {threshold // 60} 分钟的实例。")
