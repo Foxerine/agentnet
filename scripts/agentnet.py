@@ -219,6 +219,7 @@ INFO_FIELD_ORDER: tuple[str, ...] = (
     'unarmed_blocks',
     'unacked_letters',
     'review_debts',
+    'deaf_notified_for',
     # 语义（LLM 经 charter / log 提供）
     'topics', 'topics_updated_at', 'plan_file',
     # 血缘（仅被 spawn 出来的实例有）
@@ -2184,6 +2185,19 @@ def notify_deaf_child(ws: Workspace, agent_id: str, meta: dict[str, Any],
     真正空闲的**永远不会**取走（Stop 钩子只在回合结束时触发，
     停下等输入 ⇒ 再无回合结束 ⇒ 再不 drain）。⇒ 熬过宽限期的积压 = 真聋。
 
+    🔴 **一个积压世代只通知一次**（``deaf_notified_for``，2026-08-24 补）：
+    此前每次 sweep 都重发 —— 实测 ``ae546b89`` 一个就给它的拉起方发了 **81 封**，
+    全网 197 封。**这比误报更致命**：收件人一旦学会跳过这个标题，
+    真正的聋掉通知**也一起被跳过**，整条告警链归零。
+
+    世代键取**最老那封未读信的文件名**（名字带时间戳前缀，排序即时序）。
+    键不变 ⇒ 情况没有实质变化（哪怕又多积了几封——数量不增加任何信息，
+    拉起方已经知道它聋了）⇒ 不重发。键变了 ⇒ 对方取走过旧的又积了新的
+    ⇒ 是新一轮失联，重新通知。
+
+    ⛔ **刻意不做升级重试**：拉起方若漏看了那一封，多发 80 封也不会让它看见
+    ——那正是上面 197 封证明过的事。
+
     :return: 是否真的发出了通知（供调用方计数）。
     """
     parent = str(meta.get('spawned_by') or '')
@@ -2192,6 +2206,15 @@ def notify_deaf_child(ws: Workspace, agent_id: str, meta: dict[str, Any],
     if oldest_min < DEAF_GRACE_MIN:
         return False
     if reachability(meta) == '可达':
+        return False
+    letters = inbox_letters(ws, agent_id)
+    if not letters:
+        return False
+    # **一个积压世代只通知一次。** 键取最老那封的文件名——文件名带时间戳前缀，
+    # 排序即时序 ⇒ `[0]` 恒为最老。它取代不了的：世代**变了**（对方取走了旧的、
+    # 又积了新的）说明情况有实质变化，那时该重新通知。
+    episode = letters[0].name
+    if str(meta.get('deaf_notified_for') or '') == episode:
         return False
     name = str(meta.get('display_name') or agent_id[:8])
     body = (f"# ⚠ 你拉起的 `{agent_id[:8]}`（{name}）**收不到信**——有 {unread} 封在它收件箱里躺着\n\n"
@@ -2214,6 +2237,7 @@ def notify_deaf_child(ws: Workspace, agent_id: str, meta: dict[str, Any],
         write_letter(ws, agent_id, matched[0],
                      f"[自动] 你拉起的 {agent_id[:8]} 收不到信（{unread} 封在等）",
                      body, 'control', None, None, None)
+        merge_info(ws.info_path_of(agent_id), {'deaf_notified_for': episode}, create=False)
         return True
     except Exception as exc:  # noqa: BLE001 —— 通知失败不该带走调用方
         print(f"[warn] 失联通知未发出（{parent[:8]}）：{type(exc).__name__}: {exc}")

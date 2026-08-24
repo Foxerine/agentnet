@@ -2066,6 +2066,55 @@ class TestDeafChildNotice(Base):
                         '熬过宽限期还躺着 = 真聋，必须报')
         self.assertEqual(len(self.parent_inbox()), 1)
 
+    def test_one_notice_per_backlog_episode(self) -> None:
+        """🔴 **同一批积压只通知一次** —— 实测代价：`ae546b89` 一个就发了 81 封。
+
+        零去重时每次 sweep 都重发。**这比误报更致命**：收件人学会跳过这个标题后，
+        真正的聋掉通知也一起被跳过 ⇒ 整条告警链归零
+        （而 `DEAF_GRACE_MIN` 的 docstring 里正写着「误报会训练出忽略的习惯」，
+        紧挨着它的代码却在做同一件事 81 次）。
+
+        世代键 = 最老那封未读信的文件名。**再多积几封不改变任何信息**
+        （拉起方已经知道它聋了），⇒ 不重发。
+        """
+        self.register()
+        cid, _ = self.child(unread=1, poller=None)
+        fresh = an.read_info(self.ctx().info_path_of(cid))[0]
+        self.assertTrue(an.notify_deaf_child(self.ctx(), cid, fresh, 1, 30.0), '首次必须报')
+        self.assertEqual(len(self.parent_inbox()), 1)
+
+        # 同一批积压再扫一次 ⇒ 静默。**必须重读 info**，因为去重状态就落在那里；
+        # 传旧 meta 会让这条用例恒绿（它测的正是"状态有没有真的写回去"）。
+        again = an.read_info(self.ctx().info_path_of(cid))[0]
+        oldest = an.inbox_letters(self.ctx(), cid)[0].name
+        self.assertEqual(again.get('deaf_notified_for'), oldest, '去重键没落盘')
+        self.assertFalse(an.notify_deaf_child(self.ctx(), cid, again, 1, 40.0), '重复通知')
+        self.assertEqual(len(self.parent_inbox()), 1, '同一批积压发了第二封')
+
+    def test_new_episode_notifies_again(self) -> None:
+        """世代变了要重新报 —— 对方取走过旧的、又积了新的 = **新一轮失联**。
+
+        与上一条**只差「最老那封是不是同一封」**，其余全同 ⇒ 真差分。
+        """
+        self.register()
+        cid, _ = self.child(unread=1, poller=None)
+        meta = an.read_info(self.ctx().info_path_of(cid))[0]
+        an.notify_deaf_child(self.ctx(), cid, meta, 1, 30.0)
+        self.assertEqual(len(self.parent_inbox()), 1)
+
+        # 它取走了那封（inbox 清空），随后又来一封新的 ⇒ 世代键变化。
+        inbox = self.ctx().agent_dir(cid) / 'inbox'
+        for p in inbox.glob('*.md'):
+            p.unlink()
+        an.write_doc(inbox / '20260824T235959-p-1-new.md',
+                     {'id': 'new', 'from': 'p-1', 'subject': 's',
+                      'created_at': an.now() - timedelta(minutes=30)},
+                     '正文', an.LETTER_FIELD_ORDER)
+        meta2 = an.read_info(self.ctx().info_path_of(cid))[0]
+        self.assertTrue(an.notify_deaf_child(self.ctx(), cid, meta2, 1, 30.0),
+                        '新一轮失联被旧的去重键吃掉了')
+        self.assertEqual(len(self.parent_inbox()), 2)
+
     def test_notice_says_it_is_probably_alive(self) -> None:
         """⛔ 措辞不能诱导 kill —— 这种形态**通常还活着**，kill 会丢掉已有上下文。"""
         self.register()
