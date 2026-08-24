@@ -536,7 +536,8 @@ class TestRearmNotice(Base):
         ⇒ **用它做判据必然漏掉幽灵**。而"顶掉"的代价实测很小：旧的干净退位、无残留。
 
         ⚠ 唯一例外（也断言）：**每回合必发的死循环**下应当停止重挂——
-        继续挂只会烧回合，而 Stop 钩子每回合 drain 保证不会失联。
+        继续挂只会烧回合；活动期间 Stop 钩子仍会 drain，
+        但**空闲后就收不到了**（2026-08-24 订正，见 `LOOP_EXCEPTION_LINE`）。
         """
         self.assertIn('即使 `agentnet whoami` 说「运行中」'.replace('agentnet ', ''),
                       an.REARM_NOTICE)
@@ -559,7 +560,12 @@ class TestRearmNotice(Base):
         self.assertGreater(len(long_notice), 400, '首次提示应当是完整版')
         self.assertLess(len(brief), 200, '拦满后仍在重发全文')
         self.assertIn('agentnet poll', brief, '缩短版丢了恢复方式')
-        self.assertIn('不会失联', brief, '缩短版丢了"不挂也收得到信"这条关键事实')
+        # 🔴 **两半都得在**（2026-08-24 订正）：这一行发出的时刻，恰好是拦截配额
+        # 耗尽、对方即将转入空闲的时刻——只说"还能收到"是**危险的半个真相**。
+        self.assertIn('还在回合里', brief, '缩短版丢了"活动时仍收得到"这一半')
+        self.assertIn('空闲', brief, '缩短版丢了"空闲后就收不到"这一半（更要紧的那半）')
+        self.assertNotIn('不会失联', brief,
+                         '这句已被实测推翻：Stop 钩子只在回合末触发，空闲即失联')
 
     def test_every_rearm_prompt_carries_the_loop_exception(self) -> None:
         """**给重挂指引的每一处都必须带死循环例外**——只补一处等于没补。
@@ -572,7 +578,12 @@ class TestRearmNotice(Base):
         这条用例把那个清单钉死，新增指引点时会红。
         """
         self.assertIn('死循环', an.LOOP_EXCEPTION_LINE)
-        self.assertIn('不会失联', an.LOOP_EXCEPTION_LINE, '没说清停挂的代价')
+        # 停挂的代价必须**两半齐全**：活动时仍收得到 + 空闲后就收不到。
+        # 2026-08-24 之前这里只断言"不会失联"，而那是被实测推翻的半个真相
+        # （探针收到测试信，是因为它当时正被本钩子顶着逐轮转，并非"无条件送达"）。
+        self.assertIn('还在回合里', an.LOOP_EXCEPTION_LINE, '没说清"活动时仍收得到"')
+        self.assertIn('空闲', an.LOOP_EXCEPTION_LINE, '没说清"空闲后就收不到"')
+        self.assertNotIn('不会失联', an.LOOP_EXCEPTION_LINE, '已被推翻的措辞复活了')
         # **断言三处都引用了那个单一来源**，而不是各自抄一份措辞——
         # 抄一份就会各自漂移，而漂移正是这条用例要防的。
         self.assertIn(an.LOOP_EXCEPTION_LINE, an.REARM_NOTICE, 'REARM_NOTICE 未引用')
@@ -2028,6 +2039,32 @@ class TestDeafChildNotice(Base):
         cid, meta = self.child(unread=1, poller=None)
         meta.pop('spawned_by')
         self.assertFalse(an.notify_deaf_child(self.ctx(), cid, meta, 1, 30.0))
+
+    def test_grace_period_suppresses_fresh_backlog(self) -> None:
+        """🔴 **刚到的信不算聋** —— 首次实战命中 `9d4d284b` 就是误报。
+
+        它当时**正在逐轮回信**：Stop 钩子在每个回合末 drain 收件箱、
+        把信续进下一回合 ⇒ 几秒内就取走了，而通知已经发给拉起方了。
+
+        ⭐ 判据只能是**信件积压时长**，⛔ 不能是心跳静默时长
+        （`test_fresh_heartbeat_still_reported` 那条依然成立：
+        心跳新鲜的实例照样可能已空闲）。二者测的是不同的东西：
+        心跳说的是"它上一回合什么时候结束"，积压说的是"它还会不会有下一回合"。
+
+        本用例与 `test_fresh_heartbeat_still_reported` **只差 `oldest_min`**
+        （1 分钟 vs 30 分钟），其余全同 ⇒ 真差分，不是恒真守卫。
+        """
+        self.register()
+        cid, meta = self.child(unread=1, poller=None)
+        self.assertLess(1.0, an.DEAF_GRACE_MIN, '前提：1 分钟必须落在宽限期内')
+        self.assertFalse(an.notify_deaf_child(self.ctx(), cid, meta, 1, 1.0),
+                         '刚到 1 分钟的信就报聋 —— 正在回合里的实例会被误伤')
+        self.assertEqual(self.parent_inbox(), [], '发出了噪音通知')
+        # 同一实例、同一状态，只把积压时长推过宽限期 ⇒ 必须报。
+        self.assertTrue(an.notify_deaf_child(self.ctx(), cid, meta, 1,
+                                             an.DEAF_GRACE_MIN + 0.1),
+                        '熬过宽限期还躺着 = 真聋，必须报')
+        self.assertEqual(len(self.parent_inbox()), 1)
 
     def test_notice_says_it_is_probably_alive(self) -> None:
         """⛔ 措辞不能诱导 kill —— 这种形态**通常还活着**，kill 会丢掉已有上下文。"""
