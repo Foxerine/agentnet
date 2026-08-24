@@ -3776,14 +3776,6 @@ def _args_reset(p: argparse.ArgumentParser) -> None:
     p.add_argument('--task', help='重生后的首个任务（短文本）')
 
 
-@command(
-    'reset',
-    '重置一个 agent 的对话：终止 + 用全新 session id 原地重生',
-    'agentnet reset <id前缀> [--task-file t.md | --task "..."]',
-    detail=('按它的 spawn_recipe 原样重生——mode / window / 命令 / 主题 / 职责全部带回，'
-            '只有对话是全新的。不去碰 harness 的内部管道，所以对任何 harness 都成立。'),
-    add_args=_args_reset,
-)
 def spawn_args(**overrides: Any) -> argparse.Namespace:
     """从**真正的 spawn 解析器**取全部默认值，再覆盖指定项。
 
@@ -3808,6 +3800,14 @@ def spawn_args(**overrides: Any) -> argparse.Namespace:
     return ns
 
 
+@command(
+    'reset',
+    '重置一个 agent 的对话：终止 + 用全新 session id 原地重生',
+    'agentnet reset <id前缀> [--task-file t.md | --task "..."]',
+    detail=('按它的 spawn_recipe 原样重生——mode / window / 命令 / 主题 / 职责全部带回，'
+            '只有对话是全新的。不去碰 harness 的内部管道，所以对任何 harness 都成立。'),
+    add_args=_args_reset,
+)
 def cmd_reset(args: argparse.Namespace) -> None:
     ctx = Ctx()
     target = resolve_single_target(ctx, args.target)
