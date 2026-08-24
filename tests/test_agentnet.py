@@ -1945,6 +1945,114 @@ class TestCommandRegistryWiring(Base):
             self.assertEqual(params, ['args'], f"`{cmd.name}` 的签名是 {params}")
 
 
+class TestReviewDebt(Base):
+    """终态信欠账：收到评审请求即记账，**只有结构化终态信**能销账。
+
+    `c4b0fb44` 2026-08-22 报告：作者的推进条件是 `review-resolved`/`review-blocked`，
+    而 reviewer 的本地 final 文本**对作者不可见**。⇒ 只输出普通 final 就结束会话时，
+    作者看到的是「还在审」——⛔ **没有任何超时能区分「慢审」与「漏交付」**，
+    一次遗漏变成**无上界等待**。
+
+    它要求覆盖五种情况，下面逐条对应。
+    """
+
+    def request(self, thread: str = 't1', kind: str = 'review-request') -> Path:
+        p = self.ctx().home / 'inbox' / f'20260822T{thread}0000-req-aa.md'
+        p.parent.mkdir(parents=True, exist_ok=True)
+        an.write_doc(p, {'id': 'x', 'from': 'requester-1', 'kind': kind,
+                         'thread': thread, 'subject': 's'}, '正文', an.LETTER_FIELD_ORDER)
+        return p
+
+    def debts(self) -> list:
+        return [str(d) for d in (an.read_info(self.ctx().info_path)[0].get('review_debts') or [])]
+
+    def test_request_creates_debt(self) -> None:
+        self.register()
+        an.record_review_debts(self.ctx(), an.peek_letters([self.request()]))
+        self.assertEqual(self.debts(), ['t1|requester-1'])
+
+    def test_terminal_kinds_clear_it(self) -> None:
+        """情况①②：正常 resolved / 正常 blocked ⇒ 销账。"""
+        for kind in ('review-resolved', 'review-blocked'):
+            with self.subTest(kind=kind):
+                self.register()
+                an.record_review_debts(self.ctx(), an.peek_letters([self.request()]))
+                self.assertIn(kind, an.TERMINAL_REVIEW_KINDS)
+                an.clear_review_debt(self.ctx(), 't1')
+                self.assertEqual(self.debts(), [])
+
+    def reply_with(self, kind: str | None) -> None:
+        """**走真实的 `cmd_reply`** —— 销账逻辑在它里面，不在常量集合里。"""
+        req = self.request()
+        an.record_review_debts(self.ctx(), an.peek_letters([req]))
+        peer = self.ctx().agents_dir / 'requester-1'
+        (peer / 'inbox').mkdir(parents=True, exist_ok=True)
+        an.write_doc(peer / 'info.md', {'id': 'requester-1', 'status': an.STATUS_ACTIVE,
+                                        'last_active': an.now()}, '', an.INFO_FIELD_ORDER)
+        an.consume(self.ctx(), [req])                       # 搬进 read/，reply 从那里找
+        body = self.tmp / 'reply.md'
+        body.write_text('结论', encoding='utf-8')
+        an.cmd_reply(argparse.Namespace(
+            to_letter=req.name, body_file=str(body), body=None,
+            subject=None, kind=kind, force=True))
+
+    def test_plain_letter_does_not_clear(self) -> None:
+        """情况⑤：**只发普通 letter 不算交付** —— 欠账必须还在。
+
+        ⛔ 这条是整个机制的要害：若普通 letter 能销账，
+        「我审完了」这类自然语言就会被当成终态，而作者根本收不到可判定的信号。
+
+        ⚠ 第一版只断言 `'letter' not in TERMINAL_REVIEW_KINDS` —— 那测的是**常量集合**，
+        不是销账代码，集合恒不含 letter ⇒ **变异（去掉 kind 判断）照样绿**。
+        现在走真实的 `cmd_reply`。
+        """
+        self.register()
+        self.reply_with('letter')
+        self.assertEqual(self.debts(), ['t1|requester-1'],
+                         '普通 letter 销掉了欠账——终态判据被架空')
+
+    def test_terminal_reply_clears_through_cmd_reply(self) -> None:
+        """对照组：同一条路径发终态信 ⇒ 必须销账（否则上一条可能只是"永远不销"）。"""
+        self.register()
+        self.reply_with('review-blocked')
+        self.assertEqual(self.debts(), [])
+
+    def test_wrong_thread_does_not_clear(self) -> None:
+        """情况④：回复到**错误 thread** ⇒ 原欠账不动。"""
+        self.register()
+        an.record_review_debts(self.ctx(), an.peek_letters([self.request('t1')]))
+        an.clear_review_debt(self.ctx(), 'some-other-thread')
+        self.assertEqual(self.debts(), ['t1|requester-1'])
+
+    def test_exit_with_debt_notifies_the_waiter(self) -> None:
+        """情况③：**漏回信就离场 ⇒ 等待方收到通知**。
+
+        ⭐ 这是把「无上界等待」变成「有界 + 有通知」的那一环，上界 = 归档阈值。
+        """
+        self.register()
+        waiter = self.ctx().agents_dir / 'requester-1'
+        (waiter / 'inbox').mkdir(parents=True, exist_ok=True)
+        an.write_doc(waiter / 'info.md', {'id': 'requester-1', 'status': an.STATUS_ACTIVE,
+                                          'last_active': an.now()}, '', an.INFO_FIELD_ORDER)
+        an.record_review_debts(self.ctx(), an.peek_letters([self.request()]))
+        meta, _ = an.read_info(self.ctx().info_path)
+        an.notify_review_debt(self.ctx(), self.agent_id, meta, silent_min=125)
+        got = list((waiter / 'inbox').glob('*.md'))
+        self.assertEqual(len(got), 1, '欠账方离场时没有通知等待方')
+        text = got[0].read_text(encoding='utf-8')
+        self.assertIn('没有发出终态信', text)
+        self.assertIn('不会来了', text, '没说清那封信永远不会来——那正是要传达的')
+
+    def test_no_debt_no_notification(self) -> None:
+        """没欠账就别发通知——否则每次归档都在制造噪声。"""
+        self.register()
+        waiter = self.ctx().agents_dir / 'requester-1'
+        (waiter / 'inbox').mkdir(parents=True, exist_ok=True)
+        meta, _ = an.read_info(self.ctx().info_path)
+        an.notify_review_debt(self.ctx(), self.agent_id, meta, silent_min=125)
+        self.assertEqual(list((waiter / 'inbox').glob('*.md')), [])
+
+
 class TestReachabilityIsNotStatus(Base):
     """**「进程在动」与「投信有人接」是两件事** —— 此前被折成一个 `active`。
 

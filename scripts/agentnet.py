@@ -218,6 +218,7 @@ INFO_FIELD_ORDER: tuple[str, ...] = (
     'pid', 'status', 'last_active', 'harness', 'display_name', 'poller_pid',
     'unarmed_blocks',
     'unacked_letters',
+    'review_debts',
     # 语义（LLM 经 charter / log 提供）
     'topics', 'topics_updated_at', 'plan_file',
     # 血缘（仅被 spawn 出来的实例有）
@@ -2028,6 +2029,10 @@ def cmd_reply(args: argparse.Namespace) -> None:
     path = write_letter(ctx, ctx.agent_id, recipient, subject, body, kind,
                         str(original.get('thread') or ''), str(original.get('id') or ''), None)
     print(f"[OK] 已回复 {recipient[:8]}  thread={original.get('thread')}  {path.name}")
+    # 销账**只认结构化终态** —— 普通 letter / "我审完了" 这类自然语言都不算
+    # （`c4b0fb44` 第 4 条：作者等的是 kind，不是措辞）。
+    if kind in TERMINAL_REVIEW_KINDS:
+        clear_review_debt(ctx, str(original.get('thread') or ''))
 
 
 def inbox_letters(ws: Workspace, agent_id: str) -> list[Path]:
@@ -2077,6 +2082,80 @@ def peek_letters(paths: list[Path]) -> list[tuple[dict[str, Any], str, Path]]:
             continue
         out.append((meta, body, path))
     return out
+
+
+def record_review_debts(ctx: Ctx, items: list[tuple[dict[str, Any], str, Path]]) -> None:
+    """收到评审请求 ⇒ 记一笔**终态信欠账**（thread + 请求方）。
+
+    **为什么需要它**（``c4b0fb44`` 2026-08-22 报告）：作者的推进条件是**结构化终态信**
+    （``review-resolved`` / ``review-blocked``），而 reviewer 的本地 final 文本
+    **对作者不可见**。⇒ reviewer 只输出普通 final 就结束会话时，
+    作者看到的是「还在审」——⛔ **而没有任何超时能区分「慢审」与「漏交付」**，
+    于是一次容易修复的遗漏变成**无上界等待**。
+
+    ⛔ **刻意不做"拦住 reviewer 不让它结束"**（那是报告者的首选方案，我不采纳）：
+    ① 拦截只在 reviewer **还活着**时有效，而实测最常见的形态是它**已经死了或卡住**
+       ——死掉的实例拦不住，但作者仍在等；
+    ② 拦截换来的是**高频打断**，实测 Stop 钩子连拦九次后被 harness 强制放行，
+       对贴着上下文上限的实例尤其贵。
+    ⇒ 改为**在欠账方离场时通知等待方**（见 :func:`notify_review_debt`）——
+    它**不依赖 reviewer 配合**，也不消耗任何人的回合。
+    """
+    debts = [f"{meta.get('thread')}|{meta.get('from')}" for meta, _, _ in items
+             if str(meta.get('kind')) in ('review-request', 'errand') and meta.get('thread')]
+    if not debts:
+        return
+    existing = read_info(ctx.info_path)[0].get('review_debts') or []
+    merged = list(dict.fromkeys([*existing, *debts]))     # 去重且保序
+    merge_info(ctx.info_path, {'review_debts': merged}, create=False)
+
+
+def notify_review_debt(ws: Workspace, agent_id: str, meta: dict[str, Any],
+                       silent_min: int) -> None:
+    """欠着终态信的 agent 被归档 ⇒ **给每个等待方投一封信**。
+
+    ⭐ **这是把「无上界等待」变成「有界 + 有通知」的那一环**，上界 = 归档阈值。
+    作者等的是结构化终态信；欠账方一旦离场，那封信**永远不会来了**，
+    而作者这一侧看到的只是「还在审」——**没有任何超时能区分慢审与漏交付**。
+
+    ⚠ **失败不得炸穿 sweep**：通知是附加价值，归档才是本职
+    （同 :func:`run_opportunistic` 的理由）。
+    """
+    debts = [str(d) for d in (meta.get('review_debts') or [])]
+    if not debts:
+        return
+    name = str(meta.get('display_name') or agent_id[:8])
+    for debt in debts:
+        thread, _, requester = debt.partition('|')
+        if not requester:
+            continue
+        body = (f"# ⚠ 你等的 `{agent_id[:8]}`（{name}）已归档，**且没有发出终态信**\n\n"
+                f"它静默 {silent_min} 分钟后被 sweep 归档，而 thread `{thread}` 上\n"
+                f"**始终没有收到它的 `review-resolved` / `review-blocked`**。\n\n"
+                f"⇒ 你等的那封信**不会来了**。这条通知的存在，是为了让"
+                f"「还在审」与「已经没人在审」可区分——\n"
+                f"   否则你只能一直等（没有任何超时能区分慢审与漏交付）。\n\n"
+                f"**可做的**：`agentnet restore {agent_id[:8]}` 取回它的历史"
+                f"（含它可能已写好但没发出的东西），或重新 spawn 一个接手。\n"
+                f"⛔ 重开之前先确认后端是否健康——若它是死在上游故障上，"
+                f"新实例会死在同一处。")
+        try:
+            matched, why = resolve_target(ws, requester)
+            if why is not None or not matched:
+                continue
+            write_letter(ws, agent_id, matched[0],
+                         f"[自动] 你等的 {agent_id[:8]} 已归档且未发终态信",
+                         body, 'control', thread, None, None)
+        except Exception as exc:  # noqa: BLE001 —— 通知失败不该带走归档
+            print(f"[warn] 欠账通知未发出（{requester[:8]}）：{type(exc).__name__}: {exc}")
+
+
+def clear_review_debt(ctx: Ctx, thread: str) -> None:
+    """发出终态信 ⇒ 销账。⛔ 只认结构化终态，普通 ``letter`` 不算。"""
+    existing = [str(d) for d in (read_info(ctx.info_path)[0].get('review_debts') or [])]
+    remaining = [d for d in existing if not d.startswith(f"{thread}|")]
+    if len(remaining) != len(existing):
+        merge_info(ctx.info_path, {'review_debts': remaining or None}, create=False)
 
 
 def record_unacked(ctx: Ctx, items: list[tuple[dict[str, Any], str, Path]]) -> None:
@@ -2370,7 +2449,9 @@ def poll_loop(args: argparse.Namespace, *, stream: bool) -> None:
                 # 反过来记的代价是**可能多记**（登记了却没来得及 consume）——
                 # 那种情况下信还在 inbox，下一轮照常 drain，登记项被正常清掉。
                 # **重复显示安全，丢失不安全。**
-                record_unacked(ctx, peek_letters(pending))
+                previewed = peek_letters(pending)
+                record_unacked(ctx, previewed)
+                record_review_debts(ctx, previewed)
                 items = consume(ctx, pending)
                 if items:
                     if stream:
@@ -2547,7 +2628,11 @@ def cmd_drain(args: argparse.Namespace) -> None:
         if args.hook:
             print('{}')
         return
-    items = consume(ctx, inbox_letters(ctx, ctx.agent_id))
+    # 与 poll_loop 同序：**先落 durable 意图，再推进状态**（设计哲学 §13）。
+    _pending = inbox_letters(ctx, ctx.agent_id)
+    if _pending:
+        record_review_debts(ctx, peek_letters(_pending))
+    items = consume(ctx, _pending)
     meta, _ = read_info(ctx.info_path)
     poller = meta.get('poller_pid')
     armed = isinstance(poller, int) and pid_alive(poller)
@@ -2666,7 +2751,24 @@ def cmd_last(args: argparse.Namespace) -> None:
             meta, body = parse_doc(path)
             received.append((meta, body, path))
     if not received:
-        print('（还没收到过任何信）')
+        # 🔴 **别把「我这边看不到」说成「它不存在」。** 归档会把整个目录（含 read/、
+        # inbox/）挪进 `archive/<id>-<ts>/`，于是重新注册后这里空空如也——
+        # 而实例会据此得出「**对方没回**」这个**错误的否定结论，且指向别人**，
+        # 引发一轮无意义的追问（`81cfd2ac` 2026-08-22 实测：两封终审裁定因此被误判为
+        # "对方没回"，实际早已送达，最后是手动翻对方 sent/ 才发现）。
+        buried = 0
+        for copy in sorted(ctx.archive_dir.glob(f"{ctx.agent_id}*")) \
+                if ctx.archive_dir.is_dir() else []:
+            if copy.is_dir() and strip_archive_stamp(copy.name) == ctx.agent_id:
+                for sub in ('read', 'inbox'):
+                    buried += len(list((copy / sub).glob('*.md'))) if (copy / sub).is_dir() else 0
+        if buried:
+            print(f'（此身份**当前**没有信件——但归档里还留着 {buried} 封。）')
+            print(f'  历史在 `archive/{ctx.agent_id[:8]}…/`；'
+                  f'`agentnet restore {ctx.agent_id[:8]}` 可连同信件一起取回。')
+            print(f'  ⛔ **别据此判断「对方没回」**——很可能它早就回了，信在归档里。')
+        else:
+            print('（还没收到过任何信）')
         return
     received.sort(key=lambda item: str(item[0].get('created_at') or ''))
     chosen = received[-max(1, args.count):]
@@ -2817,10 +2919,9 @@ def cmd_log(args: argparse.Namespace) -> None:
 SPAWN_MODES = ('tab', 'window', 'pane', 'named', 'background')
 
 def url_reachable(url: str, timeout: float = 3.0) -> tuple[bool, str]:
-    """后端是否可达。任何 HTTP 应答（含 4xx/5xx）都算可达——我们只关心有没有人在监听。
+    """**有没有人在监听**。任何 HTTP 应答（含 4xx/5xx）都算可达。
 
-    用于拉起前的预检：一个后端不通的实例会在第一句话就报错，与其让人对着报错猜，
-    不如在拉起前就拦住并说清是哪个地址不通。
+    ⚠ 它只回答连通性，**不回答"问得到模型吗"** —— 见 :func:`backend_can_answer`。
     """
     import urllib.error
     import urllib.request
@@ -2831,6 +2932,52 @@ def url_reachable(url: str, timeout: float = 3.0) -> tuple[bool, str]:
         return True, f'HTTP {exc.code}（有人在监听即可）'
     except Exception as exc:  # noqa: BLE001 —— 连接层的失败形态很多，一律视为不可达
         return False, f'{type(exc).__name__}: {exc}'
+
+
+def backend_can_answer(base_url: str, env: dict[str, str],
+                       timeout: float = 20.0) -> tuple[bool, str]:
+    """**端到端**探测：真发一次最小 completion，看拿不拿得到回答。
+
+    🔴 **为什么不能只用** :func:`url_reachable`（2026-08-22 实测代价 >24 小时）：
+    网关本身返回 ``HTTP 200 / 1.5ms``，而它的**上游**同期在返
+    ``503 auth_unavailable: no auth available (providers=codex)``。
+    ⇒ 预检通过 ⇒ 拉起 ⇒ 实例一开口就撞上 503 ⇒ 卡在等一个永远失败的后端。
+    实测三个 reviewer 因此死亡、一个从出生起就不可用。
+
+    ⭐ **探的是代理，不是命题**：「端口在监听」是「问得到模型」的**代理**，
+    而代理通过时命题可以是假的。这里改成直接验命题。
+
+    ⚠ **刻意 fail-open**：只有拿到**明确的上游错误**（4xx/5xx + 响应体）才判失败。
+    超时 / 连接层异常一律放行——那些可能只是本次慢，而**误拦一次拉起的代价**
+    （人要重来一轮、且会怀疑 agentnet 坏了）大于**放过一次**（实例自己会报错）。
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+    payload = _json.dumps({
+        'model': env.get('ANTHROPIC_MODEL') or 'claude-3-5-haiku-20241022',
+        'max_tokens': 1,
+        'messages': [{'role': 'user', 'content': 'hi'}],
+    }).encode()
+    req = urllib.request.Request(
+        base_url.rstrip('/') + '/v1/messages', data=payload, method='POST',
+        headers={'content-type': 'application/json',
+                 'anthropic-version': '2023-06-01',
+                 'x-api-key': env.get('ANTHROPIC_AUTH_TOKEN')
+                              or env.get('ANTHROPIC_API_KEY') or 'probe'})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout):
+            return True, 'ok（端到端）'
+    except urllib.error.HTTPError as exc:
+        body = ''
+        try:
+            body = exc.read().decode('utf-8', 'replace')[:300]
+        except Exception:  # noqa: BLE001 —— 读不到响应体不影响判定
+            pass
+        return False, f'上游返回 HTTP {exc.code}：{body}'
+    except Exception as exc:  # noqa: BLE001
+        # fail-open：见 docstring。把原因说出来，但不拦。
+        return True, f'探测未完成（放行）：{type(exc).__name__}: {exc}'
 
 
 def resolve_launcher(name: str) -> list[str]:
@@ -3265,6 +3412,9 @@ def _args_spawn(p: argparse.ArgumentParser) -> None:
     p.add_argument('--topics', help='为新实例预设的负责主题')
     p.add_argument('--name', help='显示名 / 分页标题')
     p.add_argument('--dry-run', action='store_true', help='只打印将要执行的命令，不真启动')
+    p.add_argument('--skip-healthcheck', action='store_true',
+                   help='跳过后端预检强行拉起。**只在你已知后端在恢复中、且愿意承担'
+                        '"实例可能一开口就卡住"时用**')
 
 
 @command(
@@ -3322,11 +3472,25 @@ def cmd_spawn(args: argparse.Namespace) -> None:
 
     role_env = Config.role_env(role_name)
     health = Config.role_healthcheck(role_name)
-    if health and not args.dry_run:
+    if health and args.skip_healthcheck:
+        print(f"[warn] 已跳过后端预检（--skip-healthcheck）。"
+              f"若上游正在报错，这个实例可能一开口就卡住且永不产出。")
+    elif health and not args.dry_run:
         reachable, why = url_reachable(health)
         if not reachable:
             _die(f"角色 `{role_name}` 的后端不可达：{health}\n  {why}\n"
                  f"  现在拉起只会得到一个第一句话就报错的实例，所以先拦下来。")
+        # **端口在监听 ≠ 问得到模型。** 网关会 200，而它的上游可能正在 503。
+        # 只有拿到明确的上游错误才拦；超时/连接异常放行（见 backend_can_answer）。
+        answers, detail = backend_can_answer(health, role_env)
+        if not answers:
+            _die(f"角色 `{role_name}` 的后端**在监听但答不了**：{health}\n"
+                 f"  {detail}\n"
+                 f"  ⇒ 拉起来它会卡在等一个失败的上游：进程活着、CPU 低、"
+                 f"**永远不再产出**（2026-08-22 实测三个 reviewer 因此死亡）。\n"
+                 f"  先修上游，或临时 `--skip-healthcheck` 强行拉起。")
+        if detail != 'ok（端到端）':
+            print(f"[warn] 端到端探测未能完成，已放行：{detail}")
 
     child_kind = launcher_name
     if role.get('claude_compatible') and len(launcher_parts) == 1:
@@ -4224,7 +4388,11 @@ def cmd_sweep(args: argparse.Namespace) -> None:
         print('\n'.join(lines))
         return
 
-    for agent_id, _, stale, _, _ in victims:
+    for agent_id, meta, stale, _, _ in victims:
+        # **带着未了的终态信欠账离场 ⇒ 通知等待方。** 这是把「无上界等待」变成
+        # 「有界 + 有通知」的唯一环节：作者等的是结构化终态信，而它永远不会来了。
+        # 上界 = 归档阈值。⛔ 必须在 archive_agent 之前发——之后目录就搬走了。
+        notify_review_debt(ctx, agent_id, meta, int(stale // 60))
         released = archive_agent(ctx, agent_id, 'sweep',
                                  f'no heartbeat for {int(stale // 60)}m')
         if released:
