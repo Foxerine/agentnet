@@ -2241,6 +2241,62 @@ class TestSpawnArgsCoverAllReads(Base):
         self.assertFalse(ns.skip_healthcheck, '未覆盖项应保留解析器默认值')
 
 
+class TestOneshotSessionGuidance(Base):
+    """一次性调用形态（`-p`）**不得**收到任何"挂收信器"的引导。
+
+    🔴 **实测代价（2026-08-25）**：`claude -p` 跑「回一个数字 7」花了 **5 轮 / $2.13**
+    ——多出来的轮次全用在挂一个它**根本不需要**的 watch 上。
+    一次性调用是**同步**的（调用方直接拿 stdout），没有异步、没有空闲期、不会失联。
+
+    ⚠ **为什么判据是自有环境变量而不是 harness 给的字段**（都实测过）：
+    - `SessionStart` 的 `source` 对 `-p` 与交互式**都是 `startup`** ⇒ 区分不了；
+    - `AI_AGENT` 后缀**不稳定**——同为 `-p`，实测既见过 `_agent` 也见过 `_harness`
+      ⇒ 拿它当判据会**间歇性失效**，而那种缺陷不会快速失败。
+    """
+
+    ARM_MARKERS = ('Monitor(', 'agentnet poll', '挂上收信器', '重挂')
+
+    def emit(self, *, oneshot: bool, pending: int = 0) -> str:
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            an.emit_session_start(['接入信息'], pending, oneshot=oneshot, title='nm')
+        return buf.getvalue()
+
+    def test_oneshot_output_has_no_arming_guidance(self) -> None:
+        text = self.emit(oneshot=True, pending=3)
+        for marker in self.ARM_MARKERS:
+            self.assertNotIn(marker, text, f'一次性形态仍在教挂收信器：{marker}')
+
+    def test_resident_output_still_arms(self) -> None:
+        """⚠ 防恒真：常驻形态**必须**保留引导，否则上面那条测不出东西。"""
+        text = self.emit(oneshot=False, pending=3)
+        self.assertIn('Monitor(', text, '常驻形态丢了收信器引导')
+
+    def test_both_forms_still_push_the_task(self) -> None:
+        """⭐ 跳过的只有保活——「有信要 drain」这条**两种形态都必须在**。"""
+        for oneshot in (True, False):
+            with self.subTest(oneshot=oneshot):
+                self.assertIn('agentnet drain', self.emit(oneshot=oneshot, pending=2))
+
+    def test_no_task_no_initial_message(self) -> None:
+        self.assertNotIn('initialUserMessage', self.emit(oneshot=True, pending=0))
+
+    def test_env_flag_semantics(self) -> None:
+        """`0` 与空字符串都算「不是一次性」——⛔ 别让 `AGENTNET_ONESHOT=0` 反而生效。"""
+        for value, expected in (('1', True), ('true', True), ('0', False), ('', False)):
+            with self.subTest(value=value):
+                old = os.environ.get(an.ONESHOT_ENV)
+                os.environ[an.ONESHOT_ENV] = value
+                try:
+                    self.assertIs(an.is_oneshot_session(), expected)
+                finally:
+                    if old is None:
+                        os.environ.pop(an.ONESHOT_ENV, None)
+                    else:
+                        os.environ[an.ONESHOT_ENV] = old
+
+
 class TestReviewDebt(Base):
     """终态信欠账：收到评审请求即记账，**只有结构化终态信**能销账。
 

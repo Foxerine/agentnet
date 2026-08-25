@@ -4006,6 +4006,63 @@ def _args_hook(p: argparse.ArgumentParser) -> None:
     p.add_argument('event', choices=('session-start', 'stop'), help='钩子事件')
 
 
+ONESHOT_ENV = 'AGENTNET_ONESHOT'
+"""**一次性调用形态**的标记 —— 由 agentnet 自己在发起 ``-p`` 调用时注入。
+
+⭐ **为什么用自有环境变量，而不是读 harness 给的字段**（2026-08-25 实测定案）：
+
+* ``SessionStart`` 的 ``source`` 对 ``-p`` 与交互式**都是 ``startup``** ⇒ 区分不了；
+* ``AI_AGENT`` 的后缀**不稳定**——同样是 ``-p``，实测既出现过 ``_agent``
+  也出现过 ``_harness`` ⇒ 拿它当形态判据会**间歇性失效**，而那种缺陷不会快速失败。
+
+⇒ 唯一可靠的是**我们自己写进去的东西**：谁发起调用谁打标，读的人不必推断。
+
+**这个标记只表达一件事**：本会话是**同步一次性调用**，调用方会直接拿到 stdout
+⇒ 它**不需要收信器**（没有异步、没有空闲期、不会失联）。
+⛔ 它**不表示**"权限更低"或"不是网络节点"——身份注册照常，只是不注入保活引导。
+"""
+
+
+def is_oneshot_session() -> bool:
+    """本会话是不是一次性调用形态。见 :data:`ONESHOT_ENV`。"""
+    return os.environ.get(ONESHOT_ENV, '') not in ('', '0')
+
+
+def emit_session_start(lines: list[str], pending: int, *,
+                       oneshot: bool, title: Any = None) -> None:
+    """SessionStart 的**唯一**输出出口。
+
+    ⭐ **两条形态（常驻 / 一次性）共用它，是为了不出现"同一判定两份实现"**
+    ——那正是本项目记过的缺陷来源：两份实现必然漂移，而漂移只在其中一条路径上显形。
+
+    :param pending: 收件箱未读数；>0 时给一条 ``initialUserMessage`` 作"第一推动"
+    :param oneshot: 一次性形态 ⇒ 推动语**不含**任何挂收信器的内容（它不需要）
+    :param title: 有显示名就设 ``sessionTitle``
+    """
+    out: dict[str, Any] = {
+        'hookEventName': 'SessionStart',
+        'additionalContext': '\n'.join(lines),
+    }
+    if title:
+        out['sessionTitle'] = str(title)
+    if pending:
+        # 收件箱里有信 ⇒ 给一条首条用户消息把它推动起来。
+        # **不消费收件箱**（早先在这里消费过，结果信被移走却没送达，任务静默蒸发）。
+        #
+        # 这条路径不经 argv，所以对那些会吞掉位置参数的启动器（如经 cmd /c 的 ccrg）
+        # 是唯一可靠的"第一推动"。argv 上的 BOOTSTRAP_PROMPT 是给能收到它的启动器用的，
+        # 两者同时到达也无害：都只是让 agent 去 drain 一次。
+        arm = ('' if oneshot else
+               '再挂上收信器：'
+               "**有 `Monitor` 工具**就用 `Monitor(command='agentnet watch', persistent=true)`；"
+               '**没有**就用后台任务机制跑 `agentnet poll`，并且**每次被唤醒后立刻重挂**。')
+        out['initialUserMessage'] = (
+            f'你的 AgentNet 收件箱里有 {pending} 封未读信（其中可能包含你的任务简报）。'
+            f'先运行 `agentnet drain` 领取，{arm}然后照信里的内容行动。'
+        )
+    print(json.dumps({'hookSpecificOutput': out}, ensure_ascii=False))
+
+
 @command(
     'hook',
     'Claude Code 钩子入口（session-start / stop）',
@@ -4091,6 +4148,25 @@ def cmd_hook(args: argparse.Namespace) -> None:
             '`agentnet drain` 领取——**那封信里写的才是你本次会话要做的事**。',
             '下面的接入步骤都只是准备工作；**在把结果回信给发信人之前，本次会话没有交付**。',
         ]
+    if is_oneshot_session():
+        # 🔴 **一次性调用不需要收信器**（见 :data:`ONESHOT_ENV`）：调用方同步拿 stdout，
+        # 没有异步、没有空闲期、不会失联。⇒ 下面整段保活引导对它**纯属浪费**。
+        #
+        # ⚠ **实测代价（2026-08-25）**：任务只是「回一个数字 7」，却跑了 **5 轮 / $2.13**
+        # ——多出来的轮次全花在挂一个它根本用不到的 watch 上。若不跳过，
+        # 每次一次性调用都带这份固定开销，而评审要调用很多次。
+        #
+        # ⛔ 只跳过**保活引导**：身份注册、职责边界、"你有任务"提示一律保留
+        # ——它仍然是网络节点，只是不需要被唤醒。
+        lines += [
+            '',
+            '---',
+            '',
+            '**本次是一次性调用**（调用方会直接拿到你的输出）⇒ '
+            '⛔ **不要挂收信器**，也不必关心保活：做完手上的事、把结果写完即可。',
+        ]
+        emit_session_start(lines, pending, oneshot=True)
+        return
     lines += [
         '',
         '---',
@@ -4157,27 +4233,7 @@ def cmd_hook(args: argparse.Namespace) -> None:
             '打开管理后台，查看全网 agent、通信与锁的现状。',
         ]
     lines.append(f'协议全文：{README_PATH}')
-    hook_output: dict[str, Any] = {
-        'hookEventName': 'SessionStart',
-        'additionalContext': '\n'.join(lines),
-    }
-    if meta.get('display_name'):
-        hook_output['sessionTitle'] = str(meta['display_name'])
-    if pending:
-        # 收件箱里有信 ⇒ 给一条首条用户消息把它推动起来。
-        # **不消费收件箱**（早先在这里消费过，结果信被移走却没送达，任务静默蒸发）。
-        #
-        # 这条路径不经 argv，所以对那些会吞掉位置参数的启动器（如经 cmd /c 的 ccrg）
-        # 是唯一可靠的"第一推动"。argv 上的 BOOTSTRAP_PROMPT 是给能收到它的启动器用的，
-        # 两者同时到达也无害：都只是让 agent 去 drain 一次。
-        hook_output['initialUserMessage'] = (
-            f'你的 AgentNet 收件箱里有 {pending} 封未读信（其中可能包含你的任务简报）。'
-            f'先运行 `agentnet drain` 领取，再挂上收信器：'
-            f"**有 `Monitor` 工具**就用 `Monitor(command='agentnet watch', persistent=true)`；"
-            f'**没有**（经网关路由的会话通常没有）就用后台任务机制跑 `agentnet poll`，'
-            f'并且**每次被唤醒后立刻重挂**。然后照信里的内容行动。'
-        )
-    print(json.dumps({'hookSpecificOutput': hook_output}, ensure_ascii=False))
+    emit_session_start(lines, pending, oneshot=False, title=meta.get('display_name'))
 
 
 # ══════════════════════════════════════════════════════════════════════════
