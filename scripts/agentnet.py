@@ -1990,6 +1990,7 @@ def cmd_send(args: argparse.Namespace) -> None:
             topic_of[rid] = topic
             recipients.append(rid)
     delivered: list[str] = []
+    unreachable: list[str] = []
     for rid in recipients:
         if rid == ctx.agent_id:
             continue  # 群发时不投给自己
@@ -2011,11 +2012,21 @@ def cmd_send(args: argparse.Namespace) -> None:
         # 不阻止投递（落盘仍有价值：它下个回合的 Stop 钩子会 drain 到），
         # 但**必须让投信方知道"现在没人会看见"**。实测代价 9 小时（3a95ee25）。
         if reachability(read_info(ctx.info_path_of(rid))[0]).startswith('✗'):
+            unreachable.append(rid)
             print(f"       ⚠ 但 {rid[:8]} 的轮询器**已不在**——信已落盘，"
                   f"但它现在不会被唤醒；要等它下一个回合的 Stop 钩子才会读到。")
     if not delivered and not refused:
         _die("没有实际收件人（群发时只匹配到你自己？）")
-    print(f"[OK] 已投递 {len(delivered)}/{len(delivered) + len(refused)} 封，kind={args.kind}")
+    # 🔴 不可达计数**必须进汇总行**，不能只靠上面那些逐收件人的警告。
+    # 2026-08-25 实测：群发 29 人时那些警告全滚过去了，屏幕上只剩汇总行；
+    # 而调用方（**包括我自己**）习惯 `| tail -2`，那恰好把警告整段切掉。
+    # ⇒ 一个只在"没人过滤输出"时才可见的警告，等于没有。汇总行是唯一必然被读到的一行。
+    warn = (f" —— ⚠ 其中 {len(unreachable)} 个收信器**不可达**"
+            f"（{', '.join(r[:8] for r in unreachable[:4])}"
+            f"{'…' if len(unreachable) > 4 else ''}），它们要等自己下个回合才读到"
+            if unreachable else '')
+    print(f"[OK] 已投递 {len(delivered)}/{len(delivered) + len(refused)} 封，"
+          f"kind={args.kind}{warn}")
     if refused:
         # 响亮收尾：**部分成功不能读起来像全部成功**。非零退出码让脚本调用方也看得见。
         print(f"[!] 有 {len(refused)} 个收件人没投出去："
