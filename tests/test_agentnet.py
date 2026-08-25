@@ -547,6 +547,36 @@ class TestRearmNotice(Base):
         self.assertIn(an.LOOP_EXCEPTION_LINE, an.REARM_NOTICE, '死循环例外缺失')
         self.assertNotIn('只有它说未运行才重挂', an.REARM_NOTICE)
 
+    def test_unarmed_texts_discriminate_never_started_from_killed(self) -> None:
+        """🔴 「未运行」有**两种成因、处置相反**，文案必须给出**区分它们的方法**。
+
+        实战（2026-08-25，`8df980eb`）：它连挂两次 `agentnet watch` 都是 `exit 127`
+        （裸命令名解析不到），却按「死循环就别再挂」那条例外停止重试，**白等 25 分钟**。
+
+        ⚠ 两条例外的**指纹不同**：
+        - 死循环 = 挂上**数秒即被杀**、输出**为空**
+        - 它的情况 = 输出文件**根本不存在**
+
+        🔴 **而"看输出文件"这个判别器本身也不够**（同人 5 分钟后自我更正）：
+        「文件不存在」是**二义**的 —— 既可能没起来，**也可能起来了而横幅在文件系统
+        争用下延迟数分钟**（2026-08-22 实测）。⛔ 据它反复重挂的代价是
+        **4 个实例互抢 drain 收件箱**。
+
+        ⇒ ⭐ 真正的判别器**不是"看"，是做一次单变量实验**：只把裸命令换成绝对路径、
+        重试**一次**。它成本低，且同时证伪最常见的那个成因。
+        ⇒ 本用例钉住的就是这个：**第一动作是换绝对路径重试一次**、
+        **「不存在」是二义的**、以及**别反复重挂**。
+        """
+        for name, text in (('whoami', an.whoami_unarmed_text()),
+                           ('钩子首次提示', an.unarmed_chunk(0))):
+            with self.subTest(place=name):
+                self.assertIn('绝对路径', text, f'{name}：没给出第一动作（换绝对路径）')
+                self.assertIn('一次', text, f'{name}：没限定"只试一次"')
+                self.assertIn('二义', text, f'{name}：没点明「文件不存在」是二义的')
+                self.assertIn('互抢', text, f'{name}：没写出反复重挂的实测代价')
+                # `Monitor started` 是最容易被当成证据的那句，必须显式否掉。
+                self.assertIn('不是证据', text, f'{name}：没否掉 "Monitor started"')
+
     def test_full_notice_stops_repeating_after_the_block_budget(self) -> None:
         """拦满配额后**不再重发全文**——只留一行。
 
