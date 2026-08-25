@@ -2899,9 +2899,19 @@ def cmd_drain(args: argparse.Namespace) -> None:
         # 照做了下一回合自然不再拦（armed ⇒ 计数清零）；真的挂不上也不会无限循环。
         blocked_so_far += 1
         remaining = UNARMED_BLOCK_LIMIT - blocked_so_far
+        # 🔴 **第二次起必须承认「我可能在拦一个已经挂好的人」**（2026-08-25 `8df980eb` 报）：
+        # 本判据是 `poller_pid` 存在且进程活着，而认领发生在 watch 进程**启动之后**——
+        # 启动被负载拖住时（实测 0 秒 ~ 17 分钟）它还没写登记，于是这里必然拦。
+        # ⇒ 而文案刚教人「试一次就走、别反复挂」。两者对同一观测给出相反指令，
+        # 遵守文案的人会被连拦。⛔ 不能假装没有这个情形。
+        already_tried = ('' if blocked_so_far <= 1 else
+                        '\n⚠ 若你**已经用绝对路径挂过一次**、只是横幅还没出现：'
+                        '那是已知的启动延迟（无上界），**本条可以忽略，继续做你的事**——'
+                        '⛔ 别再挂第三个，多挂只会互抢 drain。')
         reason = (f'轮询器未挂载，先挂上再结束本回合'
                   f'（第 {blocked_so_far}/{UNARMED_BLOCK_LIMIT} 次拦截'
-                  + (f'，还会再拦 {remaining} 次）' if remaining else '，此后不再拦）'))
+                  + (f'，还会再拦 {remaining} 次）' if remaining else '，此后不再拦）')
+                  + already_tried)
         merge_info(ctx.info_path, {'unarmed_blocks': blocked_so_far}, create=False)
     if reason and not args.no_block:
         payload['decision'] = 'block'
@@ -3327,6 +3337,7 @@ def build_claude_argv(
         name: str,
         permission_mode: str,
         blocked_tools: list[str],
+        model: str = '',
 ) -> list[str]:
     """装配 claude 兼容启动器的 argv。
 
@@ -3342,6 +3353,16 @@ def build_claude_argv(
     argv = [*executable, prompt,
             '--session-id', session_id, '-n', name,
             '--permission-mode', permission_mode]
+    # 🔴 **模型档位决定工具集**（2026-08-25 三探针实测）：不传 `--model` 时子实例
+    # 落到 CLI 默认档（实测 `claude-fable-5`），而 **`Monitor` 不在那一档上**
+    # ——`ToolSearch(select:Monitor)` 明确回 `No matching deferred tools found`，
+    # 即"不存在"而非"未加载"。⇒ 没有 Monitor 的实例只能用「投递即退出」的 poll，
+    # 空闲后收不到信。让角色能点名档位，是唯一能改变这一点的杠杆。
+    # ⚠ 此前排除过的三个候选：模型家族本身（工具是 harness 侧的）、CCR 网关
+    # （去掉后 ToolSearch 回来了、Monitor 没有）、`CLAUDE_CODE_CHILD_SESSION`
+    # （设与不设结果相同）。
+    if model:
+        argv += ['--model', model]
     if blocked_tools:
         # 工具名是纯 ASCII，走 argv 安全；这是角色边界里**真拦得住**的那一半
         argv += ['--disallowed-tools', ','.join(blocked_tools)]
@@ -3686,7 +3707,8 @@ def cmd_spawn(args: argparse.Namespace) -> None:
         # 只放一句引导而不是任务全文——任务走收件箱这条**唯一**通道，不受命令行长度限制。
         inner = build_claude_argv(
             resolve_launcher(launcher_parts[0]), BOOTSTRAP_PROMPT,
-            new_id, name, permission_mode, Config.role_disallowed_tools(role_name))
+            new_id, name, permission_mode, Config.role_disallowed_tools(role_name),
+            str(role.get('model') or ''))
     else:
         # 其它 harness：没有 --session-id 这类身份开关，只能靠环境变量注入身份
         inner = launcher_parts

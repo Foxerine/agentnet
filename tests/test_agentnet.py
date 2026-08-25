@@ -1688,14 +1688,32 @@ class TestSpawnArgv(Base):
     这类失败极难查（进程活着、注册也在、就是不动），所以用例盯得比别处紧。
     """
 
-    def build(self, blocked: list[str]) -> list[str]:
+    def build(self, blocked: list[str], model: str = '') -> list[str]:
         return an.build_claude_argv(
-            ['C:/x/claude.exe'], an.BOOTSTRAP_PROMPT, 'sid', 'nm', 'auto', blocked)
+            ['C:/x/claude.exe'], an.BOOTSTRAP_PROMPT, 'sid', 'nm', 'auto', blocked, model)
 
     def test_prompt_immediately_follows_executable(self) -> None:
         for blocked in ([], ['Edit', 'Write']):
             with self.subTest(blocked=blocked):
                 self.assertEqual(self.build(blocked)[1], an.BOOTSTRAP_PROMPT)
+
+    def test_model_flag_is_optional_and_before_variadic(self) -> None:
+        """`--model` 决定子实例的工具集，但它**必须排在 variadic 之前**。
+
+        🔴 三探针实测（2026-08-25）：不传 `--model` 时子实例落到 CLI 默认档
+        （`claude-fable-5`），而 **`Monitor` 不在那一档**——`ToolSearch(select:Monitor)`
+        明确回 `No matching deferred tools found`（"不存在"而非"未加载"）。
+        ⇒ 没有 Monitor 的实例只能用「投递即退出」的 poll，空闲后收不到信。
+
+        ⚠ 而 `--disallowed-tools <tools...>` 是 variadic、**吞掉其后一切**
+        ——`--model` 若排在它后面会被静默吃掉，表现为"配置了却没生效"。
+        """
+        self.assertNotIn('--model', self.build([]), '没要求时不该凭空加 --model')
+        argv = self.build(['Edit'], 'opus')
+        self.assertIn('--model', argv)
+        self.assertEqual(argv[argv.index('--model') + 1], 'opus')
+        self.assertLess(argv.index('--model'), argv.index('--disallowed-tools'),
+                        '--model 落在 variadic 之后会被吞掉')
 
     def test_variadic_flag_is_last(self) -> None:
         """``--disallowed-tools <tools...>`` 吞掉其后一切，所以它必须垫底。"""
