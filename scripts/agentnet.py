@@ -2860,7 +2860,18 @@ def cmd_drain(args: argparse.Namespace) -> None:
             "    （agentnet 无从知道你是从输出里读的、还是从别处得知的，所以只把清单摆出来"
             "让你自己对账；只提醒一次。）")
         merge_info(ctx.info_path, {'unacked_letters': None}, create=False)
-    if not armed:
+    # 🔴 **一次性调用形态不需要收信器**——调用方同步读 stdout，交付就是返回值。
+    # 拦它去挂 poll，等于逼一个**没有异步**的会话建立一条异步通道。
+    #
+    # ⚠ 阶段 0 只让 `SessionStart` 认了这个形态，**漏了 Stop 这一条**。实测代价
+    # （2026-08-25 首次真实 `oneshot_call`）：被连拦 3 次 ⇒ `num_turns` **1 → 14**、
+    # 成本翻倍到 $0.50，且最终 `result` 回的是「轮询器已挂载并确认运行中。」
+    # ——**不是任务答案**。⇒ 四段门全过，交付的却是另一个问题的回答。
+    #
+    # ⭐ 教训：同一个形态判定要在**每一条**会因它而改变行为的路径上生效；
+    # 只改"最像入口"的那一处，剩下的会安静地继续按旧形态跑。
+    needs_poller = not is_oneshot_session()
+    if not armed and needs_poller:
         chunks.append(unarmed_chunk(blocked_so_far))
     if not chunks:
         if args.hook:
@@ -2889,7 +2900,7 @@ def cmd_drain(args: argparse.Namespace) -> None:
         # 必须 block：这条的**全部意义**就是覆盖"agent 压根没打开 poll 的输出"那种情形，
         # 而那种情形下不 block 就等于再发一张会被跳过的便签。
         reason = f'对一下账：轮询器投递过 {len(unacked)} 封信，认得出就继续'
-    elif not armed and blocked_so_far < UNARMED_BLOCK_LIMIT:
+    elif not armed and needs_poller and blocked_so_far < UNARMED_BLOCK_LIMIT:
         # **不让回合在未挂载的状态下结束。** Stop 钩子触发的时刻，恰好就是 agent
         # 可能转入空闲的那一刻——而"空闲且没有轮询器"是唯一真正有害的组合：
         # 此后叫不醒它，5 分钟后判死、别人投信被拒。钩子站在唯一正确的位置上。
@@ -3368,6 +3379,153 @@ def build_claude_argv(
         argv += ['--disallowed-tools', ','.join(blocked_tools)]
     reject_swallowed_positional(argv, len(executable))
     return argv
+
+
+ONESHOT_TIMEOUT_DEFAULT = 900.0
+"""一次性调用的**强制**超时上限（秒）。
+
+⚠ **这不是"建议加一个"，是必需的。** 2026-08-25 实测：上游返 408 之后
+``claude -p`` **既不报错也不退出**，一路挂到外层超时——⇒ 上游故障在 ``-p`` 下
+表现为**卡死**而非失败。没有这个上限，一次性调用就退化成无上界挂起，
+而那正是本形态要消灭的东西。
+
+900 秒的依据：本机实测一次**平凡**调用（"回一个数字 7"）耗时 73~83 秒，
+其中 API 段仅 ~5 秒，余下是 CLI 启动开销。真实评审要读几百行代码，
+数量级更大 ⇒ 上限须留足，否则会把**正在正常工作**的评审掐死。
+"""
+
+ONESHOT_GATES = ('timeout', 'exit', 'json', 'is_error', 'stop_reason')
+"""四段成败判定的门名（``timeout`` 与 ``exit`` 同属第 1 段，分开是为了可诊断）。"""
+
+
+def judge_oneshot(exit_code: int, stdout: str, *, timed_out: bool) -> tuple[str, str, dict[str, Any]]:
+    """对一次 ``-p`` 调用做**四段判定**，返回 ``(gate, detail, payload)``。
+
+    ``gate`` 为空串表示四段全过；否则是 :data:`ONESHOT_GATES` 之一。
+
+    **四段缺一不可**，尤其第 2 段：
+
+    1. **进程层**——超时被杀 / 非零退出；
+    2. 🔴 **stdout 首个 JSON 能否解析**——**退出码会骗人**：实测
+       ``--resume <不存在的 session>`` 打印错误却**退出 0**。同类教训见
+       "被杀的 commit ``exit 0`` 却没产生提交"；
+    3. ``is_error``——模型侧报错；
+    4. ``stop_reason``——非 ``end_turn`` 即中断（长度上限 / 拒答 / 工具错），
+       此时**有部分输出但结论不完整**，当成功用会拿到半截评审。
+    """
+    if timed_out:
+        return 'timeout', f"超过 {ONESHOT_TIMEOUT_DEFAULT} 秒未返回，已终止（上游故障在 -p 下表现为卡死）", {}
+    if exit_code != 0:
+        return 'exit', f"进程以退出码 {exit_code} 结束", {}
+    text = stdout.strip()
+    if not text:
+        return 'json', "标准输出为空——进程退出 0 但什么都没产出", {}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return 'json', f"标准输出不是 JSON（{exc}）：{text[:200]}", {}
+    if not isinstance(payload, dict):
+        return 'json', f"标准输出是 JSON 但不是对象：{type(payload).__name__}", {}
+    if payload.get('is_error'):
+        return 'is_error', f"模型侧报错：{str(payload.get('result'))[:200]}", payload
+    stop = str(payload.get('stop_reason') or '')
+    if stop != 'end_turn':
+        return 'stop_reason', f"未正常收尾：stop_reason={stop or '(缺失)'}", payload
+    return '', 'ok', payload
+
+
+def build_oneshot_argv(
+        executable: list[str],
+        bootstrap: str,
+        *,
+        session_id: str,
+        resume: bool,
+        blocked_tools: list[str],
+        model: str = '',
+) -> list[str]:
+    """装配一次性调用的 argv。
+
+    :param bootstrap: 位置参数。⚠ **必须是单行纯 ASCII**——见下。
+    :param resume: 真则 ``--resume``（续上一轮），假则 ``--session-id``（开新会话）
+
+    🔴 **位置参数只放短 ASCII 引导，真正的任务走收件箱。** 两条理由：
+
+    1. **码页**：本机 ACP=936，非 ASCII 穿过 Windows 命令行会被按 GBK 重解码；
+       多行非 ASCII 还会被 cmd.exe 与 commander 一路拆碎（实测崩在
+       ``unknown option '->'``）。同 :data:`BOOTSTRAP_PROMPT` 的教训。
+    2. **单一投递通道**：任务经 inbox 文件送达（UTF-8、无长度上限），
+       与常驻形态**共用同一条路**——⛔ 不新增第二条投递通道。
+
+    ⚠ ``-p`` 的 stdin 是**补充上下文而非提示词**（实测 stderr 明说
+    "no stdin data received in 3s, **proceeding without it**"），⛔ 不能拿它当任务载体。
+
+    **不变式与** :func:`build_claude_argv` **相同**：位置参数紧跟可执行文件，
+    variadic 选项一律在末尾。
+    """
+    argv = [*executable, '-p', bootstrap, '--output-format', 'json']
+    argv += ['--resume', session_id] if resume else ['--session-id', session_id]
+    if model:
+        argv += ['--model', model]
+    if blocked_tools:
+        argv += ['--disallowed-tools', ','.join(blocked_tools)]
+    reject_swallowed_positional(argv, len(executable) + 1)
+    return argv
+
+
+def oneshot_call(
+        role_name: str,
+        bootstrap: str,
+        *,
+        session_id: str,
+        resume: bool = False,
+        timeout: float = ONESHOT_TIMEOUT_DEFAULT,
+) -> dict[str, Any]:
+    """同步跑一次角色调用，拿回结构化结果。⛔ 不落窗口、不挂收信器、不产生常驻实例。
+
+    这是"让 reviewer 不需要 ``Monitor``"的那条路：调用即同步，
+    ⇒ **没有异步、没有保活、没有失联、没有"聋掉"**。
+
+    ⚠ **不注入 scope_note**：那是非 ASCII 文本，走 argv 会被码页损坏。
+    它仍由 ``SessionStart`` 钩子经 ``additionalContext`` 注入（JSON + stdin，安全）
+    ——⭐ 一次性形态下钩子照常触发，只是**跳过保活引导**（见 :data:`ONESHOT_ENV`）。
+
+    :returns: ``ok`` / ``gate`` / ``detail`` / ``result`` / ``session_id`` /
+        ``num_turns`` / ``cost_usd`` / ``duration_ms`` / ``raw``。
+        ⭐ ``session_id`` **每轮都要记下来**——中途挂掉可 ``--resume`` 接着上一轮，
+        不丢上下文（超时可安全重试：``-p`` 无"半个提交"式副作用）。
+    """
+    role = Config.role(role_name)
+    argv = build_oneshot_argv(
+        resolve_launcher(str(role.get('command') or 'claude')), bootstrap,
+        session_id=session_id, resume=resume,
+        blocked_tools=Config.role_disallowed_tools(role_name),
+        model=str(role.get('model') or ''))
+    env = {**os.environ, **Config.role_env(role_name), ONESHOT_ENV: '1'}
+    started = time.monotonic()
+    timed_out = False
+    stdout = ''
+    code = 0
+    try:
+        done = subprocess.run(argv, env=env, capture_output=True, text=True,
+                              encoding='utf-8', errors='replace',
+                              timeout=timeout, check=False)
+        stdout, code = done.stdout, done.returncode
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ''
+    gate, detail, payload = judge_oneshot(code, stdout, timed_out=timed_out)
+    return {
+        'ok': gate == '',
+        'gate': gate,
+        'detail': detail,
+        'result': str(payload.get('result') or ''),
+        # 失败时回落到传入值：崩在建立会话之前也要能 --resume 重试
+        'session_id': str(payload.get('session_id') or session_id),
+        'num_turns': int(payload.get('num_turns') or 0),
+        'cost_usd': float(payload.get('total_cost_usd') or 0.0),
+        'duration_ms': int((time.monotonic() - started) * 1000),
+        'raw': payload,
+    }
 
 
 def in_windows_terminal() -> bool:

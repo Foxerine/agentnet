@@ -47,7 +47,7 @@ wt 拉起的交互式会话     → 无 Monitor，        AI_AGENT 后缀 _harne
 |---|---|
 | **多轮上下文** | `--session-id` 存 → `--resume` 取，第二轮准确答出只有第一轮说过的 token |
 | **禁用工具** | `--disallowed-tools <tools...>` 存在（reviewer 需禁 `Edit`/`NotebookEdit`） |
-| **注入职责边界** | `--append-system-prompt` 存在（承载现有 `scope_note`） |
+| ~~**注入职责边界**~~ | ⛔ **已放弃 `--append-system-prompt`**，见下方「实现期推翻」 |
 | **结构化结果** | `--output-format json` 返回 `is_error` / `num_turns` / `stop_reason` / `duration_ms` / `total_cost_usd` / `session_id` |
 
 ---
@@ -70,6 +70,54 @@ wt 拉起的交互式会话     → 无 Monitor，        AI_AGENT 后缀 _harne
 `SessionStart` 的 payload 是否带 `source` 字段可区分 `-p`；
 若不带，退路是由 `agentnet` 在调用 `-p` 时注入一个自有环境变量
 （如 `AGENTNET_ONESHOT=1`）供钩子识别——**那是我们自己的变量，不依赖 harness**。
+
+---
+
+## 三补、🔴 reviewer 必须继续走 CCR（用户明确要求）+ 一个未闭合的验证
+
+> **对抗性审查只有在模型不同时才有意义。** ⇒ oneshot 化只改**调用形态**，
+> ⛔ **不碰上游模型**：`[roles.reviewer.env]` 的 CCR 变量一字不动。
+
+### ✅ 已闭合（2026-08-25 20:35 实测）：`-p` **确实经 CCR**，A 方案对 reviewer 成立
+
+此前两次测试都因上游故障超时（先 408、后**额度耗尽导致 401/503**），
+测不出是结构性不兼容还是上游在坏。用户换号后复测，**决定性证据**：
+
+```
+claude -p --model gpt-5.6-sol --output-format json "Reply with only the digit 7"
+→ EXIT=0  73s   is_error:false  num_turns:1  stop_reason:end_turn  result:'7'
+   modelUsage: ['gpt-5.6-sol']
+   stderr:     [claude-code:unrecognized_model] {"model":"gpt-5.6-sol"}
+```
+
+⭐ **判据是「第一方 Anthropic API 没有 `gpt-5.6-sol` 这个模型」**：CLI **自己都不认识**它
+（stderr 明写 `unrecognized_model`），却拿回了正确答案 ⇒ **只可能是 CCR 应答的**。
+
+#### ⚠️ 两个曾被我误当证据的东西（记下来免得重犯）
+
+1. **`provider: "firstParty"` / 模型名显示 `claude-fable-5`** —— ⛔ **不是绕过 CCR 的证据**。
+   CLI **不知道自己前面有代理**，它按**自己请求的模型名**记账。⇒ 走不走 CCR，这个字段**长得一样**。
+2. **「CCR 日志里没有这笔请求」** —— ⛔ 同样无效：该日志**只记 error 级**，
+   实测当前文件 **0 字节**，连一次**已知成功**的直连 curl 都没记。
+   ⇒ ⭐ **先用已知为真的样本验探针，再拿它判「没有」**（分歧样本验证）。
+
+### 🔴 但它确立了两个硬约束
+
+1. **超时上限从"建议"升为"必需"**：上游故障在 `-p` 下表现为**卡死**而非失败
+   （401/503 期实测一路挂到外层超时）。⇒ `ONESHOT_TIMEOUT_DEFAULT` 不可省。
+2. **成本比预期高一个量级**：一次**平凡**调用（"回一个数字 7"）
+   **73~83 秒 / $0.229**，其中 API 段仅 **4.9 秒** ⇒ **约 68 秒是 CLI 启动开销**，
+   且 22830 input tokens 全是系统提示词 + 工具定义（每轮重付）。
+   ⇒ ⭐ **阶段 3 的预算门是必需的，不是可选**。
+
+### 🔴 但它已经改变了一条设计假设
+
+计划 §六 原本写「异常同步可见」。实测发现：**上游 408 之后 `claude -p` 既不报错也不退出，
+一路挂到我的 280 秒 timeout** ⇒ **上游故障在 `-p` 下表现为「卡死」而非「失败」**。
+
+⇒ ✅ 四段判定第 1 项（退出码 `124`）仍然抓得住它，但：
+**每次调用必须设超时上限，这从"建议"升级为"必需"**——没有它就是无上界挂起，
+而那正是本方案要消灭的东西。
 
 ---
 
@@ -103,13 +151,38 @@ oneshot = true          # 🆕 支持 -p --resume 形态
 - 钩子在该形态下**跳过保活引导**，仅保留身份注册与信件投递
 - **验收**：`-p` 跑「回一个数字 7」应为 **1 轮**、结果不含 `agentnet` 字样
 
-### 阶段 1：一次性调用原语（不接线，可独立测）
+### ✅ 阶段 1：一次性调用原语（已实现，2026-08-25）
 
-- 新增 `oneshot_call(role, session_id, prompt) -> dict`：
-  装配 `-p --resume/--session-id --output-format json --disallowed-tools --append-system-prompt`，
-  同步执行并返回解析后的结构
-- **四段成败判定**（缺一不可，见 §六）
-- **验收**：单测覆盖四种失败路径；真实调用一次读文件任务并断言 `is_error == false`
+落地形态：`judge_oneshot()` + `build_oneshot_argv()` + `oneshot_call()`，
+拆成三个函数是为了**前两个不碰 subprocess、可纯单测**。
+`ONESHOT_TIMEOUT_DEFAULT = 900.0`，`ONESHOT_GATES` 把门名做成对外契约。
+
+**验收**：单测 **16 个**覆盖四段的每一段 + argv 不变式（全套 223 → **239，OK**）。
+
+#### 🔴 实现期推翻了计划的一处设计：**scope_note 与任务都不走 argv**
+
+计划 §二 原写「用 `--append-system-prompt` 承载 `scope_note`」。**动手时发现它与
+代码库既有的一条硬教训冲突**——`Config.role_scope_note` 的 docstring 早就写着：
+
+> **刻意不走 argv**：非 ASCII 文本穿过 Windows 命令行有被码页损坏的风险。
+
+⚠️ 而**评审任务本身就是长篇中文**，问题比 scope_note 更大。
+
+✅ **改成**：
+| 承载什么 | 走哪条路 | 为什么 |
+|---|---|---|
+| `scope_note` | **SessionStart 的 `additionalContext`**（JSON + stdin） | 与常驻形态**完全一致**，零新增机制；一次性形态下钩子照常触发，只是跳过保活引导 |
+| **评审任务全文** | 🔴 **收件箱信件**（UTF-8 文件） | 无长度上限、无码页问题；⭐ 且**与常驻形态共用同一条投递通道** |
+| argv 位置参数 | 只放**单行纯 ASCII 引导** | 同 `BOOTSTRAP_PROMPT` 的既有教训 |
+
+⇒ ⭐ 这正合本计划 §三 自己总结的那条：**「投递只保留一条通道」**。
+
+#### ⚠️ 顺带验死的一条：`-p` 的 stdin **不是**提示词载体
+
+实测 stderr 原文：`no stdin data received in 3s, **proceeding without it**`
+⇒ stdin 是**补充上下文**，⛔ 不能拿它当任务载体。
+（另有一次「纯 stdin 无 argv 提示词」的调用跑到 110 秒被杀、零输出，
+⚠️ 但那次基线余量只有 30%，**不足以单独定性**——结论以上面那句 stderr 为准。）
 
 ### 阶段 2：接入 spawn / review 流程
 

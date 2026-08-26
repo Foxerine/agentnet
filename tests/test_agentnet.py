@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import inspect
+import json
 import os
 import re
 import shutil
@@ -2771,6 +2772,191 @@ class TestSweepSparesLiveProcesses(Base):
         self.stale_agent(poller_pid=999998, pid=999999)
         an.cmd_sweep(argparse.Namespace(dry_run=False, quiet=True))
         self.assertFalse(self.ctx().info_path.exists(), '真的没进程了却没归档')
+
+
+class TestOneshotArgv(unittest.TestCase):
+    """一次性调用的 argv 装配。纯函数，不需要 workspace。"""
+
+    EXE = ['C:/x/claude.exe']
+
+    def build(self, **kw: object) -> list[str]:
+        params: dict[str, object] = {
+            'session_id': 'sid-1', 'resume': False,
+            'blocked_tools': ['Edit', 'NotebookEdit'], 'model': '',
+        }
+        params.update(kw)
+        return an.build_oneshot_argv(self.EXE, 'READ YOUR INBOX', **params)  # type: ignore[arg-type]
+
+    def test_positional_immediately_follows_the_p_flag(self) -> None:
+        """位置参数必须紧跟 ``-p``——落到 variadic 后面会被整个吞掉。"""
+        argv = self.build()
+        self.assertEqual(argv[len(self.EXE)], '-p')
+        self.assertEqual(argv[len(self.EXE) + 1], 'READ YOUR INBOX')
+
+    def test_variadic_option_is_last(self) -> None:
+        """``--disallowed-tools`` 是 variadic，之后不得再有任何位置参数。"""
+        argv = self.build()
+        self.assertEqual(argv[-2], '--disallowed-tools')
+        self.assertEqual(argv[-1], 'Edit,NotebookEdit')
+
+    def test_model_goes_before_the_variadic(self) -> None:
+        """``--model`` 若排在 variadic 之后，它的值会被 variadic 吞掉。"""
+        argv = self.build(model='gpt-5.6-sol')
+        self.assertLess(argv.index('--model'), argv.index('--disallowed-tools'))
+
+    def test_resume_and_new_session_are_mutually_exclusive(self) -> None:
+        fresh = self.build(resume=False)
+        self.assertIn('--session-id', fresh)
+        self.assertNotIn('--resume', fresh)
+        resumed = self.build(resume=True)
+        self.assertIn('--resume', resumed)
+        self.assertNotIn('--session-id', resumed)
+
+    def test_bootstrap_stays_ascii(self) -> None:
+        """⚠ 位置参数走 Windows 命令行 ⇒ 非 ASCII 会被按 GBK 重解码。
+
+        这条守的是**设计意图**：真正的中文任务走收件箱，argv 只放短 ASCII 引导。
+        """
+        argv = self.build()
+        argv[len(self.EXE) + 1].encode('ascii')  # 非 ASCII 会当场抛 UnicodeEncodeError
+
+    def test_no_scope_note_on_the_command_line(self) -> None:
+        """scope_note 是中文，⛔ 永不走 argv——它由 SessionStart 经 additionalContext 注入。"""
+        self.assertNotIn('--append-system-prompt', self.build())
+
+
+class TestOneshotFourGates(unittest.TestCase):
+    """四段成败判定。**四段缺一不可**，每段单独有测。"""
+
+    OK = json.dumps({'is_error': False, 'stop_reason': 'end_turn',
+                     'result': '7', 'session_id': 's9', 'num_turns': 1})
+
+    def test_all_four_gates_pass(self) -> None:
+        gate, _, payload = an.judge_oneshot(0, self.OK, timed_out=False)
+        self.assertEqual(gate, '')
+        self.assertEqual(payload['result'], '7')
+
+    def test_gate1_timeout(self) -> None:
+        """上游故障在 ``-p`` 下表现为**卡死**而非失败 ⇒ 超时是一等失败。"""
+        gate, detail, _ = an.judge_oneshot(0, self.OK, timed_out=True)
+        self.assertEqual(gate, 'timeout')
+        self.assertIn('卡死', detail)
+
+    def test_gate1_nonzero_exit(self) -> None:
+        self.assertEqual(an.judge_oneshot(1, self.OK, timed_out=False)[0], 'exit')
+
+    def test_gate2_exit_zero_but_stdout_is_not_json(self) -> None:
+        """🔴 **退出码会骗人**：``--resume <不存在的 session>`` 打印错误却退出 0。"""
+        gate, detail, _ = an.judge_oneshot(0, 'No conversation found with session ID: x', timed_out=False)
+        self.assertEqual(gate, 'json')
+        self.assertIn('No conversation found', detail)
+
+    def test_gate2_exit_zero_but_stdout_is_empty(self) -> None:
+        """实测见过：进程退出 0、耗时正常，stdout 一个字节都没有。"""
+        self.assertEqual(an.judge_oneshot(0, '   \n', timed_out=False)[0], 'json')
+
+    def test_gate2_json_that_is_not_an_object(self) -> None:
+        self.assertEqual(an.judge_oneshot(0, '"just a string"', timed_out=False)[0], 'json')
+
+    def test_gate3_is_error(self) -> None:
+        body = json.dumps({'is_error': True, 'stop_reason': 'end_turn', 'result': 'boom'})
+        gate, detail, payload = an.judge_oneshot(0, body, timed_out=False)
+        self.assertEqual(gate, 'is_error')
+        self.assertIn('boom', detail)
+        self.assertTrue(payload, 'is_error 时仍须把 payload 交出来，否则拿不到 session_id 续跑')
+
+    def test_gate4_stop_reason_not_end_turn(self) -> None:
+        """非 ``end_turn`` = 中断 ⇒ **有部分输出但结论不完整**，当成功用会拿到半截评审。"""
+        body = json.dumps({'is_error': False, 'stop_reason': 'max_tokens', 'result': '半截'})
+        gate, detail, _ = an.judge_oneshot(0, body, timed_out=False)
+        self.assertEqual(gate, 'stop_reason')
+        self.assertIn('max_tokens', detail)
+
+    def test_gate4_missing_stop_reason_is_a_failure_not_a_pass(self) -> None:
+        """⚠ 字段缺失不得被当作"没问题"——那正是 fail-open。"""
+        body = json.dumps({'is_error': False, 'result': 'x'})
+        self.assertEqual(an.judge_oneshot(0, body, timed_out=False)[0], 'stop_reason')
+
+    def test_every_gate_name_is_declared(self) -> None:
+        """门名是对外契约（调用方会 if gate == '...'），别让实现悄悄冒出个新名字。"""
+        seen = {
+            an.judge_oneshot(0, self.OK, timed_out=True)[0],
+            an.judge_oneshot(1, self.OK, timed_out=False)[0],
+            an.judge_oneshot(0, 'nope', timed_out=False)[0],
+            an.judge_oneshot(0, json.dumps({'is_error': True}), timed_out=False)[0],
+            an.judge_oneshot(0, json.dumps({'is_error': False, 'stop_reason': 'x'}), timed_out=False)[0],
+        }
+        self.assertEqual(seen, set(an.ONESHOT_GATES))
+
+
+class TestOneshotStopHookDoesNotDemandPoller(Base):
+    """一次性形态下 Stop 钩子**不得**逼它挂收信器。
+
+    🔴 **阶段 0 只让 `SessionStart` 认了这个形态，漏了 Stop 这一条。**
+    2026-08-25 首次真实 `oneshot_call` 的代价：被连拦 3 次 ⇒ `num_turns` **1 → 14**、
+    成本翻倍到 $0.50，且最终 `result` 回的是「轮询器已挂载并确认运行中。」
+    ——**不是任务答案**。⚠️ 四段门**全过**，交付的却是另一个问题的回答。
+
+    ⚠️ 那批 16 个纯单测**一个都没抓到它**：缺陷在**另一个进程的另一个钩子**里。
+    ⇒ ⭐ 这就是"真实调用验收"不能省的理由。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.addCleanup(os.environ.pop, an.ONESHOT_ENV, None)
+
+    def as_oneshot(self) -> None:
+        os.environ[an.ONESHOT_ENV] = '1'
+
+    def hook_output(self) -> dict:
+        import argparse, io, contextlib, json
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            an.cmd_drain(argparse.Namespace(hook=True, no_block=False))
+        return json.loads(buffer.getvalue() or '{}')
+
+    def go_offline(self) -> None:
+        an.merge_info(self.ctx().info_path, {'poller_pid': 999999})   # 不存在的 pid
+
+    def test_oneshot_is_never_blocked_for_a_missing_poller(self) -> None:
+        """调用方同步读 stdout ⇒ 收信器对它毫无用处，拦它纯属烧轮次。"""
+        self.register()
+        self.go_offline()
+        self.as_oneshot()
+        for attempt in range(an.UNARMED_BLOCK_LIMIT + 1):
+            self.assertNotIn('decision', self.hook_output(),
+                             f'一次性会话在第 {attempt + 1} 次被拦了')
+
+    def test_resident_session_is_still_blocked(self) -> None:
+        """⚠ 防恒真：常驻形态**必须**照拦，否则上面那条测不出东西。"""
+        self.register()
+        self.go_offline()
+        self.assertEqual(self.hook_output().get('decision'), 'block',
+                         '常驻形态丢了未挂载拦截')
+
+    def test_oneshot_gets_no_arming_text(self) -> None:
+        """不止别 block——连"去挂收信器"的文案都不该出现在 additionalContext 里。"""
+        self.register()
+        self.go_offline()
+        self.as_oneshot()
+        context = str(self.hook_output().get('hookSpecificOutput', {}).get('additionalContext', ''))
+        for marker in ('Monitor(', 'agentnet poll', '挂上收信器', '轮询器未挂载'):
+            self.assertNotIn(marker, context, f'一次性形态仍在教挂收信器：{marker}')
+
+    def test_oneshot_still_reports_letters(self) -> None:
+        """🔴 **防过度压制**：豁免的只是"催挂收信器"，⛔ 不是信件投递本身。
+
+        ⚠️ 一次性会话照样可能收到信（它注册了身份、别人看得见它）；
+        把这条一起压掉，信就会**静默消失**——那是比多烧几轮严重得多的缺陷。
+        """
+        self.register()
+        an.merge_info(self.ctx().info_path, {'poller_pid': os.getpid()})
+        an.record_unacked(self.ctx(), [({'from': 'aaaa1111-x', 'subject': '要紧事'},
+                                        '正文', Path('x.md'))])
+        self.as_oneshot()
+        payload = self.hook_output()
+        self.assertEqual(payload.get('decision'), 'block',
+                         '一次性形态把信件对账也一起压掉了')
 
 
 if __name__ == '__main__':
