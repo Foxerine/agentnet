@@ -3006,33 +3006,55 @@ class TestDeafNoticeDistinguishesStillborn(Base):
         letters = list((self.ctx().agents_dir / self.PARENT / 'inbox').glob('*.md'))
         return letters[0].read_text(encoding='utf-8')
 
-    def test_stillborn_says_it_never_worked(self) -> None:
-        """零产出 + 信到达之前就不动了 ⇒ 它从出生起就没活过。"""
-        body = self.notice(sent=0, silent_min=45.0)
-        self.assertIn('从未工作过', body)
-        self.assertIn('先查上游', body, '死胎的第一动作必须是查上游，不是重开')
+    def test_no_evidence_branch_states_observations_not_a_verdict(self) -> None:
+        """⭐ 摆**可复核的观察**，⛔ 不下判词。
 
-    def test_stillborn_must_not_claim_it_is_probably_alive(self) -> None:
-        """🔴 **这句正是让拉起方白等 40 分钟的那句。**"""
+        🔴 旧版写「它**从未工作过**」——那是**判词**，而这个信号证不到那一步
+        （见 `test_long_first_turn_is_not_declared_dead`）。
+        """
         body = self.notice(sent=0, silent_min=45.0)
-        self.assertNotIn('多半不是死了', body)
+        self.assertIn('sent/', body, '没摆出"没产出"这个观察，读者无从复核')
+        self.assertNotIn('从未工作过', body, '这是判词，本信号支撑不了它')
+
+    def test_no_evidence_branch_must_not_advise_killing(self) -> None:
+        """🔴 **本文件 `stalled_hint` 早已确立：⛔ 不给动作建议、⛔ 不叫 dead。**
+
+        理由原文：「写着 dead 的列会让人直接 kill，而 kill 一个正在跑 40 分钟测试的
+        实例代价远大于多等十分钟」。⚠️ 旧版写了「重开**零代价**」——正是它禁止的那句。
+        """
+        body = self.notice(sent=0, silent_min=45.0)
+        self.assertNotIn('零代价', body)
+        self.assertIn('别只凭本封信 kill', body, '缺少反向护栏，读者会直接 kill')
+
+    def test_long_first_turn_is_not_declared_dead(self) -> None:
+        """🔴 **回归（`109de4b6` 2026-08-26 评审指出的误杀路径）**。
+
+        一个**首轮长审**的健康实例：尚未回信（`sent` 空）、正在一个**长回合内**
+        读代码而回合未结束 ⇒ Stop 钩子不触发 ⇒ `last_active` **冻结整个回合**；
+        期间又收到补充信 ⇒ **两条判据同时命中**，而它完全健康。
+
+        ⚠️ 首轮评审超过 5 分钟是**常态**，不是边角情形。
+        ⇒ 本判据**分辨不了它与真空壳**，所以通知**必须把这种可能写出来**。
+        """
+        body = self.notice(sent=0, silent_min=45.0)     # 与"真空壳"输入完全相同
+        self.assertIn('长回合', body, '没写出"它可能正在长回合里"，读者会当它死了')
+        self.assertIn('别动它', body, '没给"若是长回合该怎么办"的相反动作')
 
     def test_worked_then_went_deaf_keeps_the_original_wording(self) -> None:
-        """⚠ 防恒真：真·中途失联的那句安慰**必须保留**，否则上面两条测不出东西。"""
+        """⚠ 防恒真：真·中途失联（`sent` 非空）那句安慰**必须保留**，
+        否则上面几条测不出东西。"""
         body = self.notice(sent=3, silent_min=45.0)
         self.assertIn('多半不是死了', body)
-        self.assertNotIn('从未工作过', body)
+        self.assertNotIn('两种解释', body)
 
-    def test_slow_but_working_is_not_called_stillborn(self) -> None:
-        """🔴 **防误报**：`sent == 0` 单独不成判据——reviewer 首轮静默十几分钟是常态。
+    def test_recent_heartbeat_is_not_the_no_evidence_branch(self) -> None:
+        """⚠ 防误报：心跳**比信还新** ⇒ 它在信到达之后仍在动 ⇒ 走"中途失联"分支。
 
-        这个孩子零产出，但**心跳比信还新**（信到达之后它仍在动）
-        ⇒ 它在工作，只是慢。⛔ 不许把它说成死胎。
-        ⭐ 这条也是判据的**区分力证明**：若实现退化成只看 `sent==0`，本条必红。
+        ⭐ 这条是判据的**区分力证明**：若实现退化成只看 `sent==0`，本条必红。
         """
         body = self.notice(sent=0, silent_min=2.0)
-        self.assertNotIn('从未工作过', body)
         self.assertIn('多半不是死了', body)
+        self.assertNotIn('两种解释', body)
 
 
 if __name__ == '__main__':
