@@ -2959,5 +2959,81 @@ class TestOneshotStopHookDoesNotDemandPoller(Base):
                          '一次性形态把信件对账也一起压掉了')
 
 
+class TestDeafNoticeDistinguishesStillborn(Base):
+    """失联通知必须分清「从未活过」与「活过之后聋了」——**两者的正确动作相反**。
+
+    🔴 实测代价（2026-08-25，`5d45ffe6`）：它是**死胎**——上游认证失效期被拉起，
+    `sent=0`、`last_active` 停在注册后 2 分钟、8 封信从未领取。
+    而当时的通知照旧告诉拉起方「**它多半不是死了**…进程还活着、工作正常」
+    ⇒ 拉起方据此又等了 **40 分钟**。在死胎场景下那句话是**反向误导**。
+
+    ⭐ 同时否掉一个看似合理的判据：「5 分钟内有没有 drain 任务书」。
+    该案的任务书**确实被领走了**（在 `read/` 里）——领取是**启动管道**做的，
+    ⛔ 不代表它能思考。⇒ 那个信号在真实的死胎上会说"一切正常"。
+    """
+
+    CID = 'cccccccc-0000-0000-0000-000000000009'
+    PARENT = 'p-9'
+    OLDEST_MIN = 30.0
+
+    def child(self, *, sent: int, silent_min: float) -> dict:
+        d = self.ctx().agents_dir / self.CID
+        (d / 'inbox').mkdir(parents=True, exist_ok=True)
+        (d / 'sent').mkdir(parents=True, exist_ok=True)
+        an.write_doc(d / 'inbox' / '20260824T190000-p-9-x.md',
+                     {'id': 'x0', 'from': self.PARENT, 'subject': 's',
+                      'created_at': an.now() - timedelta(minutes=self.OLDEST_MIN)},
+                     '正文', an.LETTER_FIELD_ORDER)
+        for i in range(sent):
+            an.write_doc(d / 'sent' / f'20260824T18000{i}-c-x.md',
+                         {'id': f'o{i}', 'from': self.CID, 'subject': 's',
+                          'created_at': an.now() - timedelta(minutes=40)},
+                         '回信', an.LETTER_FIELD_ORDER)
+        meta = {'id': self.CID, 'status': an.STATUS_ACTIVE,
+                'last_active': an.now() - timedelta(minutes=silent_min),
+                'spawned_by': self.PARENT, 'display_name': 'probe-child'}
+        an.write_doc(d / 'info.md', meta, '', an.INFO_FIELD_ORDER)
+        p = self.ctx().agents_dir / self.PARENT
+        (p / 'inbox').mkdir(parents=True, exist_ok=True)
+        an.write_doc(p / 'info.md', {'id': self.PARENT, 'status': an.STATUS_ACTIVE,
+                                     'last_active': an.now()}, '', an.INFO_FIELD_ORDER)
+        return meta
+
+    def notice(self, *, sent: int, silent_min: float) -> str:
+        meta = self.child(sent=sent, silent_min=silent_min)
+        self.assertTrue(an.notify_deaf_child(self.ctx(), self.CID, meta, 1, self.OLDEST_MIN),
+                        '通知根本没发出，后面的断言全是空转')
+        letters = list((self.ctx().agents_dir / self.PARENT / 'inbox').glob('*.md'))
+        return letters[0].read_text(encoding='utf-8')
+
+    def test_stillborn_says_it_never_worked(self) -> None:
+        """零产出 + 信到达之前就不动了 ⇒ 它从出生起就没活过。"""
+        body = self.notice(sent=0, silent_min=45.0)
+        self.assertIn('从未工作过', body)
+        self.assertIn('先查上游', body, '死胎的第一动作必须是查上游，不是重开')
+
+    def test_stillborn_must_not_claim_it_is_probably_alive(self) -> None:
+        """🔴 **这句正是让拉起方白等 40 分钟的那句。**"""
+        body = self.notice(sent=0, silent_min=45.0)
+        self.assertNotIn('多半不是死了', body)
+
+    def test_worked_then_went_deaf_keeps_the_original_wording(self) -> None:
+        """⚠ 防恒真：真·中途失联的那句安慰**必须保留**，否则上面两条测不出东西。"""
+        body = self.notice(sent=3, silent_min=45.0)
+        self.assertIn('多半不是死了', body)
+        self.assertNotIn('从未工作过', body)
+
+    def test_slow_but_working_is_not_called_stillborn(self) -> None:
+        """🔴 **防误报**：`sent == 0` 单独不成判据——reviewer 首轮静默十几分钟是常态。
+
+        这个孩子零产出，但**心跳比信还新**（信到达之后它仍在动）
+        ⇒ 它在工作，只是慢。⛔ 不许把它说成死胎。
+        ⭐ 这条也是判据的**区分力证明**：若实现退化成只看 `sent==0`，本条必红。
+        """
+        body = self.notice(sent=0, silent_min=2.0)
+        self.assertNotIn('从未工作过', body)
+        self.assertIn('多半不是死了', body)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
