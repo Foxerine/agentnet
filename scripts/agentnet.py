@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import collections
 import contextlib
 import hashlib
@@ -1052,6 +1053,26 @@ def resolve_pid() -> int:
     return os.getppid()
 
 
+def session_owner_pid() -> int | None:
+    """轮询器要跟随的会话进程：它退出，轮询器就跟着退出。没有可靠的会话进程时返回 None。
+
+    只认 ``AGENTNET_PID``：它由 ``agentnet run`` 或外部启动器（例如远程会话在本机的
+    启动脚本）注入，与会话同生共死。``CLAUDE_PID`` / ``os.getppid()``
+    回退出来的 pid 可能是短命进程（见 :func:`effective_status` 的表），跟随它会把
+    活着的会话的轮询器提前带走。启动这一刻就已不在的 pid 同样不跟随——那说明这个
+    pid 本身不可信，不能拿它判会话结束。
+
+    为什么需要它（2026-10-24 实测）：远程会话的轮询器跑在本机一个独立的执行进程里，
+    不是会话所在终端的子进程，会话结束时不会被一起带走。这样残留下来的轮询器同日有 4 个，各自撑了 1~2 天：
+    花名册里它们一直是「active / 可达」，投给它们的信被取走后打印到不存在的会话里。
+    """
+    raw = os.environ.get(AGENTNET_PID_ENV, '')
+    if not raw.isdigit():
+        return None
+    pid = int(raw)
+    return pid if pid_alive(pid) else None
+
+
 class Workspace:
     """一个 workspace 的**纯目录视图**——不含身份，可安全用于查看别人的分区。
 
@@ -1360,7 +1381,9 @@ def effective_status(meta: dict[str, Any], at: datetime | None = None,
         =========================  ==================  ====================================
 
         ⇒ **三个信号都能可靠证明"活"，没有一个能可靠证明"死"。** 唯一的判死依据只有
-        心跳超时，而那是定义。于是进程证据的正确用法是**反过来的**：心跳已经陈旧、
+        心跳超时，而那是定义。（例外只有一处、且不在本函数里：来自 ``AGENTNET_PID`` 的 pid
+        与会话同生共死，轮询器发现它退出就自行退出、停止续心跳，见 :func:`session_owner_pid`。
+        本函数仍只按心跳判死。）于是进程证据的正确用法是**反过来的**：心跳已经陈旧、
         但仍有活进程时**判它活着**——一个 agent 可能正忙一件十分钟的活、期间不调 agentnet，
         它的心跳早就陈旧，可轮询器还在跑。旧写法会把它判死，新写法留着它。
 
@@ -5168,12 +5191,22 @@ def poll_loop(args: argparse.Namespace, *, stream: bool) -> None:
     # 用安静取值器：顶层实例没有这个字段，而那**不是**错误（它就该得到 ''）。
     _self_meta = try_read_agent_meta(ctx, ctx.agent_id)
     my_spawner = str((_self_meta or {}).get('spawned_by') or '')
+    owner = session_owner_pid()
     try:
         while True:
             # 该退位就**立刻退位，且什么都不写** —— 让位比抢着做完手上的事重要。
             retiring = retirement_reason(ctx, me)
             if retiring is not None:
                 print(retiring)
+                return
+
+            # 会话已经结束：再跑下去只会替一个不存在的会话收信（信被取走、没人看）、
+            # 续心跳（花名册一直显示它活着）、以它的名义发自动通知。
+            # ⛔ 不写 last_active：让心跳自然过期，由既有的超时判定把它判死。
+            if owner is not None and not pid_alive(owner):
+                merge_info(ctx.info_path, {'poller_pid': None}, expect=mine, create=False)
+                print(f"[EXIT] 会话进程（{AGENTNET_PID_ENV}={owner}）已退出，本轮询器随之退出。",
+                      flush=True)
                 return
 
             # 看板没有服务端，运行中的轮询器就是它的执行器：每轮顺带取走排队的管理动作。
@@ -8182,16 +8215,271 @@ def cmd_archive(args: argparse.Namespace) -> None:
         print(f"  释放的锁：{', '.join(released)}")
 
 
+# ── 把实例所在的终端窗口调到最前（focus）───────────────────────────────────
+#
+# 定位链（2026-10-24 实测）：实例登记的 pid 挂在它所在标签页的控制台上
+# ⇒ ``AttachConsole(pid)`` + ``GetConsoleWindow()`` 拿到 ``PseudoConsoleWindow``，
+#    它的 owner 就是那个 Windows Terminal 顶层窗口；同时 ``GetConsoleTitleW`` 读到标签页标题
+# ⇒ 多标签窗口里再用 UI Automation 按标题选中那个标签页。
+# ⛔ 按 pid 找窗口所属进程行不通：所有 Windows Terminal 窗口都属于同一个 WindowsTerminal.exe。
+
+WT_WINDOW_CLASS = 'CASCADIA_HOSTING_WINDOW_CLASS'
+
+FOCUS_TAB_PREFIX_RE = r'^[^\w\s]{1,2}\s+'
+"""标签页标题前面的状态符号（Claude Code 的 ``◐`` / ``✳`` 等，后跟空格）。
+
+比对标签页时两边都先去掉它：读控制台标题与 UI Automation 读标签页名不在同一时刻，
+转圈的符号可能已经换了一帧。Python 与 PowerShell 两侧用的是这同一个式子（经环境变量传过去）。
+"""
+
+_CONSOLE_PROBE_CODE = r'''
+import ctypes, json, sys
+from ctypes import wintypes
+k = ctypes.WinDLL('kernel32', use_last_error=True)
+u = ctypes.WinDLL('user32', use_last_error=True)
+k.GetConsoleWindow.restype = wintypes.HWND
+u.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+u.GetAncestor.restype = wintypes.HWND
+u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+k.FreeConsole()
+if not k.AttachConsole(int(sys.argv[1])):
+    result = {'error': f'AttachConsole 失败（WinError {ctypes.get_last_error()}）'}
+else:
+    try:
+        con = k.GetConsoleWindow()
+        title = ctypes.create_unicode_buffer(1024)
+        k.GetConsoleTitleW(title, 1024)
+        top = u.GetAncestor(con, 3) if con else None
+        cls = ctypes.create_unicode_buffer(256)
+        if top:
+            u.GetClassNameW(top, cls, 256)
+        result = {'hwnd': top or 0, 'cls': cls.value, 'title': title.value}
+    finally:
+        k.FreeConsole()
+sys.stdout.write(json.dumps(result, ensure_ascii=True))
+'''
+"""在**无控制台的子进程**里跑的探针：附着到目标 pid 的控制台，读出它的顶层窗口与标题。
+
+为什么要放进子进程：``AttachConsole`` 要求调用方先 ``FreeConsole``。在轮询器或用户终端里
+直接做，会把调用方自己从控制台上摘下来（此后的输出、Ctrl+C 都失效）。
+``GA_ROOTOWNER``（3）：Windows Terminal 下拿到的是 owner，即那个终端顶层窗口；
+传统 conhost 下拿到的是控制台窗口自身——两种都能直接调到最前，只有前者需要再选标签页。
+"""
+
+_TAB_SELECT_PS = r'''
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+$AE = [System.Windows.Automation.AutomationElement]
+$win = $AE::FromHandle([IntPtr][int64]$env:AGENTNET_FOCUS_HWND)
+$cond = New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, [System.Windows.Automation.ControlType]::TabItem)
+$tabs = @($win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond))
+$prefix = $env:AGENTNET_FOCUS_PREFIX_RE
+$out = @{ tabs = $tabs.Count; selected = ''; ambiguous = '' }
+if ($tabs.Count -gt 1) {
+  $names = ConvertFrom-Json $env:AGENTNET_FOCUS_NAMES
+  foreach ($want in $names) {
+    $hit = @($tabs | Where-Object { ($_.Current.Name -replace $prefix, '').Trim() -ceq $want })
+    if ($hit.Count -eq 1) {
+      $hit[0].GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+      $out.selected = $hit[0].Current.Name
+      break
+    }
+    if ($hit.Count -gt 1 -and -not $out.ambiguous) { $out.ambiguous = $want }
+  }
+}
+$out | ConvertTo-Json -Compress
+'''
+"""在指定的 Windows Terminal 窗口里按名字选中标签页（UI Automation）。
+
+本脚本坚持零第三方依赖，Python 侧调不了 UI Automation 的 COM 接口，所以交给系统自带的
+PowerShell 5.1。脚本保持纯 ASCII：5.1 读无 BOM 的非 ASCII 文本会按 GBK 解码；
+参数一律经环境变量传，避免转义问题。
+"""
+
+
+def focus_tab_names(console_title: str, display_name: str | None) -> list[str]:
+    """按优先级排列的标签页候选名（已去掉状态符号、去重、去空）。
+
+    控制台标题优先：普通标签页的名字就是它。``agentnet spawn`` 拉起的标签页用 ``--title``
+    固定成了显示名，控制台标题只多一个状态符号，去掉之后同样命中；显示名排最后兜底。
+    """
+    names = [re.sub(FOCUS_TAB_PREFIX_RE, '', n).strip() for n in (console_title, display_name or '')]
+    return [n for n in dict.fromkeys(names) if n]
+
+
+def _probe_console(pid: int) -> dict[str, Any]:
+    try:
+        done = subprocess.run(
+            [sys.executable, '-I', '-c', _CONSOLE_PROBE_CODE, str(pid)],
+            capture_output=True, text=True, encoding='utf-8', timeout=15,
+            creationflags=subprocess.DETACHED_PROCESS,
+        )
+        return json.loads(done.stdout) if done.stdout.strip() else {'error': done.stderr.strip()[-300:]}
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        return {'error': f'{type(exc).__name__}: {exc}'}
+
+
+def _select_tab(hwnd: int, names: list[str]) -> str:
+    """选中标签页；返回接在结果后面的说明（单标签窗口返回空串）。"""
+    script = base64.b64encode(_TAB_SELECT_PS.encode('utf-16-le')).decode('ascii')
+    env = dict(os.environ, AGENTNET_FOCUS_HWND=str(hwnd),
+               AGENTNET_FOCUS_NAMES=json.dumps(names, ensure_ascii=False),
+               AGENTNET_FOCUS_PREFIX_RE=FOCUS_TAB_PREFIX_RE)
+    try:
+        done = subprocess.run(
+            ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+             '-EncodedCommand', script],
+            # utf-8-sig：PowerShell 5.1 的 [Text.Encoding]::UTF8 可能先写一个 BOM
+            capture_output=True, text=True, encoding='utf-8-sig', timeout=30, env=env,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        result = json.loads(done.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        return f"；⚠ 选标签页失败（{type(exc).__name__}），只调出了窗口"
+    if result.get('selected'):
+        return f"，已切到标签页「{result['selected']}」"
+    if int(result.get('tabs') or 0) <= 1:
+        return ''
+    if result.get('ambiguous'):
+        return f"；⚠ 该窗口有 {result['tabs']} 个标签页，名为「{result['ambiguous']}」的不止一个，只调出了窗口"
+    return f"；⚠ 该窗口有 {result['tabs']} 个标签页，没找到名为 {names} 的那个，只调出了窗口"
+
+
+def _bring_to_front(hwnd: int) -> str:
+    """把窗口调到最前；系统不允许时退成任务栏闪烁。返回实际效果。
+
+    Windows 不让后台进程随意抢前台（轮询器、以及远程会话转到本机执行的命令都是后台进程）。
+    依次尝试：直接 ``SetForegroundWindow`` → 把输入队列临时挂到当前前台线程上再试
+    → ``FlashWindowEx`` 闪烁任务栏按钮。
+    须在一个**用完即弃的线程**里调用（见 :func:`focus_agent`）：挂输入队列需要
+    本线程有消息队列，``IsGUIThread(True)`` 会给它建一个，不该留在轮询器的主线程上。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL('user32', use_last_error=True)
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    hw = wintypes.HWND
+    user32.IsIconic.argtypes = [hw]
+    user32.ShowWindow.argtypes = [hw, ctypes.c_int]
+    user32.SetForegroundWindow.argtypes = [hw]
+    user32.BringWindowToTop.argtypes = [hw]
+    user32.GetForegroundWindow.restype = hw
+    user32.GetWindowThreadProcessId.argtypes = [hw, ctypes.c_void_p]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    user32.IsGUIThread.argtypes = [wintypes.BOOL]
+
+    class FLASHWINFO(ctypes.Structure):
+        _fields_ = [('cbSize', wintypes.UINT), ('hwnd', hw), ('dwFlags', wintypes.DWORD),
+                    ('uCount', wintypes.UINT), ('dwTimeout', wintypes.DWORD)]
+
+    user32.FlashWindowEx.argtypes = [ctypes.POINTER(FLASHWINFO)]
+
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)                      # SW_RESTORE
+    user32.SetForegroundWindow(hwnd)
+    if user32.GetForegroundWindow() == hwnd:
+        return '已调到最前'
+    user32.IsGUIThread(True)
+    mine = kernel32.GetCurrentThreadId()
+    theirs = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
+    attached = bool(theirs) and theirs != mine and bool(user32.AttachThreadInput(mine, theirs, True))
+    try:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        if attached:
+            user32.AttachThreadInput(mine, theirs, False)
+    if user32.GetForegroundWindow() == hwnd:
+        return '已调到最前'
+    flash = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd, 0x3 | 0xC, 0, 0)  # FLASHW_ALL | FLASHW_TIMERNOFG
+    user32.FlashWindowEx(ctypes.byref(flash))
+    return '系统不允许后台进程抢前台，已让它在任务栏闪烁'
+
+
+def focus_agent(ws: Workspace, agent_id: str) -> tuple[bool, str]:
+    """把实例所在的终端窗口调到最前（Windows Terminal 下顺带切到它的标签页）。
+
+    :return: ``(是否定位到了窗口, 给人看的结果)``——命令行与看板共用这一句。
+
+    先试登记的 ``pid``，再试 ``poller_pid``（本机原生会话的轮询器挂在同一个标签页上；
+    远程会话的轮询器跑在本机的后台执行进程里，附着得上控制台、但没有窗口）。
+
+    **已知边界**：pid 被系统复用给了另一个终端里的进程时，会调出那个不相干的窗口。
+    会话结束后轮询器会自行退出、心跳随之过期（见 :func:`session_owner_pid`），
+    所以登记会很快被判死，这个窗口不长。
+    """
+    meta, _ = read_info(ws.info_path_of(agent_id))
+    label = f"{agent_id[:8]}（{meta.get('display_name') or '未命名'}）"
+    if os.name != 'nt':
+        return False, f"{label}：只支持 Windows（靠 Windows Terminal 的伪控制台定位窗口）"
+    pids = [p for p in (meta.get('pid'), meta.get('poller_pid')) if isinstance(p, int) and p > 0]
+    live = [p for p in dict.fromkeys(pids) if pid_alive(p)]
+    if not live:
+        return False, (f"{label}：登记的进程都已不在（pid {meta.get('pid')}），定位不到窗口。"
+                       f"会话多半已经结束；若它其实还在跑，说明登记的 pid 不是它的会话进程。")
+    probe: dict[str, Any] = {}
+    for pid in live:
+        probe = _probe_console(pid)
+        if probe.get('hwnd'):
+            break
+    if not probe.get('hwnd'):
+        return False, (f"{label}：它的进程不在任何终端窗口里（{probe.get('error') or '没有窗口'}），"
+                       f"多半是后台进程。")
+    hwnd = int(probe['hwnd'])
+    tab_note = ''
+    if probe.get('cls') == WT_WINDOW_CLASS:
+        tab_note = _select_tab(hwnd, focus_tab_names(str(probe.get('title') or ''),
+                                                     meta.get('display_name')))
+    outcome: list[str] = []
+    worker = threading.Thread(target=lambda: outcome.append(_bring_to_front(hwnd)), daemon=True)
+    worker.start()
+    worker.join(10)
+    return True, f"{label}：{outcome[0] if outcome else '调前台超时'}{tab_note}"
+
+
+def _args_focus(p: argparse.ArgumentParser) -> None:
+    p.add_argument('target', help='目标 agent：id 前缀，或完整的显示名')
+
+
+@command(
+    'focus',
+    '把一个实例所在的终端窗口调到最前（Windows Terminal 会切到它的标签页）',
+    'agentnet focus <id前缀|显示名>',
+    detail=('看板上每个活着的实例旁边的「高亮」按钮做的是同一件事。仅限 Windows。\n'
+            '定位靠实例登记的 pid 所在的控制台：pid 已不在时说明会话多半已经结束，'
+            '命令会直接说明、不会去猜。\n'
+            'Windows 不让后台进程随意抢前台：调不到最前时会退成让它在任务栏闪烁。'),
+    add_args=_args_focus,
+)
+def cmd_focus(args: argparse.Namespace) -> None:
+    ctx = Ctx()
+    matched, why = resolve_target(ctx, args.target)
+    if why is not None or len(matched) != 1:
+        by_name = [aid for aid, meta, _ in iter_agents(ctx) if meta.get('display_name') == args.target]
+        if len(by_name) != 1:
+            _die(f"显示名 `{args.target}` 对应 {len(by_name)} 个实例，请改用 id 前缀。"
+                 if by_name else (why or f"`{args.target}` 匹配到 {len(matched)} 个实例，请给唯一的 id 前缀。"))
+        matched = by_name
+    ok, message = focus_agent(ctx, matched[0])
+    if not ok:
+        _die(message)
+    print(f"[OK] {message}")
+
+
 # ── 控制台指令队列（看板 → 运行中的轮询器）──────────────────────────────────
 CONSOLE_QUEUE = 'console-queue.json'
 CONSOLE_LOG = 'console-log.json'
 CONSOLE_LOCK = '_console'
 
-CONSOLE_VERBS = ('archive', 'restore', 'kill', 'sweep', 'lock_clear')
+CONSOLE_VERBS = ('archive', 'restore', 'kill', 'sweep', 'lock_clear', 'focus')
 """看板能下达的**全部**动作。
 
 刻意是**固定动词白名单**而不是任意命令：看板是给人用的管理面，不是远程 shell。
 即便有人能写这个队列文件，能做的也只有这几件网络自身的管理动作。
+``focus`` 只把窗口调到最前，不改任何登记。
 """
 
 
@@ -8216,6 +8504,8 @@ def run_console_action(ws: Workspace, action: dict[str, Any]) -> str:
         if len(matches) != 1:
             return f"拒绝：`{target}` 未唯一匹配（命中 {len(matches)} 个）"
         agent_id = matches[0]
+        if verb == 'focus':
+            return focus_agent(ws, agent_id)[1]
         if verb == 'kill':
             meta, _ = read_info(ws.info_path_of(agent_id))
             ok, how = terminate_pid(int(meta.get('pid') or 0))
@@ -8597,6 +8887,7 @@ DASHBOARD_TEMPLATE = '''<!doctype html>
   .act:hover { color:var(--fg); border-color:var(--faint) }
   .act.danger:hover { color:var(--bad); border-color:var(--bad) }
   .act:disabled { opacity:.4; cursor:default }
+  .act.mini { padding:0 7px; font-size:10.5px; line-height:1.6 }
   .arch-group { margin-top:14px }
   .arch-group > summary { font-size:12px; color:var(--dim) }
   .arch-group .tree { margin-top:10px }
@@ -8619,7 +8910,7 @@ DASHBOARD_TEMPLATE = '''<!doctype html>
   details.row > summary {
     display:grid; align-items:center; gap:8px; padding:4px 6px; font-size:12.5px;
     color:var(--fg); line-height:1.4;
-    grid-template-columns:8px 62px minmax(60px,1.1fr) minmax(0,1.4fr) auto auto;
+    grid-template-columns:8px 62px minmax(60px,1.1fr) minmax(0,1.4fr) auto auto 40px;
   }
   details.row > summary::before { content:none }
   details.row > summary:hover { background:var(--card) }
@@ -8764,7 +9055,7 @@ function agentCard(a) {
     + esc(a.short) + '">' + label + '</button>';
   let acts = '';
   if (a.status === 'archived') acts = act('restore', '恢复');
-  else if (a.status === 'active') acts = act('kill', '终止', 'danger') + act('archive', '归档', 'danger');
+  else if (a.status === 'active') acts = act('focus', '高亮') + act('kill', '终止', 'danger') + act('archive', '归档', 'danger');
   else acts = act('archive', '归档');
 
   return '<article class="agent st-' + esc(a.status) + '">'
@@ -8809,6 +9100,10 @@ function agentRow(a) {
     + (a.poller ? '' : '<span class="no">无轮询</span> ')
     + (a.stale_min === null ? '' : a.stale_min + 'm') + '</span>'
     + '<span class="rmeta">' + esc(a.status) + '</span>'
+    + '<span>' + (a.status === 'active'
+      ? '<button class="act mini" data-verb="focus" data-target="' + esc(a.short)
+        + '" title="把它的终端窗口调到最前">高亮</button>'
+      : '') + '</span>'
     + '</summary>'
     + '<div class="rbody">' + blocks + '<div class="acts">' + actHtml + '</div></div>'
     + '</details>';
@@ -9212,10 +9507,14 @@ async function queueAction(verb, target) {
 document.addEventListener('click', ev => {
   const btn = ev.target.closest('.act, .ws-sweep');
   if (!btn) return;
+  /* 摘要行里的按钮：别让这次点击同时展开 / 收起整行 */
+  if (btn.closest('summary')) ev.preventDefault();
   const verb = btn.dataset.verb, target = btn.dataset.target || '';
   if ((verb === 'kill' || verb === 'archive')
       && !confirm('确定要对 ' + (target || '本 workspace') + ' 执行「' + btn.textContent + '」？')) return;
   btn.disabled = true;
+  /* 高亮可以反复点；页面每次重绘也会换掉按钮，这里只是防连点 */
+  if (verb === 'focus') setTimeout(() => { btn.disabled = false; }, 3000);
   queueAction(verb, target);
 });
 

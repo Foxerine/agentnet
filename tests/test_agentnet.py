@@ -3057,5 +3057,113 @@ class TestDeafNoticeDistinguishesStillborn(Base):
         self.assertNotIn('两种解释', body)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# focus：把实例的终端窗口调到最前
+# ══════════════════════════════════════════════════════════════════════════
+
+def _a_dead_pid() -> int:
+    for pid in range(4_000_000, 4_000_400, 4):
+        if not an.pid_alive(pid):
+            return pid
+    raise RuntimeError('找不到一个不存在的 pid')
+
+
+class TestFocus(Base):
+
+    def patch(self, name: str, value: object) -> None:
+        original = getattr(an, name)
+        setattr(an, name, value)
+        self.addCleanup(setattr, an, name, original)
+
+    def test_tab_names_drop_status_glyph_and_duplicates(self) -> None:
+        """spawn 出来的标签页名是显示名，控制台标题多一个转圈符号——去掉后两者应合并成一个。"""
+        self.assertEqual(an.focus_tab_names('◐ public-docs-final-reviewer', 'public-docs-final-reviewer'),
+                         ['public-docs-final-reviewer'])
+        self.assertEqual(an.focus_tab_names('✳ 双标签 迁移', None), ['双标签 迁移'])
+        self.assertEqual(an.focus_tab_names('', 'only-name'), ['only-name'])
+        self.assertEqual(an.focus_tab_names('', None), [])
+
+    def test_tab_names_keep_a_title_that_starts_with_a_word(self) -> None:
+        """⚠ 防过度剥离：标题第一个词是正常文字时一个字都不能少。"""
+        self.assertEqual(an.focus_tab_names('dev 环境 llms.txt', 'x'), ['dev 环境 llms.txt', 'x'])
+
+    def test_console_focus_reaches_focus_agent(self) -> None:
+        """看板的「高亮」按钮下达的是 `focus` 动词——不在白名单里就会被当成未知动作拒绝。"""
+        self.register()
+        seen: list[str] = []
+        self.patch('focus_agent', lambda ws, aid: (seen.append(aid), (True, 'ok'))[1])
+        result = an.run_console_action(self.ctx(), {'verb': 'focus', 'target': self.agent_id[:8]})
+        self.assertEqual(result, 'ok')
+        self.assertEqual(seen, [self.agent_id])
+
+    def test_cli_accepts_the_display_name(self) -> None:
+        """人记得的是显示名，不是 hash——`agentnet focus personal-sync` 要能直接用。"""
+        self.register(name='focus-me')
+        seen: list[str] = []
+        self.patch('focus_agent', lambda ws, aid: (seen.append(aid), (True, 'ok'))[1])
+        an.cmd_focus(an.build_parser().parse_args(['focus', 'focus-me']))
+        self.assertEqual(seen, [self.agent_id])
+
+    @unittest.skipUnless(os.name == 'nt', '定位窗口只在 Windows 上实现')
+    def test_dead_session_is_reported_not_guessed(self) -> None:
+        """登记的进程都不在了 ⇒ 直说定位不到，⛔ 不去猜一个窗口。"""
+        self.register()
+        an.merge_info(self.ctx().info_path, {'pid': _a_dead_pid(), 'poller_pid': None})
+        ok, message = an.focus_agent(self.ctx(), self.agent_id)
+        self.assertFalse(ok)
+        self.assertIn('已不在', message)
+
+
+class TestPollerFollowsSessionOwner(Base):
+    """远程会话的轮询器跑在本机一个独立的执行进程里，会话结束时不会被一起带走。
+    2026-10-24 实测同时残留 4 个：花名册里一直「可达」，投过去的信被取走、没人看。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._saved_pid_env = os.environ.pop(an.AGENTNET_PID_ENV, None)
+
+    def tearDown(self) -> None:
+        os.environ.pop(an.AGENTNET_PID_ENV, None)
+        if self._saved_pid_env is not None:
+            os.environ[an.AGENTNET_PID_ENV] = self._saved_pid_env
+        super().tearDown()
+
+    def test_no_owner_without_agentnet_pid(self) -> None:
+        """回退出来的 pid 可能是短命进程，跟随它会把活着的会话的轮询器带走。"""
+        self.assertIsNone(an.session_owner_pid())
+
+    def test_owner_already_dead_at_start_is_not_followed(self) -> None:
+        """启动时就不在的 pid 说明它本身不可信，不能拿它判会话结束。"""
+        os.environ[an.AGENTNET_PID_ENV] = str(_a_dead_pid())
+        self.assertIsNone(an.session_owner_pid())
+
+    def test_live_owner_is_followed(self) -> None:
+        os.environ[an.AGENTNET_PID_ENV] = str(os.getpid())
+        self.assertEqual(an.session_owner_pid(), os.getpid())
+
+    def test_poller_exits_once_the_owner_is_gone(self) -> None:
+        """会话进程退出后，轮询器要自己退出，并让出 poller_pid。
+
+        ⭐ 鉴别力：去掉这条检查，本用例会一直等到 `--max-wait` 并打印 [TIMEOUT]，而不是 [EXIT]。
+        """
+        import contextlib
+        import io
+        self.register()
+        fake_owner = _a_dead_pid()
+        original_alive, original_owner = an.pid_alive, an.session_owner_pid
+        self.addCleanup(setattr, an, 'pid_alive', original_alive)
+        self.addCleanup(setattr, an, 'session_owner_pid', original_owner)
+        an.session_owner_pid = lambda: fake_owner
+        an.pid_alive = lambda pid: False if pid == fake_owner else original_alive(pid)
+        out = io.StringIO()
+        started = time.monotonic()
+        with contextlib.redirect_stdout(out):
+            an.cmd_poll(an.build_parser().parse_args(['poll', '--interval', '1', '--max-wait', '5']))
+        self.assertIn('[EXIT]', out.getvalue())
+        self.assertLess(time.monotonic() - started, 4)
+        meta, _ = an.read_info(self.ctx().info_path)
+        self.assertNotIn('poller_pid', meta)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
