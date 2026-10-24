@@ -33,7 +33,7 @@ agentnet who                                         # 看看还有谁在
 然后**挂上收信器**——它既是空闲时收信的唯一途径，也是心跳来源：
 
 ```
-Monitor(command='agentnet watch', persistent=true)    # Claude Code：挂一次就够
+Monitor(command='python C:/Users/Administrator/.agentnet/scripts/agentnet.py watch', persistent=true)    # Claude Code：挂一次就够
 ```
 
 ⛔ **别用 `agentnet poll &`**：`&` 起的进程 harness 追踪不到，它退出时唤不醒任何人。没有流式监视器时用 harness 自己的后台机制跑 `agentnet poll`，且**每次被唤醒后要重挂**。
@@ -164,15 +164,26 @@ agentnet readme --write | --check
 
 README 由本脚本的命令注册表与常量**生成**，不手写。它是 agent 读了就照做的规范性文本，漂移即错误行为——所以用 --check 把「文档与实现一致」变成可机器验证的约束。
 
+### `reminder`
+
+管理发信回执提醒：list / update / disable
+
+```
+agentnet reminder list [--all] | update <id> [--after 30m] [--every 2h|off] | disable <id>
+```
+
+人工 send 默认等回信：1 小时后没收到就给自己投一封 control 警告。回信按 reply_to + 原收件人**精确**销账——同 thread 别人的回信不算。全部收信进程停掉期间不可能准时提醒，恢复后补发一次，不追补欠账。
+
 ### `send`
 
 投信给同 workspace 的 agent（或按主题群发）
 
 ```
-agentnet send --to <id|@topic> [--to <另一个> ...] --subject "..." (--body-file x.md | --body "...") [--kind letter|review-request|review-reply|errand|control] [--thread t] [--force]
+agentnet send --to <id|@topic> [--to <另一个> ...] --subject "..." (--body-file x.md | --body "...") [--kind letter|review-request|review-reply|errand|control] [--thread t] [--force] [--no-reminder | --reply-after 30m [--reply-every 2h]]
 ```
 
 评审就是投信——`--kind review-request` 加 `--thread`，不需要单独的评审子系统。收件人若已死或已归档会**当场拒绝**，不会静默成功。
+人工发信**默认等回信**：1 小时没收到就给自己投一封 control 警告（`--no-reminder` 关闭；`--reply-after` 改首次时间；`--reply-every` 加重复；事后用 `agentnet reminder list/update/disable` 管理）。control 信件（含警告本身）永不创建提醒，不会提醒套提醒。
 
 ### `reply`
 
@@ -252,10 +263,10 @@ agentnet last [N] [--full]
 
 ### `thread`
 
-重建一条线程的全部往来（从 sent/ + read/ + inbox/ 汇总）
+重建一条线程的全部往来（从 sent/ + read/ + inbox/ 汇总）；**接受唯一前缀**，8 位短 id 即可
 
 ```
-agentnet thread <thread-id>
+agentnet thread <thread-id|前缀>
 ```
 
 ### `log`
@@ -275,7 +286,7 @@ agentnet log "在做什么" [--plan <计划文件路径>] [--pivot]
 拉起一个新 agent（默认开在本 workspace 的约定窗口）并转交任务
 
 ```
-agentnet spawn (--task-file t.md | --task "...") [--role <角色名>] [--mode tab|window|pane|named|background] [--window shared|current|<名字>] [--topics a,b] [--name x] [--dry-run]
+agentnet spawn (--task-file t.md | --task "...") [--role <角色名>] [--mode tab|window|pane|named|background] [--window shared|current|<名字>] [--topics a,b] [--name x] [--no-reminder] [--dry-run]
 ```
 
 **先跑 `agentnet roles` 看菜单。**
@@ -285,6 +296,7 @@ agentnet spawn (--task-file t.md | --task "...") [--role <角色名>] [--mode ta
 **不用 `wt -w 0`**：`0` 是"最近使用的窗口"，会跟着用户焦点跑（实测子实例开进了用户当时正看的窗口）。而窗格在 shell 层无法得知自己属于哪个窗口——WT 只给`WT_SESSION`/`WT_PROFILE_ID`，`WT_WINDOWID` 至今是未实现的功能请求。
 要"父子同窗"：把你自己的窗口重命名为 `agentnet-<workspace>`（命令面板 → Rename Window）。
 子实例继承发起方 cwd（`-d`）⇒ 自动落在同一 workspace。
+**任务信默认给拉起方建 1h 一次性回执提醒**（与 `send` 同规则）：它任何一封回信即销账，否则 1h 后提醒你——实例活着但卡死时不会无声等待。`--no-reminder` 关闭。
 **从 Python Popen(list) 拉起，不经 shell**：文档明载从 PowerShell 拉 wt 会阻塞到新窗口关闭、且 `;` 需转义，走 Popen 两个坑都不成立。
 
 ### `kill`
@@ -299,7 +311,7 @@ agentnet kill <id前缀>
 
 ### `reset`
 
-重置一个 agent 的对话：终止 + 用全新 session id 原地重生
+重置一个 agent 的对话：终止旧实例 + 按同一 spawn 配方拉起一个**新 agent id**（⚠ 旧收件箱的未读信**不迁移**）
 
 ```
 agentnet reset <id前缀> [--task-file t.md | --task "..."]
