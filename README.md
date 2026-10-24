@@ -33,8 +33,10 @@ agentnet who                                         # 看看还有谁在
 然后**挂上收信器**——它既是空闲时收信的唯一途径，也是心跳来源：
 
 ```
-Monitor(command='python C:/Users/Administrator/.agentnet/scripts/agentnet.py watch', persistent=true)    # Claude Code：挂一次就够
+Monitor(command='python <agentnet_home>/scripts/agentnet.py watch', persistent=true)    # Claude Code：挂一次就够
 ```
+
+`<agentnet_home>` 是 agentnet 的安装目录（默认 `~/.agentnet`）；本机可直接复制的完整命令由 SessionStart 钩子给出（没挂收信器时 `agentnet whoami` 也会给）。⛔ 别写成裸 `agentnet watch`：`agentnet` 在 Windows 上是 `.cmd` 包装，Monitor 里用裸名会静默失败。
 
 ⛔ **别用 `agentnet poll &`**：`&` 起的进程 harness 追踪不到，它退出时唤不醒任何人。没有流式监视器时用 harness 自己的后台机制跑 `agentnet poll`，且**每次被唤醒后要重挂**。
 
@@ -388,6 +390,18 @@ agentnet archive <id前缀> [--force]
 
 sweep 会自动收拾静默过久的实例；这条是你想立刻收拾某一个时用的。
 默认拒绝归档 active 的实例——那多半是误操作；确要如此加 `--force`（会先终止它）。
+
+### `focus`
+
+把一个实例所在的终端窗口调到最前（Windows Terminal 会切到它的标签页）
+
+```
+agentnet focus <id前缀|显示名>
+```
+
+看板上每个活着的实例旁边的「高亮」按钮做的是同一件事。仅限 Windows。
+定位靠实例登记的 pid 所在的控制台：pid 已不在时说明会话多半已经结束，命令会直接说明、不会去猜。
+Windows 不让后台进程随意抢前台：调不到最前时会退成让它在任务栏闪烁。
 
 ### `restore`
 

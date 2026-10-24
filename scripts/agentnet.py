@@ -2211,8 +2211,15 @@ def render_readme() -> str:
         '然后**挂上收信器**——它既是空闲时收信的唯一途径，也是心跳来源：',
         '',
         '```',
-        f"{WATCH_MONITOR_HINT}    # Claude Code：挂一次就够",
+        # ⛔ 这里不插值 WATCH_MONITOR_HINT：README 也是公开仓库的首页，插进去的是
+        # 生成者本机的绝对路径。运行时提示（SessionStart 钩子、whoami）仍给本机的完整命令。
+        "Monitor(command='python <agentnet_home>/scripts/agentnet.py watch', persistent=true)"
+        "    # Claude Code：挂一次就够",
         '```',
+        '',
+        '`<agentnet_home>` 是 agentnet 的安装目录（默认 `~/.agentnet`）；本机可直接复制的完整命令'
+        '由 SessionStart 钩子给出（没挂收信器时 `agentnet whoami` 也会给）。⛔ 别写成裸 `agentnet watch`：'
+        '`agentnet` 在 Windows 上是 `.cmd` 包装，Monitor 里用裸名会静默失败。',
         '',
         '⛔ **别用 `agentnet poll &`**：`&` 起的进程 harness 追踪不到，'
         '它退出时唤不醒任何人。没有流式监视器时用 harness 自己的后台机制跑 `agentnet poll`，'
