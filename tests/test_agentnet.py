@@ -467,23 +467,23 @@ class TestLetterHeadline(Base):
                 for i in range(count)]
 
     def test_first_line_announces_a_letter(self) -> None:
-        first = an.render_letters(self.letters()).splitlines()[0]
+        first = an.render_letters(self.letters(), '').splitlines()[0]
         self.assertTrue(first.startswith('[LETTER]'), f'首行没有自带结论：{first!r}')
 
     def test_first_line_survives_head_3(self) -> None:
         """判据必须放在**任何粗略查看都会撞见**的位置——这就是那次失效的直接教训。"""
-        head = '\n'.join(an.render_letters(self.letters()).splitlines()[:3])
+        head = '\n'.join(an.render_letters(self.letters(), '').splitlines()[:3])
         self.assertIn('[LETTER]', head)
         self.assertIn('必须读完', head, 'head -3 里看不到"要读完"就等于没说')
 
     def test_first_line_carries_sender_and_subject(self) -> None:
-        first = an.render_letters(self.letters()).splitlines()[0]
+        first = an.render_letters(self.letters(), '').splitlines()[0]
         self.assertIn('sender00', first)
         self.assertIn('主题0', first)
 
     def test_reload_and_letter_differ_on_line_one(self) -> None:
         """两者共用退出路径，唯一能机械区分的就是首行——不能长得像。"""
-        letter_first = an.render_letters(self.letters()).splitlines()[0]
+        letter_first = an.render_letters(self.letters(), '').splitlines()[0]
         self.assertNotIn('[RELOAD]', letter_first)
         self.assertTrue(letter_first.startswith('[LETTER]'))
 
@@ -494,6 +494,20 @@ class TestSpawnWindowTargeting(Base):
     实测（`0de75e6c` 报告）：6 次 spawn **6 次**降级。两条退路都验死了——`WT_WINDOWID`
     未实现；进程树反查也不行（本机一个 WindowsTerminal.exe 托管 23 个窗口）。
     """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # 本组测的是「在 Windows Terminal 里时窗口怎么选」。这个前提要在测试里固定：
+        # 不在 WT 里（没有 WT_SESSION / 找不到 wt.exe）时代码会按设计降级成新窗口 `-1`，
+        # 于是结果取决于谁、在哪儿跑测试——从后台进程或 CI 跑就会红。
+        from unittest import mock
+        real_which = an.shutil.which
+        for patcher in (mock.patch.object(an, 'in_windows_terminal', lambda: True),
+                        mock.patch.object(an.shutil, 'which',
+                                          lambda name, *a, **k: 'wt.exe' if name == 'wt'
+                                          else real_which(name, *a, **k))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def build(self, window: str) -> tuple:
         return an.build_launch(mode='tab', window=window, title='t', cwd='C:/x',
@@ -526,8 +540,10 @@ class TestRearmNotice(Base):
         实测两个实例都栽在这：一个断定「挂不住」停止重试 ⇒ 永久离线；
         另一个把 `killed` 当成"有人在清理"，白停一轮。
         """
-        self.assertIn('压缩', an.REARM_NOTICE, '要点明 compact 是成因之一')
-        self.assertIn('重挂即可', an.REARM_NOTICE)
+        # 措辞随 2026-09-17/18 两次重写而变（见 REARM_NOTICE 的 docstring），命题不变：
+        # 点明 compact 是被杀的成因之一，并说清收到 killed 就重挂
+        self.assertIn('会话结束 / compact / 上下文超限', an.REARM_NOTICE, '要点明 compact 是成因之一')
+        self.assertIn('那才是重挂的依据', an.REARM_NOTICE)
 
     def test_tells_you_to_rearm_even_if_whoami_says_running(self) -> None:
         """收到 killed 通知**就重挂，不看 `whoami`**——它看不到"还被追踪着"。
@@ -655,7 +671,7 @@ class TestUnarmedPollerIsBlocking(Base):
         import argparse, io, contextlib, json
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
-            an.cmd_drain(argparse.Namespace(hook=True, no_block=False))
+            an.cmd_drain(an.build_parser().parse_args(['drain', '--hook']))
         return json.loads(buffer.getvalue() or '{}')
 
     def go_offline(self) -> None:
@@ -694,7 +710,7 @@ class TestUnarmedPollerIsBlocking(Base):
         self.go_offline()
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
-            an.cmd_drain(argparse.Namespace(hook=True, no_block=True))
+            an.cmd_drain(an.build_parser().parse_args(['drain', '--hook', '--no-block']))
         self.assertNotIn('decision', json.loads(buffer.getvalue() or '{}'))
 
     def test_message_does_not_overstate_the_loss(self) -> None:
@@ -728,7 +744,7 @@ class TestUnackedLetterSafetyNet(Base):
         import argparse, io, contextlib, json
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
-            an.cmd_drain(argparse.Namespace(hook=True, no_block=False))
+            an.cmd_drain(an.build_parser().parse_args(['drain', '--hook']))
         return json.loads(buffer.getvalue() or '{}')
 
     def deliver(self, subject: str = '关键前提被质疑') -> None:
@@ -828,7 +844,8 @@ class TestErrandFraming(Base):
     """任务简报必须说清"收到 ≠ 完成"，否则实例会把读信当交付。"""
 
     def test_errand_note_demands_delivery(self) -> None:
-        note = an.TRUST_NOTE_ERRAND
+        # 原 TRUST_NOTE_ERRAND 已按发信人拆成 PARENT / PEER 两条；「任务简报」指拉起方投递的那条
+        note = an.TRUST_NOTE_ERRAND_PARENT
         self.assertIn('回信', note, '要说明做完必须回信')
         self.assertIn('agentnet reply', note, '要给出具体命令')
         self.assertIn('准备工作', note, '要点破挂 poll / 报状态只是准备')
@@ -1236,7 +1253,7 @@ class TestPollerStartupRace(Base):
         writer.start()
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
-            an.cmd_drain(argparse.Namespace(hook=True, no_block=False))
+            an.cmd_drain(an.build_parser().parse_args(['drain', '--hook']))
         writer.join()
         payload = json.loads(buffer.getvalue() or '{}')
         self.assertNotIn('decision', payload, '复查应看到迟到的写入，不该再拦截')
@@ -1255,7 +1272,7 @@ class TestUnarmedNoticeOrdering(Base):
         an.merge_info(self.ctx().info_path, {'poller_pid': 999999})
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
-            an.cmd_drain(argparse.Namespace(hook=True, no_block=False))
+            an.cmd_drain(an.build_parser().parse_args(['drain', '--hook']))
         return json.loads(buffer.getvalue())['hookSpecificOutput']['additionalContext']
 
     def test_verify_comes_before_the_imperative(self) -> None:
@@ -1277,12 +1294,17 @@ class TestUnarmedNoticeOrdering(Base):
         `ae95fcde` 2026-08-21 报告：切到 watch 后仍被钩子劝去跑 poll。
         它因为先读过通知才没照做；**没有那个上下文的实例会照做**，
         于是被送回「被杀 → 重挂」的循环——即刚修好的那个问题。
+
+        （订正 2026-10-24：此处原断言「watch 排在 poll 之前——它才是首选」。
+        2026-09-18 提示文案已改为按监视器返回横幅选择原语——短超时 build 上 poll 更划算，
+        「无条件首选 watch」的前提被推翻，故改为断言提示讲清了这个判据。
+        watch 的挂法也已按设计改成绝对路径形态，见 WATCH_MONITOR_HINT。）
         """
         text = self.notice()
-        self.assertIn('agentnet watch', text, '未挂载提示没提 watch')
-        self.assertLess(text.index('agentnet watch'), text.index('agentnet poll'),
-                        'watch 必须排在 poll 之前——它才是首选')
-        self.assertIn('顶掉', text, '没警告「已在跑 watch 时挂 poll 会顶掉它」')
+        self.assertIn(an.WATCH_MONITOR_HINT, text, '未挂载提示没给 watch 的挂法')
+        self.assertIn('返回横幅', text, '没讲清 watch / poll 按监视器返回横幅来选')
+        # 匹配那一句本身：只断言「顶掉」二字时，提示里另一处泛指的「重挂会顶掉」就能让它照样通过
+        self.assertIn('已经在跑 `watch` 就别再挂 `poll`', text, '没警告「已在跑 watch 时挂 poll 会顶掉它」')
 
     def test_warns_against_double_arming(self) -> None:
         self.assertIn('别重挂', self.notice())
@@ -2430,11 +2452,13 @@ class TestReachabilityIsNotStatus(Base):
         self.assertEqual(an.reachability(meta), '可达')
 
     def test_never_armed_is_unknown_not_unreachable(self) -> None:
-        """从未挂过 ⇒ **无从判断**，不能报"不可达"。
+        """当前没有轮询器 ⇒ 报「未挂」，不能报"不可达"。
 
-        ⛔ 报"不可达"会让投信方以为出了故障；实际只是这个 agent 没用过轮询器。
+        ⛔ 报"不可达"会让投信方以为出了故障；实际只是这个 agent 此刻没挂轮询器。
+        （此处原断言空串：2026-09-22 起 `reachability` 改为返回可见的「未挂」，
+        理由见其 docstring——空白会被读成"无事"。）
         """
-        self.assertEqual(an.reachability({'status': an.STATUS_ACTIVE}), '')
+        self.assertEqual(an.reachability({'status': an.STATUS_ACTIVE}), '未挂')
 
     def test_reachability_ignores_status_and_silence(self) -> None:
         """判据只能是 pid 探测——**不是 status、不是静默时长**。"""
@@ -2605,14 +2629,23 @@ class TestPartialDeliveryIsNotSilent(Base):
         an.write_doc(d / 'info.md', meta, '', an.INFO_FIELD_ORDER)
         return agent_id
 
+    def send(self, to: list[str], *, force: bool = False) -> None:
+        """经真正的解析器构造参数——手搭 Namespace 会随 send 新增参数而漂移
+        （`--reply-after` 加进来后，这里四个用例曾因缺字段全部报错）。
+        ``--no-reminder``：回执提醒与本组要测的「部分投递不静默」无关。"""
+        argv = ['send', '--subject', 's', '--body', 'b', '--no-reminder']
+        for target in to:
+            argv += ['--to', target]
+        if force:
+            argv.append('--force')
+        an.cmd_send(an.build_parser().parse_args(argv))
+
     def test_dead_recipient_does_not_block_the_ones_after_it(self) -> None:
         self.register()
         dead = self.peer('0001', alive=False)
         alive = self.peer('0002', alive=True)
         with self.assertRaises(SystemExit) as caught:       # 有人没投出去 ⇒ 非零退出
-            an.cmd_send(argparse.Namespace(
-                to=[dead, alive], subject='s', body='b', body_file=None,
-                kind='letter', thread=None, force=False))
+            self.send([dead, alive])
         self.assertEqual(caught.exception.code, 1)
         # **关键断言**：排在死人后面的那个必须真的收到了
         self.assertEqual(len(an.inbox_letters(self.ctx(), alive)), 1,
@@ -2629,9 +2662,7 @@ class TestPartialDeliveryIsNotSilent(Base):
         self.register()
         alive = self.peer('0007', alive=True)
         with self.assertRaises(SystemExit) as caught:
-            an.cmd_send(argparse.Namespace(
-                to=['no-such-agent-xyz', alive], subject='s', body='b', body_file=None,
-                kind='letter', thread=None, force=False))
+            self.send(['no-such-agent-xyz', alive])
         self.assertEqual(caught.exception.code, 1)
         self.assertEqual(len(an.inbox_letters(self.ctx(), alive)), 1,
                          '解析不出来的 token 掐断了整批')
@@ -2647,9 +2678,7 @@ class TestPartialDeliveryIsNotSilent(Base):
         """全都投出去时不能反过来误报失败。"""
         self.register()
         peers = [self.peer('0003', alive=True), self.peer('0004', alive=True)]
-        an.cmd_send(argparse.Namespace(
-            to=peers, subject='s', body='b', body_file=None,
-            kind='letter', thread=None, force=False))          # 不抛即通过
+        self.send(peers)                                       # 不抛即通过
         for p in peers:
             self.assertEqual(len(an.inbox_letters(self.ctx(), p)), 1)
 
@@ -2657,9 +2686,7 @@ class TestPartialDeliveryIsNotSilent(Base):
         self.register()
         dead = self.peer('0005', alive=False)
         alive = self.peer('0006', alive=True)
-        an.cmd_send(argparse.Namespace(
-            to=[dead, alive], subject='s', body='b', body_file=None,
-            kind='letter', thread=None, force=True))
+        self.send([dead, alive], force=True)
         for p in (dead, alive):
             self.assertEqual(len(an.inbox_letters(self.ctx(), p)), 1)
 
@@ -2912,7 +2939,7 @@ class TestOneshotStopHookDoesNotDemandPoller(Base):
         import argparse, io, contextlib, json
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
-            an.cmd_drain(argparse.Namespace(hook=True, no_block=False))
+            an.cmd_drain(an.build_parser().parse_args(['drain', '--hook']))
         return json.loads(buffer.getvalue() or '{}')
 
     def go_offline(self) -> None:
