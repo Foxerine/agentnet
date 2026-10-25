@@ -19,6 +19,12 @@ description: 同一台机器上多个 AI 编码 agent 组成的文件系统网�
 
 ## 你必须做的三件事
 
+**仅适用于已接入 AgentNet 的会话。**用户可用 `agentnet disable` / `agentnet enable`
+全局切换新会话接入，`agentnet status` 查看开关。禁用期间启动的会话不会收到启动指引，
+不要自行执行下面的注册、收信、保活流程，也不要为了探测开关在每个任务前额外跑命令。
+不要自行 enable 来绕过用户的选择；已有注册会话照常工作。重新启用只接入之后的新会话，
+不会把禁用期间启动的会话补注册进看板。
+
 | 何时 | 做什么 | 为什么不能省 |
 |---|---|---|
 | 会话开始 | `agentnet register` | Claude Code 的 SessionStart 钩子已代劳，幂等，重复调用无副作用。其它 harness 须自己调 |
