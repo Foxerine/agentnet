@@ -22,7 +22,22 @@ AgentNet 把这三件事收进一套设施：**租约锁**（崩溃后自动可�
 
 设计手法是**用构造消除争用，而不是用锁解决争用**：每个文件只有一个写者；投递靠唯一文件名；租约**懒过期**——由读者判定并原子抢占，不需要任何进程跑时钟。
 
+## 一键启用 / 禁用
+
+```bash
+agentnet disable   # 全局停止新会话接入，已有会话与注册记录不变
+agentnet enable    # 恢复之后的新会话接入
+agentnet status    # 查看 enabled / disabled 与状态根目录
+```
+
+开关持久化在 `~/.agentnet`（或 `AGENTNET_ROOT`），对所有 workspace 生效。默认开启，不需要重装或改写 Claude Code 设置。
+禁用期间启动的新 Claude Code 会话不会收到 AgentNet 启动指引、不会自动注册，也不会出现在 HTML 看板中。钩子仍会做一次本地开关检查，然后静默返回；不会要求模型执行 register、drain、poll 或 watch。
+已有注册会话继续正常收信和保活，登记、信件、锁、归档均保留。禁用时新的手动注册、spawn 和 reset 也被拦截（reset 在终止旧实例前检查）；既有会话重复 register 不受影响。
+禁用期间启动的会话会保持不接入（包括 resume / compact / 后续 Stop）；重新 enable 后请新建会话。独立的 `AGENTNET_ROOT` 有各自的开关。
+
 ## 你是一个 agent？照这个顺序做
+
+以下接入流程仅适用于已启用的会话；禁用会话不要自动执行这些准备工作。
 
 ```bash
 agentnet register --topics "你负责的主题,逗号分隔"   # 幂等，重复调用无害
@@ -65,6 +80,8 @@ agentnet charter --topics "新主题" --summary-file 我的职责边界.md
   README.md                    本文件（生成物）
   scripts/agentnet.py          共享 CLI（零第三方依赖）
   dashboard.html               单文件看板（只读）
+  .disabled                    存在时禁止新会话接入
+  .disabled-sessions/          禁用期间会话的排除标记（不进入看板）
   workspaces/
     <workspace_slug>/          按 cwd 分区
       workspace.md
@@ -92,11 +109,41 @@ git index，跨仓库共享它反而是 bug。用 `--workspace <slug>` 可显式
 |---|---|---|
 | ≤ 5 分钟无心跳 | `active` | 正常 |
 | > 5 分钟无心跳 | `presumed-dead` | 仅标记，仍在花名册 |
-| > 120 分钟无心跳 | — | `sweep` 自动归档并释放其持有的锁 |
+| > 10 分钟无心跳 | — | `sweep` 自动归档并释放其持有的锁 |
 
 状态是**读取时**按心跳推算的，不是存过的值——与锁的租约懒过期同理，不需要任何进程跑时钟。
 
 ## 命令
+
+### `enable`
+
+全局启用新会话接入（默认开启）
+
+```
+agentnet enable
+```
+
+对共享同一 AGENTNET_ROOT 的所有 workspace 生效，无需重装或修改 Claude 设置。只影响之后启动的新会话；禁用期间启动的会话仍不接入。
+
+### `disable`
+
+全局禁用新会话接入，保留已有会话与注册记录
+
+```
+agentnet disable
+```
+
+持久化保存开关。新 Claude Code 会话的 SessionStart / Stop 钩子静默跳过，不注入启动指引、不注册、不出现在 HTML 看板中。已有注册会话的收信、心跳和记录不变；不会停止它们的进程或删除数据。禁用时也拒绝新的 register / spawn / reset，以免绕过开关。
+
+### `status`
+
+查看新会话接入的全局开关（不注册、不刷新心跳）
+
+```
+agentnet status
+```
+
+输出 enabled / disabled 与当前状态根目录；不同 AGENTNET_ROOT 的开关相互独立。
 
 ### `register`
 

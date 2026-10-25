@@ -4,6 +4,8 @@
 
 # 网络自身的状态：花名册、信件、锁、归档
 workspaces/
+.disabled
+.disabled-sessions/
 
 # 本机策略配置：写着你本机的 agent CLI 名字与权限模式，不该被提交、也不该被别人的覆盖。
 # 无需提供 example —— 首次运行会从 scripts/agentnet.py 里的 DEFAULT_CONFIG 生成它，

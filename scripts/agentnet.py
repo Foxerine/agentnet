@@ -85,6 +85,10 @@ SCRIPTS_DIR = ROOT / 'scripts'
 
 README_PATH = ROOT / 'README.md'
 
+DISABLED_PATH = ROOT / '.disabled'
+DISABLED_SESSIONS_DIR = ROOT / '.disabled-sessions'
+"""全局准入开关与被排除的会话；不放进 workspaces，避免出现在看板里。"""
+
 CONFIG_PATH = ROOT / 'config.toml'
 """**人类拥有**的策略文件。agent 只能从这里定义的菜单中选择，不能自由组合。
 
@@ -1608,6 +1612,47 @@ def touch_activity(ctx: Ctx) -> None:
 # 命令注册表 —— argparse 与 README 的**单一真相源**
 # ══════════════════════════════════════════════════════════════════════════
 
+def new_sessions_enabled() -> bool:
+    """只控制新会话准入；不缓存，让另一终端的切换立即生效。"""
+    return not DISABLED_PATH.exists()
+
+
+def session_is_disabled(ctx: Ctx) -> bool:
+    """禁用时首次遇到的新身份持续退出网络，enable 不追溯接入它。"""
+    enabled = new_sessions_enabled()
+    if not enabled and not any((os.environ.get(key) or '').strip() for key in (
+            'AGENTNET_ID', 'CLAUDE_CODE_SESSION_ID', 'CODEX_SESSION_ID',
+            'OPENCODE_SESSION_ID')) and not _fallback_id_path(ctx.slug).exists():
+        return True  # 没有稳定身份时不能为了拒绝准入反而创建兜底 workspace
+    key = hashlib.sha256(ctx.agent_id.encode('utf-8')).hexdigest()
+    excluded = DISABLED_SESSIONS_DIR / key
+    if excluded.exists():
+        return True
+    if enabled or ctx.info_path.is_file():
+        return False
+    # 老会话可能切换过 cwd，或已经归档；不能把它当成禁用期间的新会话。
+    if WORKSPACES_DIR.is_dir():
+        for directory in WORKSPACES_DIR.iterdir():
+            if not directory.is_dir():
+                continue
+            ws = Workspace(directory.name)
+            if ws.info_path_of(ctx.agent_id).is_file() or archived_copy(ws, ctx.agent_id):
+                return False
+    _atomic_write(excluded, 'disabled\n')
+    return True
+
+
+def report_disabled_session() -> None:
+    print('[SKIP] 本会话未接入 AgentNet。请由用户运行 `agentnet enable` 后新建会话；'
+          '已有会话和注册记录不受影响。')
+
+
+def require_new_sessions_enabled(action: str) -> None:
+    if not new_sessions_enabled():
+        _die(f'AgentNet 已禁用新会话接入，不能 {action}。'
+             '请由用户运行 `agentnet enable` 后重试。')
+
+
 class Command:
     def __init__(
             self,
@@ -1642,6 +1687,43 @@ def command(name: str, summary: str, usage: str, detail: str = '',
 # 命令实现
 # ══════════════════════════════════════════════════════════════════════════
 
+@command(
+    'enable',
+    '全局启用新会话接入（默认开启）',
+    'agentnet enable',
+    detail=('对共享同一 AGENTNET_ROOT 的所有 workspace 生效，无需重装或修改 Claude 设置。'
+            '只影响之后启动的新会话；禁用期间启动的会话仍不接入。'),
+)
+def cmd_enable(args: argparse.Namespace) -> None:
+    unlink_with_retry(DISABLED_PATH)
+    print('[OK] AgentNet enabled：之后的新会话将正常接入；禁用期间启动的会话保持不接入。')
+
+
+@command(
+    'disable',
+    '全局禁用新会话接入，保留已有会话与注册记录',
+    'agentnet disable',
+    detail=('持久化保存开关。新 Claude Code 会话的 SessionStart / Stop 钩子静默跳过，'
+            '不注入启动指引、不注册、不出现在 HTML 看板中。'
+            '已有注册会话的收信、心跳和记录不变；不会停止它们的进程或删除数据。'
+            '禁用时也拒绝新的 register / spawn / reset，以免绕过开关。'),
+)
+def cmd_disable(args: argparse.Namespace) -> None:
+    _atomic_write(DISABLED_PATH, 'disabled\n')
+    print('[OK] AgentNet disabled：新会话不再接入；已有会话、注册记录和轮询器保持不变。')
+
+
+@command(
+    'status',
+    '查看新会话接入的全局开关（不注册、不刷新心跳）',
+    'agentnet status',
+    detail='输出 enabled / disabled 与当前状态根目录；不同 AGENTNET_ROOT 的开关相互独立。',
+)
+def cmd_status(args: argparse.Namespace) -> None:
+    print('enabled' if new_sessions_enabled() else 'disabled')
+    print(f'root: {ROOT}')
+
+
 def _args_register(p: argparse.ArgumentParser) -> None:
     p.add_argument('--topics', help='逗号分隔的负责主题（可后续用 charter 更新）')
     p.add_argument('--name', help='显示名——**没有默认值**，不给就在花名册里显示为 `-`。'
@@ -1659,6 +1741,9 @@ def _args_register(p: argparse.ArgumentParser) -> None:
 )
 def cmd_register(args: argparse.Namespace) -> None:
     ctx = Ctx()
+    if session_is_disabled(ctx):
+        report_disabled_session()
+        return
     ensure_agent_home(ctx)
     first_time = not ctx.info_path.exists()
 
@@ -2200,7 +2285,28 @@ def render_readme() -> str:
         '投递靠唯一文件名；租约**懒过期**——由读者判定并原子抢占，'
         '不需要任何进程跑时钟。',
         '',
+        '## 一键启用 / 禁用',
+        '',
+        '```bash',
+        'agentnet disable   # 全局停止新会话接入，已有会话与注册记录不变',
+        'agentnet enable    # 恢复之后的新会话接入',
+        'agentnet status    # 查看 enabled / disabled 与状态根目录',
+        '```',
+        '',
+        '开关持久化在 `~/.agentnet`（或 `AGENTNET_ROOT`），对所有 workspace 生效。'
+        '默认开启，不需要重装或改写 Claude Code 设置。',
+        '禁用期间启动的新 Claude Code 会话不会收到 AgentNet 启动指引、不会自动注册，'
+        '也不会出现在 HTML 看板中。钩子仍会做一次本地开关检查，然后静默返回；'
+        '不会要求模型执行 register、drain、poll 或 watch。',
+        '已有注册会话继续正常收信和保活，登记、信件、锁、归档均保留。'
+        '禁用时新的手动注册、spawn 和 reset 也被拦截（reset 在终止旧实例前检查）；'
+        '既有会话重复 register 不受影响。',
+        '禁用期间启动的会话会保持不接入（包括 resume / compact / 后续 Stop）；'
+        '重新 enable 后请新建会话。独立的 `AGENTNET_ROOT` 有各自的开关。',
+        '',
         '## 你是一个 agent？照这个顺序做',
+        '',
+        '以下接入流程仅适用于已启用的会话；禁用会话不要自动执行这些准备工作。',
         '',
         '```bash',
         'agentnet register --topics "你负责的主题,逗号分隔"   # 幂等，重复调用无害',
@@ -2250,6 +2356,8 @@ def render_readme() -> str:
         '  README.md                    本文件（生成物）',
         '  scripts/agentnet.py          共享 CLI（零第三方依赖）',
         '  dashboard.html               单文件看板（只读）',
+        '  .disabled                    存在时禁止新会话接入',
+        '  .disabled-sessions/          禁用期间会话的排除标记（不进入看板）',
         '  workspaces/',
         '    <workspace_slug>/          按 cwd 分区',
         '      workspace.md',
@@ -6733,6 +6841,7 @@ def _args_spawn(p: argparse.ArgumentParser) -> None:
     add_args=_args_spawn,
 )
 def cmd_spawn(args: argparse.Namespace) -> None:
+    require_new_sessions_enabled('spawn')
     ctx = Ctx()
     if not ctx.info_path.exists():
         _die("你还没注册。先跑 `agentnet register`。")
@@ -6868,6 +6977,8 @@ def cmd_spawn(args: argparse.Namespace) -> None:
         print(f"  argv: {argv}")
         return
 
+    # 后端预检可能耗时；在写预约记录前重新检查，避免预检期间 disable 被绕过。
+    require_new_sessions_enabled('spawn')
     # 先落地"预约"记录与任务信，再启动——子实例一起来就能拿到自己的身份与任务
     home = ctx.agents_dir / new_id
     for sub in ('inbox', 'read', 'sent'):
@@ -7091,6 +7202,8 @@ def spawn_args(**overrides: Any) -> argparse.Namespace:
     add_args=_args_reset,
 )
 def cmd_reset(args: argparse.Namespace) -> None:
+    # reset 随后要 spawn 新身份，必须在终止既有实例之前检查准入。
+    require_new_sessions_enabled('reset')
     ctx = Ctx()
     target = resolve_single_target(ctx, args.target)
     if target == ctx.agent_id:
@@ -7474,6 +7587,42 @@ def cmd_hook(args: argparse.Namespace) -> None:
         except json.JSONDecodeError:
             payload = {}
 
+    if not isinstance(payload, dict):
+        payload = {}
+    if payload.get('agent_id') or payload.get('agent_type'):
+        return  # 子 agent 的 SessionStart 和 Stop 都不应操作父会话
+
+    # Claude Code 的钩子 payload 是 session_id 的可靠来源；不要求 shell 恰好导出它。
+    # AGENTNET_ID 仍优先（run 包装器用它把预注册身份传给子进程）。
+    previous_sid = os.environ.get('CLAUDE_CODE_SESSION_ID')
+    previous_id = os.environ.get('AGENTNET_ID')
+    sid = payload.get('session_id')
+    if isinstance(sid, str) and sid.strip():
+        os.environ['CLAUDE_CODE_SESSION_ID'] = sid.strip()
+        if not (previous_id or '').strip():
+            # 已知这是 Claude 钩子；其它 harness 的继承变量不能覆盖 payload 身份。
+            os.environ['AGENTNET_ID'] = sid.strip()
+    try:
+        ctx = Ctx()
+        if session_is_disabled(ctx):
+            return
+        touch_activity(ctx)
+        try:
+            _run_session_hook(args, payload, ctx)
+        finally:
+            refresh_dashboard_data()
+    finally:
+        if previous_sid is None:
+            os.environ.pop('CLAUDE_CODE_SESSION_ID', None)
+        else:
+            os.environ['CLAUDE_CODE_SESSION_ID'] = previous_sid
+        if previous_id is None:
+            os.environ.pop('AGENTNET_ID', None)
+        else:
+            os.environ['AGENTNET_ID'] = previous_id
+
+
+def _run_session_hook(args: argparse.Namespace, payload: dict[str, Any], ctx: Ctx) -> None:
     if args.event == 'stop':
         # `stop_hook_active` 是 harness 的循环护栏：它为真表示本轮回答本身就是被
         # Stop 钩子挡回去后续接出来的。此时**绝不能再 block**，否则两边互相续命。
@@ -7484,10 +7633,6 @@ def cmd_hook(args: argparse.Namespace) -> None:
                                      transcript=str(transcript) if transcript else None))
         return
 
-    if payload.get('agent_id') or payload.get('agent_type'):
-        return  # 子 agent 不是网络节点
-
-    ctx = Ctx()
     first_time = not ctx.info_path.exists()
     ensure_agent_home(ctx)
     updates: dict[str, Any] = {
@@ -9943,6 +10088,15 @@ def main() -> None:
         for item in (value if isinstance(value, list) else [value]):
             if isinstance(item, str):
                 guard_text(item, f"参数 --{name.replace('_', '-')}")
+
+    # 管理开关不能解析身份、更新登记或刷新看板。钩子在解析 payload 并检查准入之后
+    # 自己处理心跳与快照，避免禁用的新会话在这里产生副作用。
+    if args.cmd in ('enable', 'disable', 'status', 'hook'):
+        args._handler(args)
+        return
+    if args.cmd == 'register' and session_is_disabled(Ctx()):
+        report_disabled_session()
+        return
 
     # 任何一次 agentnet 调用本身就证明该 agent 活着 —— 顺手刷新心跳。
     # 未注册时静默跳过（不隐式入网）；register 随后会写自己的权威值。
