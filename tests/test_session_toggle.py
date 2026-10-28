@@ -73,8 +73,8 @@ class TestSessionToggle(unittest.TestCase):
         self.assertEqual(result.stdout, '')
         self.assertEqual(result.stderr, '')
 
-    def test_default_status_and_enable_are_read_only_without_identity(self) -> None:
-        self.assertEqual(self.cli('status').stdout.splitlines()[0], 'enabled')
+    def test_default_admission_and_enable_are_read_only_without_identity(self) -> None:
+        self.assertEqual(self.cli('admission').stdout.splitlines()[0], 'enabled')
         self.cli('enable')
         self.cli('enable')
         self.assertFalse(self.root.exists())
@@ -82,17 +82,17 @@ class TestSessionToggle(unittest.TestCase):
     def test_toggle_is_persistent_global_and_idempotent(self) -> None:
         self.cli('disable')
         self.cli('disable', cwd=self.other)
-        self.assertEqual(self.cli('status', cwd=self.other).stdout.splitlines()[0], 'disabled')
+        self.assertEqual(self.cli('admission', cwd=self.other).stdout.splitlines()[0], 'disabled')
         self.assertEqual(set(self.snapshot()), {'.disabled'})
         self.cli('enable', cwd=self.other)
         self.cli('enable')
-        self.assertEqual(self.cli('status').stdout.splitlines()[0], 'enabled')
+        self.assertEqual(self.cli('admission').stdout.splitlines()[0], 'enabled')
         self.assertEqual(self.snapshot(), {})
 
     def test_separate_state_roots_have_independent_toggles(self) -> None:
         self.cli('disable')
         another = self.base / 'separate-state'
-        result = self.cli('status', extra_env={'AGENTNET_ROOT': str(another)})
+        result = self.cli('admission', extra_env={'AGENTNET_ROOT': str(another)})
         self.assertEqual(result.stdout.splitlines()[0], 'enabled')
         self.assertFalse(another.exists())
 
@@ -102,13 +102,13 @@ class TestSessionToggle(unittest.TestCase):
         self.cli('lock', 'acquire', 'test-lock', sid=OLD)
         before = self.snapshot()
         self.cli('disable', sid=OLD)
-        self.cli('status', sid=OLD)
+        self.cli('admission', sid=OLD)
         self.cli('enable', sid=OLD)
         self.assertEqual(self.snapshot(), before)
 
     def test_management_does_not_resolve_conflicting_harness_identities(self) -> None:
         conflicting = {'CLAUDE_CODE_SESSION_ID': OLD, 'CODEX_SESSION_ID': NEW}
-        for command in ('disable', 'status', 'enable'):
+        for command in ('disable', 'admission', 'enable'):
             self.cli(command, extra_env=conflicting)
         self.assertEqual(self.snapshot(), {})
 
@@ -164,18 +164,32 @@ class TestSessionToggle(unittest.TestCase):
         self.assertTrue(self.info(LATER).exists())
         self.assertFalse(self.info(OLD).exists())
 
-    def test_disabled_sessions_stay_excluded_after_enable_and_across_workspaces(self) -> None:
+    def test_disabled_sessions_stay_excluded_after_enable_until_explicit_register(self) -> None:
         self.cli('disable')
         self.assert_silent(self.hook('session-start', NEW))
         self.cli('enable')
         for source in ('resume', 'compact', 'startup'):
             self.assert_silent(self.hook('session-start', NEW, source=source, cwd=self.other))
         self.assert_silent(self.hook('stop', NEW))
-        self.assertIn('[SKIP]', self.cli('register', sid=NEW, cwd=self.other).stdout)
         self.assertFalse(self.info(NEW).exists())
         self.assertFalse(self.info(NEW, self.other).exists())
         self.assertIn('additionalContext', self.hook('session-start', LATER).stdout)
         self.assertTrue(self.info(LATER).exists())
+        # 显式 register 是重新入网的入口：解除排除标记并注册，之后的钩子按普通会话处理。
+        self.assertIn('已解除排除', self.cli('register', sid=NEW, cwd=self.other).stdout)
+        self.assertTrue(self.info(NEW, self.other).exists())
+        self.assertEqual(list((self.root / '.disabled-sessions').iterdir()), [])
+        self.assertIn('additionalContext',
+                      self.hook('session-start', NEW, source='resume', cwd=self.other).stdout)
+
+    def test_register_while_still_disabled_does_not_readmit(self) -> None:
+        self.cli('disable')
+        self.assert_silent(self.hook('session-start', NEW))
+        result = self.cli('register', sid=NEW)
+        self.assertIn('[SKIP]', result.stdout)
+        self.assertIn('agentnet register', result.stdout)
+        self.assertFalse(self.info(NEW).exists())
+        self.assertEqual(len(list((self.root / '.disabled-sessions').iterdir())), 1)
 
     def test_stop_first_seen_while_disabled_also_excludes_session(self) -> None:
         self.cli('disable')
@@ -190,7 +204,8 @@ class TestSessionToggle(unittest.TestCase):
         self.assertIn('[SKIP]', result.stdout)
         self.assertFalse((self.root / 'workspaces').exists())
         self.cli('enable')
-        self.assertIn('[SKIP]', self.cli('register', sid=NEW).stdout)
+        self.assertIn('已解除排除', self.cli('register', sid=NEW).stdout)
+        self.assertTrue(self.info(NEW).exists())
 
     def test_disabled_manual_registration_without_identity_creates_no_workspace(self) -> None:
         self.cli('disable')
@@ -241,6 +256,36 @@ class TestSessionToggle(unittest.TestCase):
         for event in ('session-start', 'stop'):
             self.assert_silent(self.hook(event, OLD, agent_id='subagent', agent_type='Explore'))
         self.assertEqual(self.snapshot(), before)
+
+    def test_agent_flag_session_stop_still_delivers_letters(self) -> None:
+        # 用 --agent 启动的主会话：payload 只带 agent_type、没有 agent_id。
+        self.cli('register', sid=OLD)
+        self.cli('register', sid=LATER)
+        self.cli('send', '--to', LATER, '--subject', 'agent-flag', '--body',
+                 'letter for agent-flag session', '--no-reminder', sid=OLD)
+        output = self.hook('stop', LATER, agent_type='my-agent',
+                           extra_env={'AGENTNET_ONESHOT': '1'}).stdout
+        self.assertIn('letter for agent-flag session', output)
+        self.assertEqual(list((self.info(LATER).parent / 'inbox').glob('*.md')), [])
+
+    def test_agent_flag_session_start_is_still_not_auto_registered(self) -> None:
+        self.assert_silent(self.hook('session-start', NEW, agent_type='my-agent'))
+        self.assertFalse(self.info(NEW).exists())
+
+    def test_sweep_prunes_only_expired_exclusion_markers(self) -> None:
+        self.cli('register', sid=OLD)
+        self.cli('disable')
+        self.assert_silent(self.hook('session-start', NEW))
+        self.assert_silent(self.hook('session-start', LATER))
+        markers = self.root / '.disabled-sessions'
+        expired = markers / hashlib.sha256(NEW.encode('utf-8')).hexdigest()
+        fresh = markers / hashlib.sha256(LATER.encode('utf-8')).hexdigest()
+        self.assertTrue(expired.is_file() and fresh.is_file())
+        aged = time.time() - 15 * 86400   # 默认保留期 14 天
+        os.utime(expired, (aged, aged))
+        self.assertIn('排除标记', self.cli('sweep', sid=OLD).stdout)
+        self.assertFalse(expired.exists())
+        self.assertTrue(fresh.exists())
 
     def test_spawn_is_blocked_before_creating_child_or_launching_process(self) -> None:
         self.cli('register', sid=OLD)

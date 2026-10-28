@@ -1617,15 +1617,23 @@ def new_sessions_enabled() -> bool:
     return not DISABLED_PATH.exists()
 
 
+def exclusion_marker(agent_id: str) -> Path:
+    """禁用期间首次出现的会话留下的排除标记。文件名是 id 的哈希，从外面列不出是哪个会话。"""
+    return DISABLED_SESSIONS_DIR / hashlib.sha256(agent_id.encode('utf-8')).hexdigest()
+
+
 def session_is_disabled(ctx: Ctx) -> bool:
-    """禁用时首次遇到的新身份持续退出网络，enable 不追溯接入它。"""
+    """禁用时首次遇到的新身份被排除在网络之外。
+
+    重新 enable 后钩子（resume / compact / Stop）仍不接入它；要接入，须在该会话里显式
+    ``agentnet register``（见 :func:`readmit_session`）。
+    """
     enabled = new_sessions_enabled()
     if not enabled and not any((os.environ.get(key) or '').strip() for key in (
             'AGENTNET_ID', 'CLAUDE_CODE_SESSION_ID', 'CODEX_SESSION_ID',
             'OPENCODE_SESSION_ID')) and not _fallback_id_path(ctx.slug).exists():
         return True  # 没有稳定身份时不能为了拒绝准入反而创建兜底 workspace
-    key = hashlib.sha256(ctx.agent_id.encode('utf-8')).hexdigest()
-    excluded = DISABLED_SESSIONS_DIR / key
+    excluded = exclusion_marker(ctx.agent_id)
     if excluded.exists():
         return True
     if enabled or ctx.info_path.is_file():
@@ -1642,9 +1650,44 @@ def session_is_disabled(ctx: Ctx) -> bool:
     return True
 
 
+def readmit_session(ctx: Ctx) -> bool:
+    """开关开启时，显式 register 解除本会话的排除标记。返回是否解除了。
+
+    只由 register 调用：钩子不调用它，所以禁用期间启动的会话不会因为 resume / Stop
+    自己混进网络，只在有人在该会话里运行 ``agentnet register`` 时接入。
+    """
+    marker = exclusion_marker(ctx.agent_id)
+    if not marker.exists():
+        return False
+    unlink_with_retry(marker)
+    return True
+
+
+def prune_exclusion_markers(days: int, at: float | None = None) -> int:
+    """删除超过 ``days`` 天的排除标记，返回删除数；``days <= 0`` 时不做。
+
+    标记只在禁用期间产生，此后除了显式 register 之外没有别的出口，不清理就只增不减。
+    保留期与归档共用 ``archive_retention_days``。标记被清掉的会话之后若 resume，
+    按普通会话处理：开关开启即接入，仍禁用则重新写入标记。
+    """
+    if days <= 0 or not DISABLED_SESSIONS_DIR.is_dir():
+        return 0
+    now_s = at if at is not None else time.time()
+    pruned = 0
+    for entry in os.scandir(DISABLED_SESSIONS_DIR):
+        try:
+            if not entry.is_file() or now_s - entry.stat().st_mtime <= days * 86400.0:
+                continue
+            unlink_with_retry(Path(entry.path))
+            pruned += 1
+        except OSError:
+            continue                      # 读不到年龄或删不掉 ⇒ 留着，⛔ 不中断其余
+    return pruned
+
+
 def report_disabled_session() -> None:
-    print('[SKIP] 本会话未接入 AgentNet。请由用户运行 `agentnet enable` 后新建会话；'
-          '已有会话和注册记录不受影响。')
+    print('[SKIP] AgentNet 已禁用新会话接入，本会话未接入。由用户运行 `agentnet enable` 后，'
+          '在本会话运行 `agentnet register` 即可接入；已有会话和注册记录不受影响。')
 
 
 def require_new_sessions_enabled(action: str) -> None:
@@ -1692,11 +1735,13 @@ def command(name: str, summary: str, usage: str, detail: str = '',
     '全局启用新会话接入（默认开启）',
     'agentnet enable',
     detail=('对共享同一 AGENTNET_ROOT 的所有 workspace 生效，无需重装或修改 Claude 设置。'
-            '只影响之后启动的新会话；禁用期间启动的会话仍不接入。'),
+            '之后启动的新会话自动接入；禁用期间启动的会话不会被钩子自动接入，'
+            '在该会话里运行 `agentnet register` 即重新入网。'),
 )
 def cmd_enable(args: argparse.Namespace) -> None:
     unlink_with_retry(DISABLED_PATH)
-    print('[OK] AgentNet enabled：之后的新会话将正常接入；禁用期间启动的会话保持不接入。')
+    print('[OK] AgentNet enabled：之后的新会话将正常接入；'
+          '禁用期间启动的会话需在该会话里运行 `agentnet register` 重新入网。')
 
 
 @command(
@@ -1714,12 +1759,12 @@ def cmd_disable(args: argparse.Namespace) -> None:
 
 
 @command(
-    'status',
-    '查看新会话接入的全局开关（不注册、不刷新心跳）',
-    'agentnet status',
+    'admission',
+    '查看新会话准入的全局开关（不注册、不刷新心跳）',
+    'agentnet admission',
     detail='输出 enabled / disabled 与当前状态根目录；不同 AGENTNET_ROOT 的开关相互独立。',
 )
-def cmd_status(args: argparse.Namespace) -> None:
+def cmd_admission(args: argparse.Namespace) -> None:
     print('enabled' if new_sessions_enabled() else 'disabled')
     print(f'root: {ROOT}')
 
@@ -1740,10 +1785,8 @@ def _args_register(p: argparse.ArgumentParser) -> None:
     add_args=_args_register,
 )
 def cmd_register(args: argparse.Namespace) -> None:
+    # 准入检查与重新入网在 main() 里、刷新心跳之前做，这里不再重复。
     ctx = Ctx()
-    if session_is_disabled(ctx):
-        report_disabled_session()
-        return
     ensure_agent_home(ctx)
     first_time = not ctx.info_path.exists()
 
@@ -2290,7 +2333,7 @@ def render_readme() -> str:
         '```bash',
         'agentnet disable   # 全局停止新会话接入，已有会话与注册记录不变',
         'agentnet enable    # 恢复之后的新会话接入',
-        'agentnet status    # 查看 enabled / disabled 与状态根目录',
+        'agentnet admission # 查看 enabled / disabled 与状态根目录',
         '```',
         '',
         '开关持久化在 `~/.agentnet`（或 `AGENTNET_ROOT`），对所有 workspace 生效。'
@@ -2300,13 +2343,16 @@ def render_readme() -> str:
         '不会要求模型执行 register、drain、poll 或 watch。',
         '已有注册会话继续正常收信和保活，登记、信件、锁、归档均保留。'
         '禁用时新的手动注册、spawn 和 reset 也被拦截（reset 在终止旧实例前检查）；'
-        '既有会话重复 register 不受影响。',
-        '禁用期间启动的会话会保持不接入（包括 resume / compact / 后续 Stop）；'
-        '重新 enable 后请新建会话。独立的 `AGENTNET_ROOT` 有各自的开关。',
+        '既有会话重复 register 不受影响。'
+        '`agentnet run` 在禁用时照常启动被包装的程序，但它注册时得到 `[SKIP]`，不接入网络。',
+        '重新 enable 后，禁用期间启动的会话不会被钩子自动接入（resume / compact / Stop 均不接入）；'
+        '在该会话里运行 `agentnet register` 即重新入网。'
+        '超过 `archive_retention_days` 的排除标记由 `sweep` 清理。'
+        '独立的 `AGENTNET_ROOT` 有各自的开关。',
         '',
         '## 你是一个 agent？照这个顺序做',
         '',
-        '以下接入流程仅适用于已启用的会话；禁用会话不要自动执行这些准备工作。',
+        '禁用期间 `register` 会输出 `[SKIP]`：看到它就说明本会话未接入，跳过下面其余步骤。',
         '',
         '```bash',
         'agentnet register --topics "你负责的主题,逗号分隔"   # 幂等，重复调用无害',
@@ -7589,8 +7635,12 @@ def cmd_hook(args: argparse.Namespace) -> None:
 
     if not isinstance(payload, dict):
         payload = {}
-    if payload.get('agent_id') or payload.get('agent_type'):
-        return  # 子 agent 的 SessionStart 和 Stop 都不应操作父会话
+    if payload.get('agent_id'):
+        return  # 子 agent / 队友的钩子：SessionStart 和 Stop 都不应操作父会话
+    # 只带 agent_type、没有 agent_id 的是用 `--agent` 启动的主会话（见 Claude Code 钩子文档）。
+    # SessionStart 维持原行为不自动接入；Stop 照常投递——它若已手动注册，就靠这里每回合收信。
+    if args.event == 'session-start' and payload.get('agent_type'):
+        return
 
     # Claude Code 的钩子 payload 是 session_id 的可靠来源；不要求 shell 恰好导出它。
     # AGENTNET_ID 仍优先（run 包装器用它把预注册身份传给子进程）。
@@ -8284,6 +8334,9 @@ def cmd_sweep(args: argparse.Namespace) -> None:
     if pruned and not args.quiet:
         print(f"[OK] 归档保留期 {retention} 天：已清理 **{pruned}** 个过期归档"
               f"（剩 {kept} 个）。⚠ 被清掉的**不能再 `restore`**。")
+    markers = prune_exclusion_markers(retention)
+    if markers and not args.quiet:
+        print(f"[OK] 已清理 {markers} 个超过 {retention} 天的会话排除标记。")
     if not victims:
         if not args.quiet:
             print(f"[OK] 无需归档——没有静默超过 {threshold // 60} 分钟的实例。")
@@ -10091,12 +10144,19 @@ def main() -> None:
 
     # 管理开关不能解析身份、更新登记或刷新看板。钩子在解析 payload 并检查准入之后
     # 自己处理心跳与快照，避免禁用的新会话在这里产生副作用。
-    if args.cmd in ('enable', 'disable', 'status', 'hook'):
+    if args.cmd in ('enable', 'disable', 'admission', 'hook'):
         args._handler(args)
         return
-    if args.cmd == 'register' and session_is_disabled(Ctx()):
-        report_disabled_session()
-        return
+    # register 的准入只在这里判（必须在刷新心跳之前，否则禁用的新会话会落下兜底身份）。
+    # 开关开启时，显式 register 同时是禁用期间启动的会话重新入网的唯一入口。
+    if args.cmd == 'register':
+        register_ctx = Ctx()
+        if new_sessions_enabled():
+            if readmit_session(register_ctx):
+                print('[OK] 本会话启动于禁用期间，已解除排除，按正常流程注册。')
+        elif session_is_disabled(register_ctx):
+            report_disabled_session()
+            return
 
     # 任何一次 agentnet 调用本身就证明该 agent 活着 —— 顺手刷新心跳。
     # 未注册时静默跳过（不隐式入网）；register 随后会写自己的权威值。
