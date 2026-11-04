@@ -6917,6 +6917,44 @@ def spawn_cwd_problem(raw: str, workspace_cwd: str) -> tuple[str, str | None]:
     return resolved, None
 
 
+def claude_global_config_path(role_env: Mapping[str, str]) -> Path:
+    """Claude Code 的全局配置文件（项目信任记录所在）。尊重 ``CLAUDE_CONFIG_DIR``。"""
+    base = role_env.get('CLAUDE_CONFIG_DIR') or os.environ.get('CLAUDE_CONFIG_DIR')
+    return (Path(base) if base else Path.home()) / '.claude.json'
+
+
+def claude_trust_problem(directory: str, config_path: Path) -> str | None:
+    """**只读**检查：Claude Code 是否已信任 ``directory`` 所在的 git 根。已信任返回 ``None``。
+
+    为什么要查：Claude Code 只在**当前 git 根**（worktree 就是 worktree 自己）上找信任记录，
+    不继承主树的信任 ⇒ 每棵新 worktree 第一次启动都会弹「是否信任此文件夹」，
+    而被拉起的实例没有人去按键 ⇒ 卡在启动前：钩子不触发、永不登记（``pid = 0``）、
+    任务信无人领取，且没有任何报错。⇒ 拉起之前就拦下来，把处理办法说清楚。
+
+    ⛔ 本函数不写配置：替用户接受信任是用户的决定。
+    """
+    proc = subprocess.run(['git', '-C', directory, 'rev-parse', '--show-toplevel'],
+                          capture_output=True, text=True, check=False, timeout=15)
+    root = proc.stdout.strip()
+    if proc.returncode != 0 or not root:
+        return f"取不到 {directory} 的 git 根，无法确认 Claude Code 是否信任它：{proc.stderr.strip()}"
+    key = root.replace('\\', '/')
+    try:
+        projects = json.loads(config_path.read_text(encoding='utf-8')).get('projects') or {}
+    except (OSError, ValueError) as exc:
+        return f"读不了 Claude Code 配置 {config_path}，无法确认是否信任 {key}：{exc}"
+    for name, entry in projects.items():
+        if (os.path.normcase(str(name).replace('\\', '/')) == os.path.normcase(key)
+                and isinstance(entry, dict) and entry.get('hasTrustDialogAccepted') is True):
+            return None
+    return (f"Claude Code 还没有信任 {key}。\n"
+            f"  ⇒ 现在拉起，新实例会停在「是否信任此文件夹」对话框：不登记、不领任务、也不报错。\n"
+            f"  处理办法（任选其一，由人来做）：\n"
+            f"  ① 在该目录交互式运行一次 claude，接受信任对话框后退出；\n"
+            f"  ② 在 {config_path} 里设 projects[\"{key}\"].hasTrustDialogAccepted = true。\n"
+            f"  信任按路径记录：固定复用几个评审树路径，每个只需处理一次。")
+
+
 def _args_spawn(p: argparse.ArgumentParser) -> None:
     p.add_argument('--task-file', help='任务简报 .md，将作为 errand 信投进新实例的收件箱')
     p.add_argument('--task', help='任务简报（短文本）')
@@ -6960,7 +6998,9 @@ def _args_spawn(p: argparse.ArgumentParser) -> None:
             '仍登记在发起方的 workspace：拉起时经 `run --workspace-cwd` 设置 '
             f'`{WORKSPACE_CWD_ENV}`，子实例的钩子与它跑的 agentnet 都按它解析 workspace。'
             '用途是让 reviewer 在评审树里启动，只加载评审树那一份项目规范。'
-            '`reset` 会按配方里记下的目录重生。\n'
+            '`reset` 会按配方里记下的目录重生。'
+            'Claude Code 只认当前 git 根上的信任记录（worktree 不继承主树）⇒ '
+            '目标目录未被信任时拒绝拉起并说明处理办法，否则新实例会静默卡在信任对话框。\n'
             '**任务信默认给拉起方建 1h 一次性回执提醒**（与 `send` 同规则）：它任何一封'
             '回信即销账，否则 1h 后提醒你——实例活着但卡死时不会无声等待。'
             '`--no-reminder` 关闭。\n'
@@ -7012,6 +7052,13 @@ def cmd_spawn(args: argparse.Namespace) -> None:
     launcher_name = Path(launcher_parts[0]).stem.lower()
 
     role_env = Config.role_env(role_name)
+    if args.cwd and role.get('claude_compatible'):
+        # 新目录未被 Claude Code 信任 ⇒ 实例会静默卡在信任对话框（见 claude_trust_problem）。
+        trust_problem = claude_trust_problem(launch_cwd, claude_global_config_path(role_env))
+        if trust_problem and args.dry_run:
+            print(f"[warn] {trust_problem}")
+        elif trust_problem:
+            _die(trust_problem)
     health = Config.role_healthcheck(role_name)
     if health and args.skip_healthcheck:
         print(f"[warn] 已跳过后端预检（--skip-healthcheck）。"

@@ -345,7 +345,7 @@ agentnet spawn (--task-file t.md | --task "...") [--role <角色名>] [--mode ta
 **不用 `wt -w 0`**：`0` 是"最近使用的窗口"，会跟着用户焦点跑（实测子实例开进了用户当时正看的窗口）。而窗格在 shell 层无法得知自己属于哪个窗口——WT 只给`WT_SESSION`/`WT_PROFILE_ID`，`WT_WINDOWID` 至今是未实现的功能请求。
 要"父子同窗"：把你自己的窗口重命名为 `agentnet-<workspace>`（命令面板 → Rename Window）。
 子实例继承发起方 cwd（`-d`）⇒ 自动落在同一 workspace。
-`--cwd <目录>` 让子实例在同一 git 仓库的另一个目录（如某棵 worktree）里启动，仍登记在发起方的 workspace：拉起时经 `run --workspace-cwd` 设置 `AGENTNET_WORKSPACE_CWD`，子实例的钩子与它跑的 agentnet 都按它解析 workspace。用途是让 reviewer 在评审树里启动，只加载评审树那一份项目规范。`reset` 会按配方里记下的目录重生。
+`--cwd <目录>` 让子实例在同一 git 仓库的另一个目录（如某棵 worktree）里启动，仍登记在发起方的 workspace：拉起时经 `run --workspace-cwd` 设置 `AGENTNET_WORKSPACE_CWD`，子实例的钩子与它跑的 agentnet 都按它解析 workspace。用途是让 reviewer 在评审树里启动，只加载评审树那一份项目规范。`reset` 会按配方里记下的目录重生。Claude Code 只认当前 git 根上的信任记录（worktree 不继承主树）⇒ 目标目录未被信任时拒绝拉起并说明处理办法，否则新实例会静默卡在信任对话框。
 **任务信默认给拉起方建 1h 一次性回执提醒**（与 `send` 同规则）：它任何一封回信即销账，否则 1h 后提醒你——实例活着但卡死时不会无声等待。`--no-reminder` 关闭。
 **从 Python Popen(list) 拉起，不经 shell**：文档明载从 PowerShell 拉 wt 会阻塞到新窗口关闭、且 `;` 需转义，走 Popen 两个坑都不成立。
 

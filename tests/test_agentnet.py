@@ -2296,6 +2296,63 @@ class TestSpawnCwd(Base):
         os.environ.pop(an.WORKSPACE_CWD_ENV, None)
         self.addCleanup(os.environ.pop, an.WORKSPACE_CWD_ENV, None)
         self.register()
+        # 假的 Claude Code 全局配置：默认已信任评审树（个别用例改成未信任）。⛔ 别读写真实那份。
+        import subprocess
+        from unittest import mock
+        self.wt_key = subprocess.run(['git', '-C', str(self.wt), 'rev-parse', '--show-toplevel'],
+                                     capture_output=True, text=True, check=True).stdout.strip()
+        self.claude_config = self.tmp / 'claude.json'
+        self.trust(True)
+        patcher = mock.patch.object(an, 'claude_global_config_path', lambda role_env: self.claude_config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def trust(self, accepted: bool, key: str | None = None) -> None:
+        projects = {key or self.wt_key: {'hasTrustDialogAccepted': accepted}}
+        self.claude_config.write_text(json.dumps({'projects': projects}), encoding='utf-8')
+
+    def real_spawn(self) -> list[dict[str, object]]:
+        """真走一遍 spawn，只截住拉起子实例那一次 Popen；校验用的 git 调用照常执行。"""
+        import contextlib
+        import io
+        from unittest import mock
+        calls: list[dict[str, object]] = []
+        real_popen = an.subprocess.Popen
+
+        def fake_popen(argv: list[str], **kw: object) -> object:
+            if len(argv) > 2 and argv[2] == 'run':
+                calls.append({'argv': argv, **kw})
+                return None
+            return real_popen(argv, **kw)
+
+        with mock.patch.object(an.subprocess, 'Popen', fake_popen), \
+                contextlib.redirect_stdout(io.StringIO()):
+            an.cmd_spawn(an.spawn_args(task='t', mode='background', cwd=str(self.wt),
+                                       no_reminder=True, skip_healthcheck=True))
+        return calls
+
+    def test_untrusted_worktree_refused_before_launch(self) -> None:
+        """未被 Claude Code 信任的目录：实例会静默卡在信任对话框 ⇒ 必须在拉起前拦下。"""
+        self.trust(False)
+        with self.assertRaises(SystemExit):
+            self.real_spawn()
+        self.assertEqual(list(an.Ctx().agents_dir.glob('*/inbox/*.md')), [], '拦下时不该已经投出任务信')
+
+    def test_trust_lookup_ignores_case_and_slashes(self) -> None:
+        self.trust(True, key=self.wt_key.upper().replace('/', '\\'))
+        self.assertEqual(len(self.real_spawn()), 1)
+
+    def test_dry_run_only_warns_about_trust(self) -> None:
+        self.trust(False)
+        self.assertIn('还没有信任', self.dry_run(cwd=str(self.wt)))
+
+    def test_trust_check_never_writes_the_config(self) -> None:
+        """⛔ 替用户接受信任是用户的决定：预检只读。"""
+        self.trust(False)
+        before = self.claude_config.read_bytes()
+        with self.assertRaises(SystemExit):
+            self.real_spawn()
+        self.assertEqual(self.claude_config.read_bytes(), before)
 
     def dry_run(self, **overrides: object) -> str:
         import contextlib
@@ -2334,23 +2391,7 @@ class TestSpawnCwd(Base):
         self.assertIn(f"'-d', {str(self.wt)!r}", out)
 
     def test_real_spawn_starts_the_process_in_the_worktree(self) -> None:
-        from unittest import mock
-        calls: list[dict[str, object]] = []
-        real_popen = an.subprocess.Popen
-
-        def fake_popen(argv: list[str], **kw: object) -> object:
-            # 只截住拉起子实例那一次；校验 --cwd 时的 git 调用照常执行
-            if len(argv) > 2 and argv[2] == 'run':
-                calls.append({'argv': argv, **kw})
-                return None
-            return real_popen(argv, **kw)
-
-        with mock.patch.object(an.subprocess, 'Popen', fake_popen):
-            import contextlib
-            import io
-            with contextlib.redirect_stdout(io.StringIO()):
-                an.cmd_spawn(an.spawn_args(task='t', mode='background', cwd=str(self.wt),
-                                           no_reminder=True, skip_healthcheck=True))
+        calls = self.real_spawn()
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]['cwd'], str(self.wt))
         self.assertIn('--workspace-cwd', calls[0]['argv'])
