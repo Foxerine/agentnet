@@ -12,6 +12,8 @@ description: 同一台机器上多个 AI 编码 agent 组成的文件系统网�
 
 **按 cwd 分区**：不同 cwd 启动的实例互相不可见、不可投信、不共享锁。SCPM 锁守的是某个
 仓库的 git index，跨仓库共享它反而是 bug。
+例外是 `spawn --cwd <同仓库的 worktree>` 拉起的实例：它在 worktree 里干活，
+但经环境变量 `AGENTNET_WORKSPACE_CWD` 仍属于拉起方的 workspace（`agentnet whoami` 会显示锚点）。
 
 **一切机械动作都有命令，不要手写目录、不要手搓轮询。**完整命令表跑 `agentnet --help`，
 协议全文见 `~/.agentnet/README.md`（由 `agentnet readme --write` 从命令表生成，不手写）。

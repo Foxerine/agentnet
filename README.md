@@ -335,7 +335,7 @@ agentnet log "在做什么" [--plan <计划文件路径>] [--pivot]
 拉起一个新 agent（默认开在本 workspace 的约定窗口）并转交任务
 
 ```
-agentnet spawn (--task-file t.md | --task "...") [--role <角色名>] [--mode tab|window|pane|named|background] [--window shared|current|<名字>] [--topics a,b] [--name x] [--no-reminder] [--dry-run]
+agentnet spawn (--task-file t.md | --task "...") [--role <角色名>] [--mode tab|window|pane|named|background] [--window shared|current|<名字>] [--topics a,b] [--name x] [--cwd <同仓库目录>] [--no-reminder] [--dry-run]
 ```
 
 **先跑 `agentnet roles` 看菜单。**
@@ -345,6 +345,7 @@ agentnet spawn (--task-file t.md | --task "...") [--role <角色名>] [--mode ta
 **不用 `wt -w 0`**：`0` 是"最近使用的窗口"，会跟着用户焦点跑（实测子实例开进了用户当时正看的窗口）。而窗格在 shell 层无法得知自己属于哪个窗口——WT 只给`WT_SESSION`/`WT_PROFILE_ID`，`WT_WINDOWID` 至今是未实现的功能请求。
 要"父子同窗"：把你自己的窗口重命名为 `agentnet-<workspace>`（命令面板 → Rename Window）。
 子实例继承发起方 cwd（`-d`）⇒ 自动落在同一 workspace。
+`--cwd <目录>` 让子实例在同一 git 仓库的另一个目录（如某棵 worktree）里启动，仍登记在发起方的 workspace：拉起时经 `run --workspace-cwd` 设置 `AGENTNET_WORKSPACE_CWD`，子实例的钩子与它跑的 agentnet 都按它解析 workspace。用途是让 reviewer 在评审树里启动，只加载评审树那一份项目规范。`reset` 会按配方里记下的目录重生。
 **任务信默认给拉起方建 1h 一次性回执提醒**（与 `send` 同规则）：它任何一封回信即销账，否则 1h 后提醒你——实例活着但卡死时不会无声等待。`--no-reminder` 关闭。
 **从 Python Popen(list) 拉起，不经 shell**：文档明载从 PowerShell 拉 wt 会阻塞到新窗口关闭、且 `;` 需转义，走 Popen 两个坑都不成立。
 
@@ -373,7 +374,7 @@ agentnet reset <id前缀> [--task-file t.md | --task "..."]
 通用包装器：为任意 agent CLI 注入身份并托管其生命周期
 
 ```
-agentnet run [--id <uuid>] [--topics a,b] -- <任意 agent 命令>
+agentnet run [--id <uuid>] [--topics a,b] [--workspace-cwd <目录>] -- <任意 agent 命令>
 ```
 
 给**没有启动钩子**的 harness 用（Codex / OpenCode / 任何 CLI）：在自己进程里设好 AGENTNET_ID 再起子命令，子进程于是继承到确定的身份。零钩子依赖，是 agent 无关性的兜底路径。

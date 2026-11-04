@@ -947,13 +947,35 @@ def write_doc(
 
 _SLUG_UNSAFE = re.compile(r'[^A-Za-z0-9._-]+')
 
+WORKSPACE_CWD_ENV = 'AGENTNET_WORKSPACE_CWD'
+"""让**在别的目录启动**的进程仍落在指定目录派生的 workspace。
+
+由 ``spawn --cwd`` 经 ``run --workspace-cwd`` 写进子实例环境。子实例的钩子、
+它 Bash 里跑的 ``agentnet`` 都继承这个变量 ⇒ 全部落在拉起方的 workspace，
+而子实例本身的工作目录可以是同一仓库的另一棵 worktree。
+
+用途：让 reviewer 直接在评审树里启动（harness 只加载评审树那一份项目规范），
+同时仍能与拉起方互相投信。
+
+⛔ 不要把它当成「worktree 自动归主仓」的全局规则：未设置时 workspace 仍按 cwd 派生，
+既有的、按 worktree 路径建立的 workspace 不受影响。
+"""
+
+
+def workspace_anchor() -> Path:
+    """派生 workspace 所用的目录：设置了 :data:`WORKSPACE_CWD_ENV` 就用它，否则用当前 cwd。"""
+    override = os.environ.get(WORKSPACE_CWD_ENV, '')
+    return Path(override) if override else Path.cwd()
+
 
 def workspace_slug(cwd: Path | None = None) -> str:
-    """由**规范化绝对 cwd** 派生 workspace 标识：``<目录名>-<sha1[:8]>``。
+    """由**规范化绝对目录**派生 workspace 标识：``<目录名>-<sha1[:8]>``。
 
-    不同 cwd 启动的实例落在不同 workspace，彼此不可见、不可投信、不共享锁。
+    不同目录启动的实例落在不同 workspace，彼此不可见、不可投信、不共享锁。
+    省略 ``cwd`` 时取 :func:`workspace_anchor`（通常就是当前 cwd，
+    被 ``spawn --cwd`` 拉起的实例则是拉起方的目录）。
     """
-    resolved = (cwd or Path.cwd()).resolve()
+    resolved = (cwd or workspace_anchor()).resolve()
     key = os.path.normcase(str(resolved))
     digest = hashlib.sha1(key.encode('utf-8')).hexdigest()[:8]
     name = _SLUG_UNSAFE.sub('-', resolved.name).strip('-') or 'root'
@@ -1111,13 +1133,19 @@ class Workspace:
 
 
 class Ctx(Workspace):
-    """本次调用者自身的上下文：身份 + 所在 workspace（由当前 cwd 派生）。"""
+    """本次调用者自身的上下文：身份 + 所在 workspace（由 :func:`workspace_anchor` 派生）。
+
+    ``cwd`` 是进程**实际**的工作目录；``workspace_cwd`` 是派生 workspace 的那个目录。
+    两者只在被 ``spawn --cwd`` 拉起的实例里不同。
+    """
 
     def __init__(self) -> None:
-        super().__init__(workspace_slug())
+        anchor = workspace_anchor().resolve()
+        super().__init__(workspace_slug(anchor))
         self.kind: str = resolve_kind()
         self.pid: int = resolve_pid()
         self.cwd: str = str(Path.cwd().resolve())
+        self.workspace_cwd: str = str(anchor)
         self._agent_id: str | None = None
 
     @property
@@ -1842,10 +1870,10 @@ def _ensure_workspace_doc(ctx: Ctx) -> None:
     path = ctx.dir / 'workspace.md'
     if path.exists():
         return
-    meta = {'slug': ctx.slug, 'cwd': ctx.cwd, 'created_at': now()}
+    meta = {'slug': ctx.slug, 'cwd': ctx.workspace_cwd, 'created_at': now()}
     body = (f"# Workspace `{ctx.slug}`\n\n"
             f"按 cwd 隔离的 agent 网络分区。成员只与同 workspace 的成员通信。\n\n"
-            f"- cwd: `{ctx.cwd}`\n")
+            f"- cwd: `{ctx.workspace_cwd}`\n")
     write_doc(path, meta, body, ('slug', 'cwd', 'created_at'))
 
 
@@ -1908,6 +1936,8 @@ def cmd_whoami(args: argparse.Namespace) -> None:
     print(f"kind       : {ctx.kind}   (harness={resolve_harness() or '-'})")
     print(f"agent pid  : {ctx.pid}   (存活={pid_alive(ctx.pid)})")
     print(f"cwd        : {ctx.cwd}")
+    if os.path.normcase(ctx.workspace_cwd) != os.path.normcase(ctx.cwd):
+        print(f"ws 锚点    : {ctx.workspace_cwd}   （来自 {WORKSPACE_CWD_ENV}，由 spawn --cwd 设置）")
     print(f"root       : {ROOT}")
     if not ctx.info_path.exists():
         print("registered : 否 —— 跑 `agentnet register` 加入网络")
@@ -6843,6 +6873,50 @@ def build_launch(
     return argv, effective, target, notes
 
 
+def _git_common_dir(path: Path) -> str | None:
+    """``path`` 所在 git 仓库的 common dir（规范化后），不在仓库里或没有 git 时返回 ``None``。
+
+    同一仓库的主树与各 worktree 返回同一个值，因此可以用来判断「是不是同一个仓库」。
+    """
+    try:
+        proc = subprocess.run(
+            ['git', '-C', str(path), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+            capture_output=True, text=True, check=False, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = proc.stdout.strip()
+    if proc.returncode != 0 or not out:
+        return None
+    return os.path.normcase(str(Path(out).resolve()))
+
+
+def spawn_cwd_problem(raw: str, workspace_cwd: str) -> tuple[str, str | None]:
+    """校验 ``spawn --cwd``。返回 (规范化后的目录, 问题说明)；问题为 ``None`` 表示可用。
+
+    规则：目录必须存在，且与 ``workspace_cwd`` 属于**同一个 git 仓库**（主树或它的 worktree）。
+    子实例会登记进 ``workspace_cwd`` 派生的 workspace；不同仓库的目录放进同一个 workspace，
+    同伴就无法从 workspace 推断对方在改什么，所以直接拒绝。
+
+    单独成函数是为了让 ``reset`` 在终止旧实例**之前**用同一条规则校验配方里的目录。
+    """
+    target = Path(raw).expanduser()
+    if not target.is_absolute():
+        target = Path.cwd() / target
+    resolved = str(target.resolve())
+    if not Path(resolved).is_dir():
+        return resolved, f"--cwd 不是一个存在的目录：{resolved}"
+    mine = _git_common_dir(Path(workspace_cwd))
+    if mine is None:
+        return resolved, (f"--cwd 只允许发起方所在 git 仓库内的目录，"
+                          f"而发起方的 workspace 目录不在 git 仓库里：{workspace_cwd}")
+    theirs = _git_common_dir(Path(resolved))
+    if theirs != mine:
+        return resolved, (f"--cwd 必须与发起方同属一个 git 仓库（主树或它的 worktree）。\n"
+                          f"  发起方：{workspace_cwd}（git common dir {mine}）\n"
+                          f"  --cwd ：{resolved}（git common dir {theirs or '不在仓库里'}）")
+    return resolved, None
+
+
 def _args_spawn(p: argparse.ArgumentParser) -> None:
     p.add_argument('--task-file', help='任务简报 .md，将作为 errand 信投进新实例的收件箱')
     p.add_argument('--task', help='任务简报（短文本）')
@@ -6853,6 +6927,9 @@ def _args_spawn(p: argparse.ArgumentParser) -> None:
     p.add_argument('--role', help='角色名，须出现在策略配置的 [roles.*] 菜单里（默认取 [spawn].default_role）')
     p.add_argument('--topics', help='为新实例预设的负责主题')
     p.add_argument('--name', help='显示名 / 分页标题')
+    p.add_argument('--cwd',
+                   help='新实例的工作目录（默认继承你的 cwd）。须与你同属一个 git 仓库，'
+                        '例如该仓库的某棵 worktree；新实例仍登记在你的 workspace')
     p.add_argument('--dry-run', action='store_true', help='只打印将要执行的命令，不真启动')
     p.add_argument('--no-reminder', action='store_true',
                    help='不为本次任务交接创建回执提醒（默认建：1h 未收到它回信会提醒你）')
@@ -6866,7 +6943,7 @@ def _args_spawn(p: argparse.ArgumentParser) -> None:
     '拉起一个新 agent（默认开在本 workspace 的约定窗口）并转交任务',
     'agentnet spawn (--task-file t.md | --task "...") [--role <角色名>] '
     '[--mode tab|window|pane|named|background] [--window shared|current|<名字>] '
-    '[--topics a,b] [--name x] [--no-reminder] [--dry-run]',
+    '[--topics a,b] [--name x] [--cwd <同仓库目录>] [--no-reminder] [--dry-run]',
     detail=('**先跑 `agentnet roles` 看菜单。**\n'
             '**角色、启动命令、权限模式都来自人类维护的策略配置**，agent 只能报一个角色名——'
             '它无法自由组合"用什么命令拉起 + 给多大权限"，因此不存在权限棘轮'
@@ -6879,6 +6956,11 @@ def _args_spawn(p: argparse.ArgumentParser) -> None:
             '`WT_SESSION`/`WT_PROFILE_ID`，`WT_WINDOWID` 至今是未实现的功能请求。\n'
             '要"父子同窗"：把你自己的窗口重命名为 `agentnet-<workspace>`（命令面板 → Rename Window）。\n'
             '子实例继承发起方 cwd（`-d`）⇒ 自动落在同一 workspace。\n'
+            '`--cwd <目录>` 让子实例在同一 git 仓库的另一个目录（如某棵 worktree）里启动，'
+            '仍登记在发起方的 workspace：拉起时经 `run --workspace-cwd` 设置 '
+            f'`{WORKSPACE_CWD_ENV}`，子实例的钩子与它跑的 agentnet 都按它解析 workspace。'
+            '用途是让 reviewer 在评审树里启动，只加载评审树那一份项目规范。'
+            '`reset` 会按配方里记下的目录重生。\n'
             '**任务信默认给拉起方建 1h 一次性回执提醒**（与 `send` 同规则）：它任何一封'
             '回信即销账，否则 1h 后提醒你——实例活着但卡死时不会无声等待。'
             '`--no-reminder` 关闭。\n'
@@ -6904,6 +6986,17 @@ def cmd_spawn(args: argparse.Namespace) -> None:
     new_id = str(uuid.uuid4())
     name = args.name or f"agent-{new_id[:8]}"
     topics = _split_topics(args.topics) if args.topics else []
+
+    # 子实例在哪个目录启动。省略 --cwd 时与此前一致：继承发起方的实际 cwd。
+    launch_cwd = ctx.cwd
+    if args.cwd:
+        launch_cwd, problem = spawn_cwd_problem(args.cwd, ctx.workspace_cwd)
+        if problem:
+            _die(problem)
+    # 启动目录与 workspace 锚点不同 ⇒ 必须显式把锚点交给子实例，
+    # 否则它按自己的 cwd 派生出另一个 workspace，收不到任务信。
+    # ⚠ 不能指望环境变量自然继承：tab / window / pane 经 wt 起新终端，继承的是终端自己的环境块。
+    needs_anchor = os.path.normcase(launch_cwd) != os.path.normcase(ctx.workspace_cwd)
 
     # claude 用 --session-id 钉死身份；其它 harness 经 run 包装器注入 AGENTNET_ID
     # （不能指望把环境变量传给 wt.exe 就能到达子进程——wt 继承的是终端自己的环境块）
@@ -7010,16 +7103,19 @@ def cmd_spawn(args: argparse.Namespace) -> None:
     child = [sys.executable, script_path(), 'run', '--id', new_id]
     if role_env:
         child += ['--role', role_name]
+    if needs_anchor:
+        child += ['--workspace-cwd', ctx.workspace_cwd]
     child += ['--'] + inner
 
     argv, effective_mode, target_window, notes = build_launch(
-        args.mode, args.window, name, ctx.cwd, child, ctx.slug,
+        args.mode, args.window, name, launch_cwd, child, ctx.slug,
         allow_focus=not args.dry_run)
 
     if args.dry_run:
         print(f"[DRY-RUN] mode={effective_mode}  window={target_window or '-'}  new_id={new_id}")
         for note in notes:
             print(f"  降级: {note}")
+        print(f"  cwd : {launch_cwd}")
         print(f"  argv: {argv}")
         return
 
@@ -7036,11 +7132,14 @@ def cmd_spawn(args: argparse.Namespace) -> None:
         'name': name,
         'topics': topics,
     }
+    if args.cwd:
+        # 只在显式给了 --cwd 时记：没给时 reset 按发起方当时的 cwd 重生，行为与此前一致。
+        recipe['cwd'] = launch_cwd
     merge_info(home / 'info.md', {
         'id': new_id,
         'workspace': ctx.slug,
         'kind': child_kind,
-        'cwd': ctx.cwd,
+        'cwd': launch_cwd,
         'registered_at': now(),
         'pid': 0,
         # 🔴 由拉起方写入：被拉起的实例**自己不知道自己是什么角色**，
@@ -7086,12 +7185,14 @@ def cmd_spawn(args: argparse.Namespace) -> None:
         # ——而发起方的 stdin 来自哪里，spawn 这一侧**完全不可控**（管道 / 重定向 / 另一个工具）。
         # ⭐ 这是"信任边界"问题，⛔ 不是洁癖：拉起方的输入流不该成为子实例的提示词通道。
         # ⚠ 对 `wt` 那几个 mode 无影响（新终端有自己的控制台，不读父进程 stdin）。
-        subprocess.Popen(argv, cwd=ctx.cwd, close_fds=True, stdin=subprocess.DEVNULL)
+        subprocess.Popen(argv, cwd=launch_cwd, close_fds=True, stdin=subprocess.DEVNULL)
     except FileNotFoundError as exc:
         _die(f"启动失败（找不到可执行文件）: {argv[0]}\n  {exc}")
 
     print(f"[OK] 已拉起 {new_id[:8]}  role={role_name}({launcher_spec})  "
           f"perm={permission_mode}  mode={effective_mode}  name={name}")
+    if needs_anchor:
+        print(f"  工作目录：{launch_cwd}（workspace 仍是你的 {ctx.slug}）")
     for note in notes:
         print(f"  降级: {note}")
     if effective_mode in ('tab', 'pane') and target_window and target_window != '0':
@@ -7259,6 +7360,14 @@ def cmd_reset(args: argparse.Namespace) -> None:
     if not isinstance(recipe, dict) or not recipe:
         _die(f"{target[:8]} 没有 spawn_recipe（不是被 spawn 出来的），无法原地重生。\n"
              f"  可以 `agentnet kill {target[:8]}` 之后自己重开。")
+    # 配方里记了 --cwd（例如某棵评审树）⇒ 按原目录重生；目录已被删掉时在终止之前就拒绝。
+    recipe_cwd = str(recipe.get('cwd') or '')
+    if recipe_cwd:
+        _, problem = spawn_cwd_problem(recipe_cwd, ctx.workspace_cwd)
+        if problem:
+            _die(f"{target[:8]} 的配方目录不可用，无法按原目录重生：\n  {problem}\n"
+                 f"  ⭐ 目标 {target[:8]} **尚未终止**。可以 `agentnet kill {target[:8]}` 之后"
+                 f"用 `spawn --cwd <新目录>` 重开。")
 
     # 🔴 **全部校验必须在 terminate_pid 之前**（2026-09-16 修）。
     # 原顺序是"先杀、再读 --task-file"，于是**路径打错一个字母 ⇒ 实例已被杀掉、
@@ -7312,6 +7421,7 @@ def cmd_reset(args: argparse.Namespace) -> None:
         role=(str(recipe['role']) if recipe.get('role') else None),
         topics=(','.join(recipe.get('topics') or []) or None),
         name=str(recipe.get('name') or ''),
+        cwd=(recipe_cwd or None),
     ))
 
 
@@ -7319,6 +7429,9 @@ def _args_run(p: argparse.ArgumentParser) -> None:
     p.add_argument('--id', help='为子进程钉死的 agent id（spawn 用；省略则自动生成）')
     p.add_argument('--topics', help='子进程的负责主题')
     p.add_argument('--role', help='套用该角色在策略配置里声明的 env（值不经命令行，不会出现在进程列表里）')
+    p.add_argument('--workspace-cwd',
+                   help=f'子进程按这个目录解析 workspace（写入 {WORKSPACE_CWD_ENV}）；'
+                        'spawn --cwd 用，让在别的目录启动的子实例仍落在拉起方的 workspace')
     p.add_argument('rest', nargs=argparse.REMAINDER, help='`--` 之后是要运行的命令')
 
 
@@ -7486,7 +7599,7 @@ def notify_spawner_of_crash(agent_id: str, child_code: int,
 @command(
     'run',
     '通用包装器：为任意 agent CLI 注入身份并托管其生命周期',
-    'agentnet run [--id <uuid>] [--topics a,b] -- <任意 agent 命令>',
+    'agentnet run [--id <uuid>] [--topics a,b] [--workspace-cwd <目录>] -- <任意 agent 命令>',
     detail=('给**没有启动钩子**的 harness 用（Codex / OpenCode / 任何 CLI）：在自己进程里'
             '设好 AGENTNET_ID 再起子命令，子进程于是继承到确定的身份。零钩子依赖，'
             '是 agent 无关性的兜底路径。'),
@@ -7501,6 +7614,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     agent_id = args.id or str(uuid.uuid4())
     role_env = Config.role_env(args.role) if args.role else {}
     env = build_child_env(os.environ, agent_id, args.topics, role_env)
+    if args.workspace_cwd:
+        env[WORKSPACE_CWD_ENV] = args.workspace_cwd
     # 🔴 让被拉起方登记**本进程**的 pid，而不是它自己那条转瞬即逝的 shell 的
     # （理由与代价见 :data:`AGENTNET_PID_ENV`）。本进程 `subprocess.run` 等到子进程
     # 结束 ⇒ 它的 pid 恰好覆盖整个会话生命周期，且 `/T` 连树杀能带走真正的 harness。
@@ -7509,6 +7624,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     banner = f"[agentnet] AGENTNET_ID={agent_id}"
     if role_env:
         banner += f"  role={args.role}  env={'/'.join(sorted(role_env))}"
+    if args.workspace_cwd:
+        banner += f"  workspace-cwd={args.workspace_cwd}"
     print(f"{banner}  →  {' '.join(rest)}", flush=True)
     # Windows 上 .cmd/.bat 不是可执行映像，CreateProcess 起不了；交给 cmd.exe 解释
     argv = resolve_launcher(rest[0]) + rest[1:]

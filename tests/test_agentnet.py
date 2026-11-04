@@ -2264,6 +2264,160 @@ class TestSpawnArgsCoverAllReads(Base):
         self.assertFalse(ns.skip_healthcheck, '未覆盖项应保留解析器默认值')
 
 
+def _git(cwd: Path, *argv: str) -> None:
+    import subprocess
+    subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@example.invalid',
+                    '-C', str(cwd), *argv], check=True, capture_output=True)
+
+
+def _make_repo(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, 'init', '-q')
+    (path / 'f.txt').write_text('x', encoding='utf-8')
+    _git(path, 'add', 'f.txt')
+    _git(path, 'commit', '-q', '-m', 'init')
+    return path.resolve()
+
+
+class TestSpawnCwd(Base):
+    """``spawn --cwd``：子实例在同仓库的另一个目录启动，**仍登记在发起方的 workspace**。
+
+    用途是让 reviewer 在评审树里启动。要守住的是两件事：
+    ① 子实例的 workspace 锚点被显式交过去（否则它按评审树派生出另一个 workspace，收不到任务信）；
+    ② 不给 ``--cwd`` 时行为与此前逐字节相同。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo = _make_repo(self.tmp / 'repo')
+        self.wt = (self.tmp / 'repo-wt').resolve()
+        _git(self.repo, 'worktree', 'add', '-q', '--detach', str(self.wt))
+        os.chdir(self.repo)
+        os.environ.pop(an.WORKSPACE_CWD_ENV, None)
+        self.addCleanup(os.environ.pop, an.WORKSPACE_CWD_ENV, None)
+        self.register()
+
+    def dry_run(self, **overrides: object) -> str:
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            an.cmd_spawn(an.spawn_args(**{'task': 't', 'mode': 'background', 'dry_run': True,
+                                           **overrides}))
+        return buf.getvalue()
+
+    def test_anchor_env_decides_the_workspace(self) -> None:
+        """锚点变量在时按它派生 workspace，实际 cwd 照实记录；不在时退回 cwd。"""
+        os.chdir(self.wt)
+        self.assertNotEqual(an.Ctx().slug, an.workspace_slug(self.repo), '前提：两处本应派生出不同 workspace')
+        os.environ[an.WORKSPACE_CWD_ENV] = str(self.repo)
+        ctx = an.Ctx()
+        self.assertEqual(ctx.slug, an.workspace_slug(self.repo))
+        self.assertEqual(Path(ctx.cwd), self.wt, '实际 cwd 不该被锚点改写')
+        self.assertEqual(Path(ctx.workspace_cwd), self.repo)
+
+    def test_worktree_cwd_hands_the_anchor_to_the_child(self) -> None:
+        out = self.dry_run(cwd=str(self.wt))
+        self.assertIn(f"cwd : {self.wt}", out)
+        self.assertIn("'--workspace-cwd'", out, '没把 workspace 锚点交给子实例')
+        self.assertIn(repr(str(self.repo)), out, '交过去的锚点不是发起方的目录')
+
+    def test_terminal_modes_open_in_the_worktree(self) -> None:
+        """tab / window / pane 经 wt 的 ``-d`` 定目录——后台模式的 dry-run 看不见这一处。"""
+        from unittest import mock
+        real_which = an.shutil.which
+        with mock.patch.object(an, 'in_windows_terminal', lambda: True), \
+                mock.patch.object(an.shutil, 'which',
+                                  lambda name, *a, **k: 'wt.exe' if name == 'wt'
+                                  else real_which(name, *a, **k)):
+            out = self.dry_run(cwd=str(self.wt), mode='tab')
+        self.assertIn(f"'-d', {str(self.wt)!r}", out)
+
+    def test_real_spawn_starts_the_process_in_the_worktree(self) -> None:
+        from unittest import mock
+        calls: list[dict[str, object]] = []
+        real_popen = an.subprocess.Popen
+
+        def fake_popen(argv: list[str], **kw: object) -> object:
+            # 只截住拉起子实例那一次；校验 --cwd 时的 git 调用照常执行
+            if len(argv) > 2 and argv[2] == 'run':
+                calls.append({'argv': argv, **kw})
+                return None
+            return real_popen(argv, **kw)
+
+        with mock.patch.object(an.subprocess, 'Popen', fake_popen):
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                an.cmd_spawn(an.spawn_args(task='t', mode='background', cwd=str(self.wt),
+                                           no_reminder=True, skip_healthcheck=True))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]['cwd'], str(self.wt))
+        self.assertIn('--workspace-cwd', calls[0]['argv'])
+
+    def test_without_cwd_nothing_changes(self) -> None:
+        """⚠ 防误伤：不给 --cwd 时不得多出任何参数。"""
+        out = self.dry_run()
+        self.assertIn(f"cwd : {self.repo}", out)
+        self.assertNotIn('--workspace-cwd', out)
+
+    def test_cwd_equal_to_own_dir_passes_no_anchor(self) -> None:
+        out = self.dry_run(cwd=str(self.repo))
+        self.assertNotIn('--workspace-cwd', out)
+
+    def test_other_repo_refused(self) -> None:
+        other = _make_repo(self.tmp / 'other')
+        with self.assertRaises(SystemExit):
+            self.dry_run(cwd=str(other))
+
+    def test_missing_dir_refused(self) -> None:
+        with self.assertRaises(SystemExit):
+            self.dry_run(cwd=str(self.tmp / 'nope'))
+
+    def test_run_writes_the_anchor_into_the_child_env(self) -> None:
+        out_file = self.tmp / 'anchor.txt'
+        code = ("import os, sys; open(sys.argv[1], 'w', encoding='utf-8')"
+                f".write(os.environ.get('{an.WORKSPACE_CWD_ENV}', '<unset>'))")
+        ns = an.build_parser().parse_args(
+            ['run', '--id', 'bbbbbbbb-0000-0000-0000-000000000002', '--workspace-cwd', str(self.repo),
+             '--', sys.executable, '-c', code, str(out_file)])
+        with self.assertRaises(SystemExit) as caught:
+            an.cmd_run(ns)
+        self.assertEqual(caught.exception.code, 0)
+        self.assertEqual(out_file.read_text(encoding='utf-8'), str(self.repo))
+
+    def _target_with_recipe(self, recipe_cwd: str) -> str:
+        target = 'cccccccc-0000-0000-0000-000000000003'
+        ctx = an.Ctx()
+        (ctx.agents_dir / target).mkdir(parents=True, exist_ok=True)
+        an.merge_info(ctx.info_path_of(target), {
+            'id': target, 'workspace': ctx.slug, 'status': an.STATUS_ACTIVE,
+            'last_active': an.now(), 'pid': 0, 'display_name': 'rv',
+            'spawn_recipe': {'mode': 'background', 'window': '', 'role': 'peer',
+                             'name': 'rv', 'topics': [], 'cwd': recipe_cwd},
+        })
+        return target
+
+    def test_reset_respawns_in_the_recipe_cwd(self) -> None:
+        from unittest import mock
+        target = self._target_with_recipe(str(self.wt))
+        captured: list[argparse.Namespace] = []
+        with mock.patch.object(an, 'terminate_pid', lambda pid: (True, 'mock')), \
+                mock.patch.object(an, 'cmd_spawn', captured.append):
+            an.cmd_reset(an.build_parser().parse_args(['reset', target[:8], '--task', 'again']))
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].cwd, str(self.wt))
+
+    def test_reset_refuses_before_killing_when_recipe_cwd_is_gone(self) -> None:
+        from unittest import mock
+        target = self._target_with_recipe(str(self.tmp / 'removed-worktree'))
+        killed: list[int] = []
+        with mock.patch.object(an, 'terminate_pid', lambda pid: killed.append(pid) or (True, 'mock')):
+            with self.assertRaises(SystemExit):
+                an.cmd_reset(an.build_parser().parse_args(['reset', target[:8], '--task', 'again']))
+        self.assertEqual(killed, [], '目录不可用时必须在终止旧实例之前拒绝')
+
+
 class TestOneshotSessionGuidance(Base):
     """一次性调用形态（`-p`）**不得**收到任何"挂收信器"的引导。
 
