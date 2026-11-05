@@ -2311,7 +2311,7 @@ class TestSpawnCwd(Base):
         projects = {key or self.wt_key: {'hasTrustDialogAccepted': accepted}}
         self.claude_config.write_text(json.dumps({'projects': projects}), encoding='utf-8')
 
-    def real_spawn(self) -> list[dict[str, object]]:
+    def real_spawn(self, **overrides: object) -> list[dict[str, object]]:
         """真走一遍 spawn，只截住拉起子实例那一次 Popen；校验用的 git 调用照常执行。"""
         import contextlib
         import io
@@ -2327,31 +2327,122 @@ class TestSpawnCwd(Base):
 
         with mock.patch.object(an.subprocess, 'Popen', fake_popen), \
                 contextlib.redirect_stdout(io.StringIO()):
-            an.cmd_spawn(an.spawn_args(task='t', mode='background', cwd=str(self.wt),
-                                       no_reminder=True, skip_healthcheck=True))
+            an.cmd_spawn(an.spawn_args(**{'task': 't', 'mode': 'background', 'cwd': str(self.wt),
+                                          'no_reminder': True, 'skip_healthcheck': True,
+                                          **overrides}))
         return calls
 
-    def test_untrusted_worktree_refused_before_launch(self) -> None:
-        """未被 Claude Code 信任的目录：实例会静默卡在信任对话框 ⇒ 必须在拉起前拦下。"""
+    def config(self) -> dict[str, object]:
+        return json.loads(self.claude_config.read_text(encoding='utf-8'))
+
+    def wt_entry(self) -> object:
+        projects = self.config()['projects']
+        assert isinstance(projects, dict)
+        return projects.get(self.wt_key)
+
+    def lock_dir(self) -> Path:
+        return self.claude_config.with_name(self.claude_config.name + '.lock')
+
+    def test_untrusted_worktree_is_trusted_then_launched(self) -> None:
+        """未被信任的同仓库 worktree：先登记信任，再拉起——否则实例会静默卡在信任对话框。"""
         self.trust(False)
-        with self.assertRaises(SystemExit):
-            self.real_spawn()
-        self.assertEqual(list(an.Ctx().agents_dir.glob('*/inbox/*.md')), [], '拦下时不该已经投出任务信')
+        self.assertIsNotNone(an.claude_trust_problem(str(self.wt), self.claude_config), '前提：起初未被信任')
+        self.assertEqual(len(self.real_spawn()), 1)
+        self.assertIsNone(an.claude_trust_problem(str(self.wt), self.claude_config))
+        self.assertFalse(self.lock_dir().exists(), '登记完没有释放 Claude Code 的配置锁')
+
+    def test_new_entry_created_when_directory_unknown(self) -> None:
+        self.claude_config.write_text(json.dumps({'numStartups': 3}), encoding='utf-8')
+        self.assertEqual(len(self.real_spawn()), 1)
+        entry = self.wt_entry()
+        assert isinstance(entry, dict)
+        self.assertIs(entry['hasTrustDialogAccepted'], True)
+        self.assertEqual(entry['allowedTools'], [], '新记录应带 Claude Code 自己新建记录时的字段')
+        self.assertEqual(self.config()['numStartups'], 3)
+
+    def test_grant_changes_only_the_trust_flag(self) -> None:
+        """持锁重读整份配置、只改这一项：别的项目、顶层键、这条记录的其它字段都原样保留。"""
+        other = 'C:/elsewhere/project'
+        self.claude_config.write_text(json.dumps({
+            'numStartups': 7, 'oauthAccount': {'x': 'y'},
+            'projects': {self.wt_key: {'hasTrustDialogAccepted': False, 'allowedTools': ['Bash(ls)']},
+                         other: {'hasTrustDialogAccepted': False, 'lastCost': 1.5}},
+        }, ensure_ascii=False), encoding='utf-8')
+        self.real_spawn()
+        data = self.config()
+        self.assertEqual(data['numStartups'], 7)
+        self.assertEqual(data['oauthAccount'], {'x': 'y'})
+        self.assertEqual(self.wt_entry(), {'hasTrustDialogAccepted': True, 'allowedTools': ['Bash(ls)']})
+        projects = data['projects']
+        assert isinstance(projects, dict)
+        self.assertEqual(projects[other], {'hasTrustDialogAccepted': False, 'lastCost': 1.5},
+                         '只该信任 --cwd 那一棵，别的项目不能被顺手改掉')
+
+    def test_already_trusted_config_left_byte_identical(self) -> None:
+        before = self.claude_config.read_bytes()
+        self.assertEqual(len(self.real_spawn()), 1)
+        self.assertEqual(self.claude_config.read_bytes(), before, '已被信任时不该重写配置')
 
     def test_trust_lookup_ignores_case_and_slashes(self) -> None:
         self.trust(True, key=self.wt_key.upper().replace('/', '\\'))
+        before = self.claude_config.read_bytes()
         self.assertEqual(len(self.real_spawn()), 1)
+        self.assertEqual(self.claude_config.read_bytes(), before)
 
-    def test_dry_run_only_warns_about_trust(self) -> None:
-        self.trust(False)
-        self.assertIn('还没有信任', self.dry_run(cwd=str(self.wt)))
-
-    def test_trust_check_never_writes_the_config(self) -> None:
-        """⛔ 替用户接受信任是用户的决定：预检只读。"""
+    def test_dry_run_reports_but_never_writes(self) -> None:
         self.trust(False)
         before = self.claude_config.read_bytes()
+        self.assertIn('还没有信任', self.dry_run(cwd=str(self.wt)))
+        self.assertEqual(self.claude_config.read_bytes(), before)
+
+    def test_held_lock_refuses_without_writing_or_launching(self) -> None:
+        """锁被别人持有：等满就放弃，⛔ 不抢锁、不写配置、不拉起，也不删别人的锁。"""
+        from unittest import mock
+        self.trust(False)
+        self.lock_dir().mkdir()
+        before = self.claude_config.read_bytes()
+        with mock.patch.object(an, 'CLAUDE_CONFIG_LOCK_WAIT_S', 0.3), self.assertRaises(SystemExit):
+            self.real_spawn()
+        self.assertEqual(self.claude_config.read_bytes(), before)
+        self.assertTrue(self.lock_dir().is_dir(), '把别人持有的锁删掉了')
+        self.assertEqual(list(an.Ctx().agents_dir.glob('*/inbox/*.md')), [], '拦下时不该已经投出任务信')
+
+    def test_grant_proceeds_once_the_lock_frees_up(self) -> None:
+        """锁在等待期内释放 ⇒ 拿到锁照常登记（⚠ 防「见锁就放弃」的退化）。"""
+        import threading
+        self.trust(False)
+        self.lock_dir().mkdir()
+        timer = threading.Timer(0.3, self.lock_dir().rmdir)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        self.assertEqual(len(self.real_spawn()), 1)
+        self.assertIsNone(an.claude_trust_problem(str(self.wt), self.claude_config))
+
+    def test_unreadable_config_refused_without_writing(self) -> None:
+        self.claude_config.write_text('{not json', encoding='utf-8')
         with self.assertRaises(SystemExit):
             self.real_spawn()
+        self.assertEqual(self.claude_config.read_text(encoding='utf-8'), '{not json')
+        self.assertFalse(self.lock_dir().exists(), '失败路径没有释放锁')
+
+    def test_write_that_does_not_take_effect_refuses_launch(self) -> None:
+        """写完复查仍不通过（如 Claude Code 认的键与 git 根写法不一致）⇒ 不拉起，⛔ 不假定写了就生效。"""
+        from unittest import mock
+        self.trust(False)
+        with mock.patch.object(an, 'claude_trust_problem', lambda directory, config_path: '仍未信任'), \
+                self.assertRaises(SystemExit):
+            self.real_spawn()
+        self.assertEqual(list(an.Ctx().agents_dir.glob('*/inbox/*.md')), [], '复查失败时不该已经投出任务信')
+
+    def test_refused_spawn_leaves_config_untouched(self) -> None:
+        """登记信任排在所有拦截之后：后端不可达等原因被拦下时，配置不留改动。"""
+        from unittest import mock
+        self.trust(False)
+        before = self.claude_config.read_bytes()
+        with mock.patch.object(an.Config, 'role_healthcheck', lambda role: 'http://127.0.0.1:9/'), \
+                mock.patch.object(an, 'url_reachable', lambda url: (False, 'down')), \
+                self.assertRaises(SystemExit):
+            self.real_spawn(skip_healthcheck=False)
         self.assertEqual(self.claude_config.read_bytes(), before)
 
     def dry_run(self, **overrides: object) -> str:

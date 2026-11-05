@@ -6923,36 +6923,116 @@ def claude_global_config_path(role_env: Mapping[str, str]) -> Path:
     return (Path(base) if base else Path.home()) / '.claude.json'
 
 
+CLAUDE_CONFIG_LOCK_WAIT_S = 15.0
+"""等 Claude Code 配置锁的上限（秒）。Claude Code 每次写配置只持锁一瞬；
+等满仍拿不到，多半是进程崩溃留下的锁目录，那要人来确认，⛔ 不自动抢。"""
+
+
+def claude_trust_key(directory: str) -> tuple[str, str | None]:
+    """Claude Code 记录信任用的键：``directory`` 所在的 git 根（正斜杠）。返回 (键, 问题)。
+
+    Claude Code 只在**当前 git 根**上找信任记录，worktree 的 git 根是它自己，不继承主树。
+    """
+    proc = subprocess.run(['git', '-C', directory, 'rev-parse', '--show-toplevel'],
+                          capture_output=True, text=True, check=False, timeout=15)
+    root = proc.stdout.strip()
+    if proc.returncode != 0 or not root:
+        return '', f"取不到 {directory} 的 git 根，无法确认 Claude Code 是否信任它：{proc.stderr.strip()}"
+    return root.replace('\\', '/'), None
+
+
 def claude_trust_problem(directory: str, config_path: Path) -> str | None:
     """**只读**检查：Claude Code 是否已信任 ``directory`` 所在的 git 根。已信任返回 ``None``。
 
     为什么要查：Claude Code 只在**当前 git 根**（worktree 就是 worktree 自己）上找信任记录，
     不继承主树的信任 ⇒ 每棵新 worktree 第一次启动都会弹「是否信任此文件夹」，
     而被拉起的实例没有人去按键 ⇒ 卡在启动前：钩子不触发、永不登记（``pid = 0``）、
-    任务信无人领取，且没有任何报错。⇒ 拉起之前就拦下来，把处理办法说清楚。
+    任务信无人领取，且没有任何报错。
 
-    ⛔ 本函数不写配置：替用户接受信任是用户的决定。
+    写配置由 :func:`grant_claude_trust` 负责，本函数不写。
     """
-    proc = subprocess.run(['git', '-C', directory, 'rev-parse', '--show-toplevel'],
-                          capture_output=True, text=True, check=False, timeout=15)
-    root = proc.stdout.strip()
-    if proc.returncode != 0 or not root:
-        return f"取不到 {directory} 的 git 根，无法确认 Claude Code 是否信任它：{proc.stderr.strip()}"
-    key = root.replace('\\', '/')
+    key, problem = claude_trust_key(directory)
+    if problem:
+        return problem
     try:
-        projects = json.loads(config_path.read_text(encoding='utf-8')).get('projects') or {}
-    except (OSError, ValueError) as exc:
+        projects = json.loads(read_text_with_retry(config_path)).get('projects') or {}
+        entries = list(projects.items())
+    except (OSError, ValueError, AttributeError) as exc:
         return f"读不了 Claude Code 配置 {config_path}，无法确认是否信任 {key}：{exc}"
-    for name, entry in projects.items():
+    for name, entry in entries:
         if (os.path.normcase(str(name).replace('\\', '/')) == os.path.normcase(key)
                 and isinstance(entry, dict) and entry.get('hasTrustDialogAccepted') is True):
             return None
-    return (f"Claude Code 还没有信任 {key}。\n"
-            f"  ⇒ 现在拉起，新实例会停在「是否信任此文件夹」对话框：不登记、不领任务、也不报错。\n"
-            f"  处理办法（任选其一，由人来做）：\n"
-            f"  ① 在该目录交互式运行一次 claude，接受信任对话框后退出；\n"
-            f"  ② 在 {config_path} 里设 projects[\"{key}\"].hasTrustDialogAccepted = true。\n"
-            f"  信任按路径记录：固定复用几个评审树路径，每个只需处理一次。")
+    return (f"Claude Code 还没有信任 {key}：直接启动的实例会停在「是否信任此文件夹」对话框，"
+            f"不登记、不领任务、也不报错。")
+
+
+def grant_claude_trust(directory: str, config_path: Path) -> str | None:
+    """在 Claude Code 全局配置里登记信任 ``directory`` 所在的 git 根。
+    成功返回 ``None``；失败返回问题说明，此时配置未被改动。
+
+    **只给 ``spawn --cwd`` 用**：调用前 :func:`spawn_cwd_problem` 已确认该目录与发起方同属一个
+    git 仓库。发起方本就在这个仓库里工作，它的另一棵 worktree 不是陌生目录 ⇒ 由 agentnet 代为
+    登记（用户 2026-11-05 授权）。其它目录 agentnet 不碰。
+
+    写法遵守 Claude Code 自己的配置锁协议，否则会与正在运行的实例互相覆盖：
+
+    1. 持锁 = 成功创建 ``<配置文件名>.lock`` 目录（Claude Code 用的 proper-lockfile 就这样判定）；
+       等不到就放弃，⛔ 不抢锁：锁目录可能属于正在写配置的实例。
+    2. 持锁期间从磁盘重读整份配置，只改这一条记录的 ``hasTrustDialogAccepted``，其余原样写回。
+    3. 写临时文件再原子替换，读的一方看不到半份文件。
+    4. 释放锁。Claude Code 自己写配置时同样在锁内从磁盘合并 ``projects``，
+       所以正在运行的实例不会把这条记录冲掉。
+
+    写完再用 :func:`claude_trust_problem` 读一遍确认，而不是假定写成功就等于被信任。
+    """
+    key, problem = claude_trust_key(directory)
+    if problem:
+        return problem
+    manual = (f"\n  也可以人工处理：在 {key} 里交互式运行一次 claude，接受信任对话框后退出，再重新拉起。")
+    lock = config_path.with_name(f"{config_path.name}.lock")
+    deadline = time.monotonic() + CLAUDE_CONFIG_LOCK_WAIT_S
+    while True:
+        try:
+            lock.mkdir()
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                return (f"等了 {CLAUDE_CONFIG_LOCK_WAIT_S:g} 秒仍拿不到 Claude Code 的配置锁 {lock}，"
+                        f"没有登记信任 {key}。\n"
+                        f"  Claude Code 写配置时锁只持有一瞬；一直不释放多半是崩溃留下的。"
+                        f"确认没有 Claude Code 正在启动或退出后，删掉这个空目录再重试。" + manual)
+            time.sleep(0.1)
+    try:
+        try:
+            data = json.loads(read_text_with_retry(config_path))
+        except (OSError, ValueError) as exc:
+            return f"读不了 Claude Code 配置 {config_path}，没有登记信任 {key}：{exc}" + manual
+        projects = data.setdefault('projects', {}) if isinstance(data, dict) else None
+        if not isinstance(projects, dict):
+            return (f"Claude Code 配置 {config_path} 的结构不是预期的"
+                    f"（顶层或 projects 不是对象），没有登记信任 {key}。" + manual)
+        entry = projects.get(key)
+        if isinstance(entry, dict):
+            projects[key] = {**entry, 'hasTrustDialogAccepted': True}
+        else:
+            # 与 Claude Code 自己新建项目记录时写入的字段相同；这里要的只有最后一项。
+            projects[key] = {
+                'allowedTools': [], 'mcpContextUris': [], 'mcpServers': {},
+                'enabledMcpjsonServers': [], 'disabledMcpjsonServers': [],
+                'hasClaudeMdExternalIncludesApproved': False,
+                'hasClaudeMdExternalIncludesWarningShown': False,
+                'hasTrustDialogAccepted': True,
+            }
+        try:
+            _atomic_write(config_path, json.dumps(data, ensure_ascii=False, indent=2))
+        except OSError as exc:
+            return f"写不回 Claude Code 配置 {config_path}，没有登记信任 {key}：{exc}" + manual
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            lock.rmdir()
+    after = claude_trust_problem(directory, config_path)
+    return None if after is None else f"已写入配置，但复查仍未通过：{after}" + manual
 
 
 def _args_spawn(p: argparse.ArgumentParser) -> None:
@@ -6999,8 +7079,10 @@ def _args_spawn(p: argparse.ArgumentParser) -> None:
             f'`{WORKSPACE_CWD_ENV}`，子实例的钩子与它跑的 agentnet 都按它解析 workspace。'
             '用途是让 reviewer 在评审树里启动，只加载评审树那一份项目规范。'
             '`reset` 会按配方里记下的目录重生。'
-            'Claude Code 只认当前 git 根上的信任记录（worktree 不继承主树）⇒ '
-            '目标目录未被信任时拒绝拉起并说明处理办法，否则新实例会静默卡在信任对话框。\n'
+            'Claude Code 只认当前 git 根上的信任记录（worktree 不继承主树），未被信任的目录里'
+            '新实例会静默卡在信任对话框 ⇒ 目标目录未被信任时，先按 Claude Code 的配置锁协议'
+            '在它的全局配置里登记信任，再拉起；`--dry-run` 只报告、不登记。'
+            '只对与你同属一个仓库的目录这样做，其它目录本来就被 `--cwd` 拒绝。\n'
             '**任务信默认给拉起方建 1h 一次性回执提醒**（与 `send` 同规则）：它任何一封'
             '回信即销账，否则 1h 后提醒你——实例活着但卡死时不会无声等待。'
             '`--no-reminder` 关闭。\n'
@@ -7052,13 +7134,17 @@ def cmd_spawn(args: argparse.Namespace) -> None:
     launcher_name = Path(launcher_parts[0]).stem.lower()
 
     role_env = Config.role_env(role_name)
+    # 新目录未被 Claude Code 信任 ⇒ 实例会静默卡在信任对话框（见 claude_trust_problem）。
+    # 这里只查；真要登记放到下面所有拦截之后，被拦下的拉起不留下配置改动。
+    trust_config: Path | None = None
     if args.cwd and role.get('claude_compatible'):
-        # 新目录未被 Claude Code 信任 ⇒ 实例会静默卡在信任对话框（见 claude_trust_problem）。
-        trust_problem = claude_trust_problem(launch_cwd, claude_global_config_path(role_env))
+        config_path = claude_global_config_path(role_env)
+        trust_problem = claude_trust_problem(launch_cwd, config_path)
         if trust_problem and args.dry_run:
-            print(f"[warn] {trust_problem}")
+            print(f"[dry-run] {trust_problem}\n"
+                  f"          真拉起时会先在 {config_path} 里登记信任（同仓库目录由 spawn --cwd 代为登记）。")
         elif trust_problem:
-            _die(trust_problem)
+            trust_config = config_path
     health = Config.role_healthcheck(role_name)
     if health and args.skip_healthcheck:
         print(f"[warn] 已跳过后端预检（--skip-healthcheck）。"
@@ -7087,6 +7173,13 @@ def cmd_spawn(args: argparse.Namespace) -> None:
                   "**两次独立采样**，上游振荡时探测失败而实例健康是常见的。")
             print("       ⇒ ⛔ 别据此判断它是不是空壳；判活看它的 `read/` 里有没有信"
                   "（见 `agentnet who`），⛔ 不看这一行。")
+
+    if trust_config is not None:
+        grant_problem = grant_claude_trust(launch_cwd, trust_config)
+        if grant_problem:
+            _die(grant_problem)
+        print(f"[OK] 已在 {trust_config} 里信任 {launch_cwd} 所在的 git 根"
+              f"（与你同属一个 git 仓库，由 spawn --cwd 代为登记）")
 
     child_kind = launcher_name
     # 🔴 引导提示词按「这个 harness 挂收信器有没有用」分档（2026-09-18，见
