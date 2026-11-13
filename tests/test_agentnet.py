@@ -1738,6 +1738,32 @@ class TestSpawnArgv(Base):
         self.assertLess(argv.index('--model'), argv.index('--disallowed-tools'),
                         '--model 落在 variadic 之后会被吞掉')
 
+    def test_settings_flag_is_optional_and_before_variadic(self) -> None:
+        """角色的 ``settings`` 文件经 ``--settings`` 传入，用来压过用户级设置里的 env。
+
+        用户级设置的 ``env`` 优先于进程环境变量：它把 ``ANTHROPIC_BASE_URL`` 指向别处时，
+        只靠 ``[roles.*.env]`` 的角色全部 401。``--settings`` 也必须排在 variadic 之前。
+        """
+        self.assertNotIn('--settings', self.build([]), '没配 settings 时不该凭空加 --settings')
+        argv = an.build_claude_argv(
+            ['C:/x/claude.exe'], an.BOOTSTRAP_PROMPT, 'sid', 'nm', 'auto', ['Edit'], '', 'C:/s.json')
+        self.assertEqual(argv[argv.index('--settings') + 1], 'C:/s.json')
+        self.assertLess(argv.index('--settings'), argv.index('--disallowed-tools'),
+                        '--settings 落在 variadic 之后会被吞掉')
+
+    def test_role_settings_reads_config_and_rejects_missing_file(self) -> None:
+        from unittest import mock
+        settings_file = Path(self.tmp) / 'role-settings.json'
+        settings_file.write_text('{}', encoding='utf-8')
+        cases = (({}, ''), ({'settings': str(settings_file)}, str(settings_file)))
+        for role, expected in cases:
+            with self.subTest(role=role), \
+                    mock.patch.object(an.Config, 'role', lambda name, r=role: r):
+                self.assertEqual(an.Config.role_settings('x'), expected)
+        with mock.patch.object(an.Config, 'role', lambda name: {'settings': str(settings_file) + '.missing'}), \
+                self.assertRaises(SystemExit):
+            an.Config.role_settings('x')
+
     def test_variadic_flag_is_last(self) -> None:
         """``--disallowed-tools <tools...>`` 吞掉其后一切，所以它必须垫底。"""
         argv = self.build(['Edit', 'Write', 'NotebookEdit'])

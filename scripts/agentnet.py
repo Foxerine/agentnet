@@ -215,6 +215,23 @@ class Config:
         return [str(v) for v in value]
 
     @classmethod
+    def role_settings(cls, name: str) -> str:
+        """claude 兼容角色额外加载的设置文件（``[roles.*].settings``），空串表示不加。
+
+        为什么要它：Claude Code 里用户级设置文件的 ``env`` 优先于进程环境变量，
+        所以 ``[roles.*.env]`` 里的值会被用户设置中的同名项盖掉。实例：用户级设置
+        把 ``ANTHROPIC_BASE_URL`` 指向一个本地代理后，角色 env 里指向网关的值不再生效，
+        请求带着网关的 token 发到那个代理，全部 401。``--settings`` 加载的文件优先于
+        用户级设置，必须压过用户设置的值放在这个文件里才真正生效。
+        """
+        value = cls.role(name).get('settings') or ''
+        if not isinstance(value, str):
+            _die(f"角色 `{name}` 的 settings 必须是字符串（文件路径）：{CONFIG_PATH}")
+        if value and not Path(value).is_file():
+            _die(f"角色 `{name}` 的 settings 指向的文件不存在：{value}")
+        return value
+
+    @classmethod
     def role_arm_poller(cls, name: str) -> bool:
         """该角色的实例**该不该挂收信器**（``[roles.*].arm_poller``，默认 ``true``）。
 
@@ -6454,12 +6471,15 @@ def build_claude_argv(
         permission_mode: str,
         blocked_tools: list[str],
         model: str = '',
+        settings: str = '',
 ) -> list[str]:
     """装配 claude 兼容启动器的 argv。
 
     :param executable: 已解析的可执行文件（``resolve_launcher`` 的产物）
     :param prompt: 位置参数，即首条用户消息
     :param blocked_tools: 工具级禁用清单，空则不下这个选项
+    :param settings: 额外加载的设置文件（``--settings``），空则不下这个选项，
+        理由见 :meth:`Config.role_settings`
 
     **不变式：位置参数紧跟可执行文件，variadic 选项一律在末尾。** 这是唯一
     可靠的排布——commander 的 variadic 没有终止符，位置参数只要落在它后面
@@ -6479,6 +6499,8 @@ def build_claude_argv(
     # （设与不设结果相同）。
     if model:
         argv += ['--model', model]
+    if settings:
+        argv += ['--settings', settings]
     if blocked_tools:
         # 工具名是纯 ASCII，走 argv 安全；这是角色边界里**真拦得住**的那一半
         argv += ['--disallowed-tools', ','.join(blocked_tools)]
@@ -6547,6 +6569,7 @@ def build_oneshot_argv(
         resume: bool,
         blocked_tools: list[str],
         model: str = '',
+        settings: str = '',
 ) -> list[str]:
     """装配一次性调用的 argv。
 
@@ -6571,6 +6594,8 @@ def build_oneshot_argv(
     argv += ['--resume', session_id] if resume else ['--session-id', session_id]
     if model:
         argv += ['--model', model]
+    if settings:
+        argv += ['--settings', settings]
     if blocked_tools:
         argv += ['--disallowed-tools', ','.join(blocked_tools)]
     reject_swallowed_positional(argv, len(executable) + 1)
@@ -6604,7 +6629,8 @@ def oneshot_call(
         resolve_launcher(str(role.get('command') or 'claude')), bootstrap,
         session_id=session_id, resume=resume,
         blocked_tools=Config.role_disallowed_tools(role_name),
-        model=str(role.get('model') or ''))
+        model=str(role.get('model') or ''),
+        settings=Config.role_settings(role_name))
     env = {**os.environ, **Config.role_env(role_name), ONESHOT_ENV: '1'}
     started = time.monotonic()
     timed_out = False
@@ -7194,7 +7220,7 @@ def cmd_spawn(args: argparse.Namespace) -> None:
         inner = build_claude_argv(
             resolve_launcher(launcher_parts[0]), bootstrap,
             new_id, name, permission_mode, Config.role_disallowed_tools(role_name),
-            str(role.get('model') or ''))
+            str(role.get('model') or ''), Config.role_settings(role_name))
     else:
         # 其它 harness：没有 --session-id 这类身份开关，只能靠环境变量注入身份。
         #
